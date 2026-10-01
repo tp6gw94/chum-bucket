@@ -1,1 +1,1 @@
-Don't write any comments, code is single source of truth.
+- Don't write any comments, code is single source of truth.
