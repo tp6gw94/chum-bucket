@@ -31,6 +31,7 @@ export type AtlassianScope = Readonly<{
     context: ToolExecutionContext,
     local: LocalToolHandler | undefined,
   ) => Promise<unknown>;
+  guard: () => Promise<(value: unknown) => void>;
 }>;
 
 type RemoteRegistration = Readonly<{
@@ -87,7 +88,7 @@ function discoveryDefinition(names: readonly string[]): ModelTool {
   };
 }
 
-class ToolBoundaryError extends Error {}
+export class ToolBoundaryError extends Error {}
 
 function parseDiscoveryRequest(argumentsText: string): readonly string[] | undefined {
   let parsed: unknown;
@@ -400,6 +401,10 @@ export async function withAtlassianScope<T>(
   };
   try {
     return await use({
+      async guard() {
+        const config = await getConfiguration();
+        return (value: unknown) => guardCredentials(value, config);
+      },
       async getModelTools(messages, compose) {
         const config = await getConfiguration();
         const session = config.mode === "http" ? getRemote(config) : undefined;
@@ -435,6 +440,9 @@ export async function withAtlassianScope<T>(
             return output;
           } catch (failure) {
             guardCredentials(failure, config);
+            if (failure instanceof ToolBoundaryError) {
+              throw failure;
+            }
             throw new Error(failure instanceof Error ? failure.message : "Tool failed");
           }
         }

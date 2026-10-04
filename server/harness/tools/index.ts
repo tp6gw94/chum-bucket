@@ -5,6 +5,7 @@ import {
   type UIMessage,
 } from "@tanstack/ai";
 import type { ModelCall } from "../model-turn";
+import { codeModeToolName, composeCodeModeTurn } from "./code-mode";
 import {
   withAtlassianScope,
   type AtlassianCatalog,
@@ -20,8 +21,13 @@ type Registration = Readonly<{
 }>;
 type Catalog = ReadonlyMap<string, Registration>;
 
+export type ModelToolTurn = Readonly<{
+  definitions: ModelTool[];
+  systemPrompt: string;
+}>;
+
 export type RunTools = Readonly<{
-  getModelTools: (messages: readonly UIMessage[]) => Promise<ModelTool[]>;
+  getModelTools: (messages: readonly UIMessage[]) => Promise<ModelToolTurn>;
   executeTool: (
     messages: readonly UIMessage[],
     call: ModelCall,
@@ -68,11 +74,28 @@ function mergeLocalDefinitions(remote: AtlassianCatalog): ModelTool[] {
 }
 
 export async function withRunTools<T>(use: (tools: RunTools) => Promise<T>): Promise<T> {
-  return withAtlassianScope((scope) =>
-    use({
-      getModelTools: (messages) => scope.getModelTools(messages, mergeLocalDefinitions),
-      executeTool: (messages, call, context) =>
-        scope.executeTool(messages, call, context, localCatalog.get(call.name)?.handler),
-    }),
-  );
+  return withAtlassianScope((scope) => {
+    const dispatchFor =
+      (messages: readonly UIMessage[]) => (call: ModelCall, context: ToolExecutionContext) =>
+        scope.executeTool(messages, call, context, localCatalog.get(call.name)?.handler);
+    const buildTurn = async (messages: readonly UIMessage[]) => {
+      const definitions = await scope.getModelTools(messages, mergeLocalDefinitions);
+      const guard = await scope.guard();
+      const turn = composeCodeModeTurn({ definitions, dispatch: dispatchFor(messages), guard });
+      return { definitions, turn };
+    };
+    return use({
+      async getModelTools(messages) {
+        const { definitions, turn } = await buildTurn(messages);
+        return { definitions: [...definitions, turn.definition], systemPrompt: turn.systemPrompt };
+      },
+      async executeTool(messages, call, context) {
+        if (call.name !== codeModeToolName) {
+          return dispatchFor(messages)(call, context);
+        }
+        const { turn } = await buildTurn(messages);
+        return turn.execute(call.input, context);
+      },
+    });
+  });
 }

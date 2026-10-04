@@ -53,7 +53,7 @@ export function Composer({
   const errorId = `${label}-error`;
 
   const editor = useEditor({
-    extensions: [StarterKit],
+    extensions: [StarterKit.configure({ link: false })],
     content: "",
     editable: !disabled,
     editorProps: {

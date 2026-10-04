@@ -10,6 +10,7 @@ import {
 import { resolveDebugOption } from "@tanstack/ai/adapter-internals";
 import { withRunTools, type RunTools } from "./tools";
 import { snapshot, streamModelTurn, type ModelCall } from "./model-turn";
+import { createToolEventBuffer, drainToolEvents } from "./tool-events";
 import {
   BUILD,
   MODEL,
@@ -40,21 +41,21 @@ async function toolStep(
   tools: RunTools,
 ): Promise<UIMessage[]> {
   await emit(runId, snapshot(messages), messages);
+  const events = createToolEventBuffer(call.id);
   let output: unknown;
   let error = false;
   try {
     const context = {
       toolCallId: call.id,
       abortSignal: AbortSignal.timeout(35_000),
-      emitCustomEvent: () => {
-        throw new Error("Tool custom events are not supported");
-      },
+      emitCustomEvent: (name: string, value: Record<string, unknown>) => events.emit(name, value),
     };
     output = await tools.executeTool(messages, call, context);
   } catch (failure) {
     output = { error: failure instanceof Error ? failure.message.slice(0, 2000) : "Tool failed" };
     error = true;
   }
+  await drainToolEvents(events, (event) => emit(runId, event));
   const content = JSON.stringify(output);
   if (typeof content !== "string") {
     throw new Error("Tool output is not JSON serializable");
@@ -89,14 +90,14 @@ export async function executeRun(run: AcceptedRun) {
           await emit(run.runId, snapshot(messages), messages);
           const { deepinfra } = await import("./provider");
           const adapter = deepinfra(run.model);
-          const definitions = await tools.getModelTools(messages);
+          const turn = await tools.getModelTools(messages);
           const result = await streamModelTurn({
             messages,
             stream: adapter.chatStream({
               model: run.model,
               messages: convertMessagesToModelMessages(messages),
-              systemPrompts: [run.prompt],
-              tools: definitions,
+              systemPrompts: [run.prompt, turn.systemPrompt],
+              tools: turn.definitions,
               logger: resolveDebugOption(false),
               request: { signal: AbortSignal.timeout(120_000) },
             }),

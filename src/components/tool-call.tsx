@@ -12,8 +12,25 @@ const labels: Record<ToolCallPart["state"], string> = {
 
 export function ToolCall({ part }: { part: ToolCallPart }) {
   let args = part.arguments;
+  const multiline: [string, string][] = [];
   try {
-    args = JSON.stringify(JSON.parse(args), null, 2);
+    const parsed: unknown = JSON.parse(args);
+    if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const remaining: [string, unknown][] = [];
+      for (const [name, value] of Object.entries(parsed)) {
+        if (typeof value === "string" && /[\r\n]/.test(value)) {
+          multiline.push([name, value]);
+        } else {
+          remaining.push([name, value]);
+        }
+      }
+      args =
+        multiline.length > 0 && remaining.length === 0
+          ? ""
+          : JSON.stringify(Object.fromEntries(remaining), null, 2);
+    } else {
+      args = JSON.stringify(parsed, null, 2);
+    }
   } catch {}
 
   return (
@@ -25,11 +42,21 @@ export function ToolCall({ part }: { part: ToolCallPart }) {
           {labels[part.state]}
         </span>
       </summary>
-      <div className="mt-2 flex flex-col gap-1">
+      <div className="mt-2 flex min-w-0 flex-col gap-2">
         <p className="text-xs text-muted-foreground">傳入參數</p>
-        <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-all text-xs">
-          {args || "等待參數…"}
-        </pre>
+        {args !== "" || multiline.length === 0 ? (
+          <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-all font-mono text-xs">
+            {args || "等待參數…"}
+          </pre>
+        ) : null}
+        {multiline.map(([name, value]) => (
+          <div key={name} className="flex min-w-0 flex-col gap-1">
+            <p className="break-all font-mono text-xs text-muted-foreground">{name}</p>
+            <pre className="max-h-80 max-w-full overflow-auto whitespace-pre rounded-md border border-border bg-background p-3 font-mono text-xs leading-relaxed">
+              <code>{value}</code>
+            </pre>
+          </div>
+        ))}
       </div>
     </details>
   );
