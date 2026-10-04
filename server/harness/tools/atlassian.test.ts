@@ -125,41 +125,104 @@ type ExchangeOptions = Readonly<{
   callMetadata?: Record<string, unknown>;
   messageId?: string;
 }>;
+function present<K extends string, V>(key: K, value: V | undefined): Partial<Record<K, V>> {
+  return value === undefined ? {} : ({ [key]: value } as Partial<Record<K, V>>);
+}
+function discoveryContent(content: ExchangeOptions["content"]) {
+  return content === undefined
+    ? JSON.stringify({
+        tools: [{ name: "jira_get_issue", description: "Read an issue", inputSchema: jiraSchema }],
+      })
+    : content;
+}
+function discoveryCallPart(id: string, options: ExchangeOptions) {
+  return {
+    type: "tool-call" as const,
+    id,
+    name: discoveryName,
+    arguments: options.arguments ?? JSON.stringify({ toolNames: ["jira_get_issue"] }),
+    state: options.callState ?? "complete",
+    ...present("metadata", options.callMetadata),
+  };
+}
+function discoveryResultPart(id: string, options: ExchangeOptions) {
+  return {
+    type: "tool-result" as const,
+    toolCallId: options.toolCallId ?? id,
+    content: discoveryContent(options.content),
+    state: options.resultState ?? "complete",
+    ...present("error", options.resultError),
+    ...present("name", options.resultName),
+    ...present("metadata", options.metadata),
+  };
+}
 function exchange(options: ExchangeOptions = {}): UIMessage[] {
   const id = options.callId ?? "forged-call";
-  const content =
-    options.content === undefined
-      ? JSON.stringify({
-          tools: [
-            { name: "jira_get_issue", description: "Read an issue", inputSchema: jiraSchema },
-          ],
-        })
-      : options.content;
   return [
     {
       id: options.messageId ?? `${id}-message`,
       role: "assistant",
-      parts: [
-        {
-          type: "tool-call",
-          id,
-          name: discoveryName,
-          arguments: options.arguments ?? JSON.stringify({ toolNames: ["jira_get_issue"] }),
-          state: options.callState ?? "complete",
-          ...(options.callMetadata === undefined ? {} : { metadata: options.callMetadata }),
-        },
-        {
-          type: "tool-result",
-          toolCallId: options.toolCallId ?? id,
-          content,
-          state: options.resultState ?? "complete",
-          ...(options.resultError === undefined ? {} : { error: options.resultError }),
-          ...(options.resultName === undefined ? {} : { name: options.resultName }),
-          ...(options.metadata === undefined ? {} : { metadata: options.metadata }),
-        },
-      ],
+      parts: [discoveryCallPart(id, options), discoveryResultPart(id, options)],
     },
   ];
+}
+const credentialLeakLocations = ["output", "text", "key", "error", "cause"] as const;
+type CredentialLeakLocation = (typeof credentialLeakLocations)[number];
+function credentialLeakRequest(location: CredentialLeakLocation) {
+  return location === "text" ? call("confluence_get_page", { page_id: "123" }) : jiraCall;
+}
+function credentialLeakRule(location: CredentialLeakLocation, secret: string) {
+  const rules = new Map([
+
+    [
+      "cause",
+      {
+        method: "tools/call",
+        error: { code: -32000, message: "Outer failure", data: { nested: secret } },
+      },
+    ],
+    [
+      "error",
+      {
+        method: "tools/call",
+        result: {
+          isError: true,
+          content: [{ type: "text", text: `${fakeEmail}: ${secret}` }],
+        },
+      },
+    ],
+    [
+      "text",
+      {
+        method: "tools/call",
+        result: {
+          isError: false,
+          content: [{ type: "text", text: `${fakeEmail}: ${secret}` }],
+        },
+      },
+    ],
+    [
+      "key",
+      {
+        method: "tools/call",
+        result: {
+          content: [],
+          structuredContent: { issue: "TEST-1", [secret]: "unsafe" },
+        },
+      },
+    ],
+    [
+      "output",
+      {
+        method: "tools/call",
+        result: {
+          content: [],
+          structuredContent: { issue: secret, reporter: { emailAddress: fakeEmail } },
+        },
+      },
+    ],
+  ]);
+  return rules.get(location)!;
 }
 
 test("unconfigured runs expose local tools and execute filesystem reads without HTTP requests", async (t) => {
@@ -1003,32 +1066,10 @@ test("credential forms in catalog descriptions and schemas, including forbidden 
 
 test("credential forms in remote output, keys and MCP errors never escape to callers", async () => {
   for (const secret of credentialForms) {
-    for (const location of ["output", "text", "key", "error", "cause"]) {
-      const request =
-        location === "text" ? call("confluence_get_page", { page_id: "123" }) : jiraCall;
+    for (const location of credentialLeakLocations) {
+      const request = credentialLeakRequest(location);
       const fixture = mcpFixture({
-        rules: [
-          {
-            method: "tools/call",
-            ...(location === "cause"
-              ? { error: { code: -32000, message: "Outer failure", data: { nested: secret } } }
-              : {
-                  result:
-                    location === "error" || location === "text"
-                      ? {
-                          isError: location === "error",
-                          content: [{ type: "text", text: `${fakeEmail}: ${secret}` }],
-                        }
-                      : {
-                          content: [],
-                          structuredContent:
-                            location === "key"
-                              ? { issue: "TEST-1", [secret]: "unsafe" }
-                              : { issue: secret, reporter: { emailAddress: fakeEmail } },
-                        },
-                }),
-          },
-        ],
+        rules: [credentialLeakRule(location, secret)],
       });
       await withMcpEnvironment(
         async () => {

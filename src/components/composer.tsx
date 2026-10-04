@@ -17,6 +17,57 @@ const EDITOR_CLASS = cn(
   "md:text-sm",
 );
 
+const SEND_ERROR: Record<Exclude<SendResult, "succeeded">, string> = {
+  failed: "執行失敗，原文已保留。",
+  uncertain: "結果尚未確認，請重新載入對話，原文已保留。",
+};
+
+function thrownMessage(cause: unknown, fallback: string): string {
+  return cause instanceof Error ? cause.message : fallback;
+}
+
+function composerCanSubmit(
+  text: string,
+  disabled: boolean,
+  busy: boolean,
+  hasSend: boolean,
+): boolean {
+  return text.trim().length > 0 && !disabled && !busy && hasSend;
+}
+
+function errorAria(
+  error: string | null,
+  errorId: string,
+): { "aria-invalid": "true"; "aria-describedby": string } | Record<string, never> {
+  if (!error) {
+    return {};
+  }
+  return {
+    "aria-invalid": "true",
+    "aria-describedby": errorId,
+  };
+}
+
+function isComposerSubmitKey(
+  event: { key: string; shiftKey: boolean; isComposing: boolean },
+  composing: boolean,
+): boolean {
+  return event.key === "Enter" && !event.shiftKey && !event.isComposing && !composing;
+}
+
+function handleComposerKeyDown(
+  form: HTMLFormElement | null,
+  composing: boolean,
+  event: { key: string; shiftKey: boolean; isComposing: boolean; preventDefault(): void },
+): boolean {
+  if (!isComposerSubmitKey(event, composing)) {
+    return false;
+  }
+  event.preventDefault();
+  form?.requestSubmit();
+  return true;
+}
+
 function SubmitButton({ disabled }: { disabled: boolean }) {
   const { pending } = useFormStatus();
 
@@ -49,7 +100,8 @@ export function Composer({
   const [error, setError] = useState<string | null>(null);
   const formRef = useRef<HTMLFormElement>(null);
 
-  const canSubmit = text.trim().length > 0 && !disabled && !busy && Boolean(onSend);
+  const canSubmit = composerCanSubmit(text, disabled, busy, Boolean(onSend));
+  const send = canSubmit ? onSend : undefined;
   const errorId = `${label}-error`;
 
   const editor = useEditor({
@@ -62,24 +114,9 @@ export function Composer({
         role: "textbox",
         "aria-multiline": "true",
         "aria-label": label,
-        ...(error
-          ? {
-              "aria-invalid": "true",
-              "aria-describedby": errorId,
-            }
-          : {}),
+        ...errorAria(error, errorId),
       },
-      handleKeyDown: (view, event) => {
-        if (event.key !== "Enter" || event.shiftKey) {
-          return false;
-        }
-        if (event.isComposing || view.composing) {
-          return false;
-        }
-        event.preventDefault();
-        formRef.current?.requestSubmit();
-        return true;
-      },
+      handleKeyDown: (view, event) => handleComposerKeyDown(formRef.current, view.composing, event),
     },
     onUpdate: ({ editor }) => {
       setText(editor.getText({ blockSeparator: "\n" }));
@@ -92,23 +129,19 @@ export function Composer({
   }, [editor, disabled]);
 
   async function submit() {
-    if (!canSubmit || !onSend) {
+    if (!send) {
       return;
     }
     setError(null);
     try {
-      const result = await onSend(text.trim());
+      const result = await send(text.trim());
       if (result === "succeeded") {
         editor.commands.clearContent();
-      } else {
-        setError(
-          result === "failed"
-            ? "執行失敗，原文已保留。"
-            : "結果尚未確認，請重新載入對話，原文已保留。",
-        );
+        return;
       }
+      setError(SEND_ERROR[result]);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "送出失敗，請稍後再試");
+      setError(thrownMessage(cause, "送出失敗，請稍後再試"));
     }
   }
 

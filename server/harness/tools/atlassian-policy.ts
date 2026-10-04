@@ -47,6 +47,9 @@ function jiraUrl(value: string): URL {
   return url;
 }
 
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "[::1]"]);
+const FORBIDDEN_ENDPOINT_FIELDS = ["username", "password", "search", "hash"] as const;
+
 function endpoint(value: string): string {
   let url: URL;
   try {
@@ -56,16 +59,12 @@ function endpoint(value: string): string {
       "ATLASSIAN_MCP_URL must be a loopback HTTP URL without credentials, query, or fragment",
     );
   }
-  const loopback = url.hostname === "127.0.0.1" || url.hostname === "[::1]";
   if (
     value !== value.trim() ||
     /\s/.test(value) ||
     url.protocol !== "http:" ||
-    !loopback ||
-    url.username ||
-    url.password ||
-    url.search ||
-    url.hash
+    !LOOPBACK_HOSTS.has(url.hostname) ||
+    FORBIDDEN_ENDPOINT_FIELDS.some((field) => Boolean(url[field]))
   ) {
     return fail(
       "ATLASSIAN_MCP_URL must be a loopback HTTP URL without credentials, query, or fragment",

@@ -10,29 +10,57 @@ const labels: Record<ToolCallPart["state"], string> = {
   error: "執行失敗",
 };
 
-export function ToolCall({ part }: { part: ToolCallPart }) {
-  let args = part.arguments;
-  const multiline: [string, string][] = [];
-  try {
-    const parsed: unknown = JSON.parse(args);
-    if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
-      const remaining: [string, unknown][] = [];
-      for (const [name, value] of Object.entries(parsed)) {
-        if (typeof value === "string" && /[\r\n]/.test(value)) {
-          multiline.push([name, value]);
-        } else {
-          remaining.push([name, value]);
-        }
-      }
-      args =
-        multiline.length > 0 && remaining.length === 0
-          ? ""
-          : JSON.stringify(Object.fromEntries(remaining), null, 2);
-    } else {
-      args = JSON.stringify(parsed, null, 2);
-    }
-  } catch {}
+type ArgumentDisplay = Readonly<{
+  args: string;
+  multiline: readonly (readonly [string, string])[];
+}>;
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isMultilineString(value: unknown): value is string {
+  return typeof value === "string" && /[\r\n]/.test(value);
+}
+
+function partitionArguments(parsed: Record<string, unknown>): {
+  multiline: Array<[string, string]>;
+  remaining: Array<[string, unknown]>;
+} {
+  const multiline: Array<[string, string]> = [];
+  const remaining: Array<[string, unknown]> = [];
+  for (const [name, value] of Object.entries(parsed)) {
+    if (isMultilineString(value)) {
+      multiline.push([name, value]);
+    } else {
+      remaining.push([name, value]);
+    }
+  }
+  return { multiline, remaining };
+}
+
+function remainingArgsText(multilineCount: number, remaining: Array<[string, unknown]>): string {
+  if (multilineCount > 0 && remaining.length === 0) {
+    return "";
+  }
+  return JSON.stringify(Object.fromEntries(remaining), null, 2);
+}
+
+function displayArguments(text: string): ArgumentDisplay {
+  try {
+    const parsed: unknown = JSON.parse(text);
+    if (!isPlainObject(parsed)) {
+      return { args: JSON.stringify(parsed, null, 2), multiline: [] };
+    }
+    const { multiline, remaining } = partitionArguments(parsed);
+    return { args: remainingArgsText(multiline.length, remaining), multiline };
+  } catch {
+    return { args: text, multiline: [] };
+  }
+}
+
+export function ToolCall({ part }: { part: ToolCallPart }) {
+  const { args, multiline } = displayArguments(part.arguments);
   return (
     <details open className="min-w-0 rounded-lg border border-border bg-muted/30 p-3">
       <summary className="cursor-pointer break-all text-sm">

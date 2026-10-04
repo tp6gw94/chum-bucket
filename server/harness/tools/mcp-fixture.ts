@@ -106,7 +106,7 @@ type FixtureOptions = {
   pages?: WireTool[][];
   rules?: FixtureRule[];
 };
-export type McpRequest = {
+type McpRequest = {
   session: string;
   headers: Record<string, string | string[] | undefined>;
   message: {
@@ -132,68 +132,26 @@ export function mcpFixture(options: FixtureOptions = {}) {
     res.end(JSON.stringify({ jsonrpc: "2.0", id: message.id, result }));
   };
 
+  const argumentsMatch = (rule: FixtureRule, message: McpRequest["message"]) =>
+    !rule.arguments ||
+    Object.entries(rule.arguments).every(
+      ([key, value]) => message.params?.arguments?.[key] === value,
+    );
+  const ruleMatches = (rule: FixtureRule, message: McpRequest["message"]) =>
+    rule.method === message.method &&
+    (!rule.name || rule.name === message.params?.name) &&
+    argumentsMatch(rule, message);
   const matchingRule = (message: McpRequest["message"]): [number, FixtureRule] | undefined => {
-    for (const [index, rule] of (options.rules ?? []).entries()) {
-      if (usedRules.has(index)) {
-        continue;
-      }
-      if (rule.method !== message.method || (rule.name && rule.name !== message.params?.name)) {
-        continue;
-      }
-      if (
-        rule.arguments &&
-        !Object.entries(rule.arguments).every(
-          ([key, value]) => message.params?.arguments?.[key] === value,
-        )
-      ) {
-        continue;
-      }
-      return [index, rule];
+    const rules = options.rules ?? [];
+    const index = rules.findIndex(
+      (rule, index) => !usedRules.has(index) && ruleMatches(rule, message),
+    );
+    if (index < 0) {
+      return undefined;
     }
-    return undefined;
+    return [index, rules[index]!];
   };
-
-  const handle = async (req: IncomingMessage, res: ServerResponse) => {
-    if (req.method === "GET") {
-      const stream: McpRequest = {
-        session: String(req.headers["mcp-session-id"] ?? ""),
-        headers: req.headers,
-        message: { jsonrpc: "2.0", method: "sse" },
-        aborted: false,
-      };
-      records.push(stream);
-      pending++;
-      let settled = false;
-      const settle = () => {
-        if (!settled) {
-          settled = true;
-          pending--;
-        }
-      };
-      res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
-      res.on("close", () => {
-        if (!settled) {
-          stream.aborted = true;
-          settle();
-        }
-      });
-      return;
-    }
-    if (req.method !== "POST") {
-      res.writeHead(404).end();
-      return;
-    }
-    const chunks: Buffer[] = [];
-    for await (const chunk of req) {
-      chunks.push(chunk as Buffer);
-    }
-    const message = JSON.parse(Buffer.concat(chunks).toString("utf8")) as McpRequest["message"];
-    const record: McpRequest = {
-      session: String(req.headers["mcp-session-id"] ?? ""),
-      headers: req.headers,
-      message,
-      aborted: false,
-    };
+  const trackRequest = (record: McpRequest, res: ServerResponse) => {
     records.push(record);
     pending++;
     let settled = false;
@@ -209,6 +167,90 @@ export function mcpFixture(options: FixtureOptions = {}) {
         settle();
       }
     });
+    return settle;
+  };
+  const listToolsResult = (message: McpRequest["message"]) => {
+    const pages = options.pages ?? [allTools.slice(0, 2), allTools.slice(2)];
+    const page = Number(message.params?.cursor ?? 0);
+    return {
+      tools: pages[page],
+      ...(page + 1 < pages.length ? { nextCursor: String(page + 1) } : {}),
+    };
+  };
+  const toolsCallResult = (message: McpRequest["message"]) => {
+    if (message.params?.name === "jira_get_issue") {
+      return {
+        content: [{ type: "text", text: "Native text fallback" }],
+        structuredContent: { issue: message.params.arguments?.issue_key },
+      };
+    }
+    return { content: [{ type: "text", text: "Native tool result" }] };
+  };
+  const rpcResults = new Map<string, (message: McpRequest["message"]) => unknown>([
+    [
+      "initialize",
+      () => ({
+        protocolVersion: "2025-03-26",
+        capabilities: { tools: {} },
+        serverInfo: { name: "offline-atlassian", version: "0.23.1" },
+      }),
+    ],
+    ["tools/list", listToolsResult],
+    ["tools/call", toolsCallResult],
+  ]);
+  const applyMatchedRule = (
+    message: McpRequest["message"],
+    res: ServerResponse,
+    settle: () => void,
+  ) => {
+    const match = matchingRule(message);
+    if (!match) {
+      return false;
+    }
+    const [index, rule] = match;
+    if (rule.once) {
+      usedRules.add(index);
+    }
+    if (rule.hang) {
+      return true;
+    }
+    if (rule.destroy) {
+      res.destroy();
+      return true;
+    }
+    if (rule.error) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ jsonrpc: "2.0", id: message.id, error: rule.error }));
+      settle();
+      return true;
+    }
+    finish(res, message, rule.result);
+    settle();
+    return true;
+  };
+  const handleGet = (req: IncomingMessage, res: ServerResponse) => {
+    const stream: McpRequest = {
+      session: String(req.headers["mcp-session-id"] ?? ""),
+      headers: req.headers,
+      message: { jsonrpc: "2.0", method: "sse" },
+      aborted: false,
+    };
+    trackRequest(stream, res);
+    res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+  };
+  const handlePost = async (req: IncomingMessage, res: ServerResponse) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) {
+      chunks.push(chunk as Buffer);
+    }
+    const message = JSON.parse(Buffer.concat(chunks).toString("utf8")) as McpRequest["message"];
+    const record: McpRequest = {
+      session: String(req.headers["mcp-session-id"] ?? ""),
+      headers: req.headers,
+      message,
+      aborted: false,
+    };
+    const settle = trackRequest(record, res);
     for (const waiter of waiters.filter((waiter) => waiter.method === message.method)) {
       waiter.resolve();
     }
@@ -223,62 +265,23 @@ export function mcpFixture(options: FixtureOptions = {}) {
       sessions.push(session);
       res.setHeader("mcp-session-id", session);
     }
-    const match = matchingRule(message);
-    if (match) {
-      const [index, rule] = match;
-      if (rule.once) {
-        usedRules.add(index);
-      }
-      if (rule.hang) {
-        return;
-      }
-      if (rule.destroy) {
-        res.destroy();
-        return;
-      }
-      if (rule.error) {
-        res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ jsonrpc: "2.0", id: message.id, error: rule.error }));
-        settle();
-        return;
-      }
-      finish(res, message, rule.result);
-      settle();
+    if (applyMatchedRule(message, res, settle)) {
       return;
     }
-    if (message.method === "initialize") {
-      finish(res, message, {
-        protocolVersion: "2025-03-26",
-        capabilities: { tools: {} },
-        serverInfo: { name: "offline-atlassian", version: "0.23.1" },
-      });
-      settle();
-      return;
-    }
-    if (message.method === "tools/list") {
-      const pages = options.pages ?? [allTools.slice(0, 2), allTools.slice(2)];
-      const page = Number(message.params?.cursor ?? 0);
-      finish(res, message, {
-        tools: pages[page],
-        ...(page + 1 < pages.length ? { nextCursor: String(page + 1) } : {}),
-      });
-      settle();
-      return;
-    }
-    if (message.method === "tools/call") {
-      if (message.params?.name === "jira_get_issue") {
-        finish(res, message, {
-          content: [{ type: "text", text: "Native text fallback" }],
-          structuredContent: { issue: message.params.arguments?.issue_key },
-        });
-      } else {
-        finish(res, message, { content: [{ type: "text", text: "Native tool result" }] });
-      }
-      settle();
-      return;
-    }
-    finish(res, message, {});
+    const result = rpcResults.get(message.method)?.(message) ?? {};
+    finish(res, message, result);
     settle();
+  };
+  const handle = async (req: IncomingMessage, res: ServerResponse) => {
+    if (req.method === "GET") {
+      handleGet(req, res);
+      return;
+    }
+    if (req.method !== "POST") {
+      res.writeHead(404).end();
+      return;
+    }
+    await handlePost(req, res);
   };
 
   return {

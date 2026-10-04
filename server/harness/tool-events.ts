@@ -1,7 +1,7 @@
 import { EventType, type StreamChunk } from "@tanstack/ai";
 
 export const maxToolEvents = 192;
-export const maxToolEventBytes = 65_536;
+const maxToolEventBytes = 65_536;
 
 export type ToolEventBuffer = Readonly<{
   emit: (name: string, value: Record<string, unknown>) => void;

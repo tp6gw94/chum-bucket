@@ -10,7 +10,7 @@ import { snapshot } from "./model-turn";
 
 export const BUILD = "durable-chat-loop-v5";
 export const MODEL = "deepseek-ai/DeepSeek-V4.1-Flash";
-export const runIdSchema = z
+const runIdSchema = z
   .string()
   .min(1)
   .max(200)
@@ -288,6 +288,31 @@ export async function checkCursor(runId: string, cursor: number, threadId?: stri
   }
 }
 
+const TERMINAL_RUN_EVENTS = new Set<StreamChunk["type"]>([
+  EventType.RUN_FINISHED,
+  EventType.RUN_ERROR,
+]);
+
+async function pollWhileOpen(signal: AbortSignal): Promise<void> {
+  await delay(100, undefined, { signal }).catch((error) => {
+    if (!signal.aborted) {
+      throw error;
+    }
+  });
+}
+
+async function runExhausted(
+  db: Awaited<ReturnType<typeof database>>,
+  runId: string,
+  cursor: number,
+): Promise<boolean> {
+  const [run] = await db.select().from(chatRunsTable).where(eq(chatRunsTable.id, runId));
+  if (!run) {
+    throw new Error("Observed run disappeared");
+  }
+  return run.state !== "pending" && cursor === run.next_sequence - 1;
+}
+
 export async function* observeRun(
   runId: string,
   cursor: number,
@@ -308,24 +333,16 @@ export async function* observeRun(
       }
       cursor = row.sequence;
       yield { sequence: cursor, event: row.payload };
-      if (row.payload.type === EventType.RUN_FINISHED || row.payload.type === EventType.RUN_ERROR) {
+      if (TERMINAL_RUN_EVENTS.has(row.payload.type)) {
         return;
       }
     }
     if (rows.length) {
       continue;
     }
-    const [run] = await db.select().from(chatRunsTable).where(eq(chatRunsTable.id, runId));
-    if (!run) {
-      throw new Error("Observed run disappeared");
-    }
-    if (run.state !== "pending" && cursor === run.next_sequence - 1) {
+    if (await runExhausted(db, runId, cursor)) {
       return;
     }
-    await delay(100, undefined, { signal }).catch((error) => {
-      if (!signal.aborted) {
-        throw error;
-      }
-    });
+    await pollWhileOpen(signal);
   }
 }

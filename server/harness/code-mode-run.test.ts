@@ -22,66 +22,111 @@ test("the durable loop runs codemode and persists its events before the result",
   const threads = new Map<string, Row>();
   const runs = new Map<string, Row>();
   const events: Row[] = [];
-  const query = async (config: string | { text: string }, values: unknown[] = []) => {
-    const text = (typeof config === "string" ? config : config.text)
-      .replace(/"(?:threads|chat_runs|chat_events)"\./g, "")
-      .replaceAll('"', "");
-    const threadColumns =
-      "id, title, agent, revision, active_run_id, messages, parent_thread_id, created_at, updated_at";
-    const runColumns =
-      "id, thread_id, request, accepted, projection, state, next_sequence, log_bytes, created_at";
-    const [a, b, c, d, e] = values;
-    let rows: Row[] = [];
-    if (["begin", "commit", "rollback"].includes(text)) {
-      return { rows, rowCount: 0 };
-    }
-    if (text.startsWith(`select ${threadColumns} from threads`)) {
-      rows = [threads.get(String(a))].filter((row): row is Row => !!row);
-    } else if (
-      text.startsWith("select thread_id from chat_runs") ||
-      text.startsWith(`select ${runColumns} from chat_runs where id`) ||
-      text.startsWith(`select ${runColumns} from chat_runs where state`)
-    ) {
-      rows = [...runs.values()].filter((row) => (text.includes("where id") ? row.id === a : true));
-    } else if (text.startsWith("insert into chat_runs")) {
-      const row = {
-        id: a,
-        thread_id: b,
-        request: JSON.parse(String(c)),
-        accepted: JSON.parse(String(d)),
-        projection: JSON.parse(String(e)),
-        state: "pending",
-        next_sequence: 0,
-        log_bytes: 0,
-      };
-      runs.set(String(a), row);
-      rows = [row];
-    } else if (text.startsWith("update chat_runs set projection")) {
-      runs.get(String(b))!.projection = JSON.parse(String(a));
-    } else if (text.startsWith("update threads set title")) {
-      const thread = threads.get(String(d))!;
-      thread.title = a;
-      thread.messages = JSON.parse(String(c));
-      thread.revision = Number(thread.revision) + 1;
-      thread.active_run_id = null;
-    } else if (text.startsWith("update threads set active_run_id")) {
-      threads.get(String(b))!.active_run_id = a;
-    } else if (text.startsWith("select sequence, payload from chat_events")) {
-      rows = events
-        .filter((row) => row.run_id === a && Number(row.sequence) > Number(b))
-        .sort((left, right) => Number(left.sequence) - Number(right.sequence))
-        .slice(0, Number(c));
-    } else if (text.startsWith("insert into chat_events")) {
-      events.push({ run_id: a, sequence: b, event_key: c, payload: JSON.parse(String(d)) });
-    } else if (text.startsWith("update chat_runs set next_sequence")) {
-      const run = runs.get(String(b))!;
-      run.next_sequence = Number(run.next_sequence) + 1;
-      run.log_bytes = Number(run.log_bytes) + Number(a);
-    } else if (text.startsWith("update chat_runs set state")) {
-      runs.get(String(b))!.state = a;
-    } else {
-      throw new Error(`Unsupported offline SQL: ${text}`);
-    }
+  const threadColumns =
+    "id, title, agent, revision, active_run_id, messages, parent_thread_id, created_at, updated_at";
+  const runColumns =
+    "id, thread_id, request, accepted, projection, state, next_sequence, log_bytes, created_at";
+  type SqlHandler = {
+    matches: (text: string) => boolean;
+    execute: (text: string, values: readonly unknown[]) => Row[];
+  };
+  const sqlHandlers: ReadonlyArray<SqlHandler> = [
+    {
+      matches: (text) => ["begin", "commit", "rollback"].includes(text),
+      execute: () => [],
+    },
+    {
+      matches: (text) => text.startsWith(`select ${threadColumns} from threads`),
+      execute: (_text, values) =>
+        [threads.get(String(values[0]))].filter((row): row is Row => !!row),
+    },
+    {
+      matches: (text) =>
+        text.startsWith("select thread_id from chat_runs") ||
+        text.startsWith(`select ${runColumns} from chat_runs where id`) ||
+        text.startsWith(`select ${runColumns} from chat_runs where state`),
+      execute: (text, values) =>
+        [...runs.values()].filter((row) => (text.includes("where id") ? row.id === values[0] : true)),
+    },
+    {
+      matches: (text) => text.startsWith("insert into chat_runs"),
+      execute: (_text, values) => {
+        const [a, b, c, d, e] = values;
+        const row = {
+          id: a,
+          thread_id: b,
+          request: JSON.parse(String(c)),
+          accepted: JSON.parse(String(d)),
+          projection: JSON.parse(String(e)),
+          state: "pending",
+          next_sequence: 0,
+          log_bytes: 0,
+        };
+        runs.set(String(a), row);
+        return [row];
+      },
+    },
+    {
+      matches: (text) => text.startsWith("update chat_runs set projection"),
+      execute: (_text, values) => {
+        runs.get(String(values[1]))!.projection = JSON.parse(String(values[0]));
+        return [];
+      },
+    },
+    {
+      matches: (text) => text.startsWith("update threads set title"),
+      execute: (_text, values) => {
+        const thread = threads.get(String(values[3]))!;
+        thread.title = values[0];
+        thread.messages = JSON.parse(String(values[2]));
+        thread.revision = Number(thread.revision) + 1;
+        thread.active_run_id = null;
+        return [];
+      },
+    },
+    {
+      matches: (text) => text.startsWith("update threads set active_run_id"),
+      execute: (_text, values) => {
+        threads.get(String(values[1]))!.active_run_id = values[0];
+        return [];
+      },
+    },
+    {
+      matches: (text) => text.startsWith("select sequence, payload from chat_events"),
+      execute: (_text, values) => {
+        const [a, b, c] = values;
+        return events
+          .filter((row) => row.run_id === a && Number(row.sequence) > Number(b))
+          .sort((left, right) => Number(left.sequence) - Number(right.sequence))
+          .slice(0, Number(c));
+      },
+    },
+    {
+      matches: (text) => text.startsWith("insert into chat_events"),
+      execute: (_text, values) => {
+        const [a, b, c, d] = values;
+        events.push({ run_id: a, sequence: b, event_key: c, payload: JSON.parse(String(d)) });
+        return [];
+      },
+    },
+    {
+      matches: (text) => text.startsWith("update chat_runs set next_sequence"),
+      execute: (_text, values) => {
+        const run = runs.get(String(values[1]))!;
+        run.next_sequence = Number(run.next_sequence) + 1;
+        run.log_bytes = Number(run.log_bytes) + Number(values[0]);
+        return [];
+      },
+    },
+    {
+      matches: (text) => text.startsWith("update chat_runs set state"),
+      execute: (_text, values) => {
+        runs.get(String(values[1]))!.state = values[0];
+        return [];
+      },
+    },
+  ];
+  const projectQueryRows = (config: string | { text: string }, text: string, rows: Row[]) => {
     const columns = text.startsWith("select ")
       ? text.slice(7, text.indexOf(" from "))
       : text.split(" returning ")[1];
@@ -93,6 +138,16 @@ test("the durable loop runs codemode and persists its events before the result",
       ),
       rowCount: rows.length,
     };
+  };
+  const query = async (config: string | { text: string }, values: unknown[] = []) => {
+    const text = (typeof config === "string" ? config : config.text)
+      .replace(/"(?:threads|chat_runs|chat_events)"\./g, "")
+      .replaceAll('"', "");
+    const handler = sqlHandlers.find((entry) => entry.matches(text));
+    if (!handler) {
+      throw new Error(`Unsupported offline SQL: ${text}`);
+    }
+    return projectQueryRows(config, text, handler.execute(text, values));
   };
   const pool = Pool.prototype as unknown as {
     connect: () => Promise<{ query: typeof query; release: () => void }>;

@@ -5,12 +5,12 @@ import type { StreamChunk } from "@tanstack/ai";
 import { fetchServerSentEvents, useChat } from "@tanstack/ai-react";
 
 const threadSchema = z.object({ id: z.uuid(), title: z.string() });
-export type ThreadSummary = z.infer<typeof threadSchema>;
+type ThreadRecord = z.infer<typeof threadSchema>;
 export type PageEntry =
   | { kind: "choose" }
   | { kind: "invalid" }
   | { kind: "thread"; threadId: string };
-export type ThreadPhase = "loading" | "ready" | "busy" | "uncertain" | "load-error";
+type ThreadPhase = "loading" | "ready" | "busy" | "uncertain" | "load-error";
 export type SendResult = "succeeded" | "failed" | "uncertain";
 
 export function readPageEntry(): PageEntry {
@@ -31,7 +31,7 @@ export function threadUrl(id: string | null) {
   return url.href;
 }
 
-export async function createThread(): Promise<ThreadSummary> {
+export async function createThread(): Promise<ThreadRecord> {
   const response = await fetch("/api/thread", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -44,7 +44,7 @@ export async function createThread(): Promise<ThreadSummary> {
 }
 
 export function useThreadList() {
-  const [threads, setThreads] = useState<ThreadSummary[]>([]);
+  const [threads, setThreads] = useState<ThreadRecord[]>([]);
   const [error, setError] = useState<string | null>(null);
   useEffect(() => {
     const controller = new AbortController();

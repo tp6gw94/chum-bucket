@@ -3,6 +3,28 @@ import { CircleIcon, LoaderCircleIcon } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import type { RunStatus } from "./types";
 
+type StatusPresentation = Readonly<{
+  Icon: typeof CircleIcon;
+  variant: "default" | "secondary";
+  className: string | undefined;
+  labelKey: "runningLabel" | "idleLabel";
+}>;
+
+const STATUS_PRESENTATION: Record<RunStatus, StatusPresentation> = {
+  running: {
+    Icon: LoaderCircleIcon,
+    variant: "default",
+    className: "motion-safe:animate-spin",
+    labelKey: "runningLabel",
+  },
+  idle: {
+    Icon: CircleIcon,
+    variant: "secondary",
+    className: undefined,
+    labelKey: "idleLabel",
+  },
+};
+
 export function StatusBadge({
   status,
   runningLabel,
@@ -12,15 +34,13 @@ export function StatusBadge({
   runningLabel: string;
   idleLabel: string;
 }) {
-  const running = status === "running";
-  const Icon = running ? LoaderCircleIcon : CircleIcon;
+  const presentation = STATUS_PRESENTATION[status];
+  const Icon = presentation.Icon;
+  const labels: Record<StatusPresentation["labelKey"], string> = { runningLabel, idleLabel };
   return (
-    <Badge variant={running ? "default" : "secondary"}>
-      <Icon
-        data-icon="inline-start"
-        className={running ? "motion-safe:animate-spin" : undefined}
-      />
-      {running ? runningLabel : idleLabel}
+    <Badge variant={presentation.variant}>
+      <Icon data-icon="inline-start" className={presentation.className} />
+      {labels[presentation.labelKey]}
     </Badge>
   );
 }

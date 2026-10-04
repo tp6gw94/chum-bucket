@@ -5,7 +5,7 @@ import { useEffect, useRef, useState } from "react";
 import { Pane } from "./components/pane";
 import { ThreadSidebar } from "./components/thread-sidebar";
 import { TopBar } from "./components/top-bar";
-import type { Pane as PaneModel, ThreadSummary } from "./components/types";
+import type { Pane as PaneModel, RunStatus, ThreadSummary } from "./components/types";
 import {
   createThread,
   readPageEntry,
@@ -15,6 +15,50 @@ import {
 } from "./hooks/use-threads";
 import { Button } from "@/components/ui/button";
 import { Provider } from "./Provider";
+
+function claimErrorMessage(cause: unknown): string {
+  return cause instanceof Error ? cause.message : "建立對話失敗";
+}
+
+async function resolveEntryId(id: string | null): Promise<string> {
+  return id ?? (await createThread()).id;
+}
+
+function threadTitle(threads: readonly { id: string; title: string }[], threadId: string): string {
+  return threads.find((item) => item.id === threadId)?.title ?? "新對話";
+}
+
+function toMainPane(
+  threadId: string,
+  threads: readonly { id: string; title: string }[],
+  messages: PaneModel["messages"],
+  busy: boolean,
+): PaneModel {
+  return {
+    id: threadId ?? "draft",
+    title: threadTitle(threads, threadId),
+    agent: "main",
+    status: busy ? "running" : "idle",
+    progress: [],
+    messages,
+    kind: "main",
+  };
+}
+
+function toSidebarSummary(
+  thread: { id: string; title: string },
+  threadId: string,
+  activeStatus: RunStatus,
+  activePaneCount: number,
+): ThreadSummary {
+  const active = thread.id === threadId;
+  return {
+    ...thread,
+    agent: "main",
+    status: active ? activeStatus : "idle",
+    paneCount: active ? activePaneCount : 1,
+  };
+}
 
 function ThreadEntry() {
   const { threads, error } = useThreadList();
@@ -28,12 +72,11 @@ function ThreadEntry() {
     claim.current = true;
     setBusy(true);
     try {
-      const selected = id ?? (await createThread()).id;
-      window.location.assign(threadUrl(selected));
+      window.location.assign(threadUrl(await resolveEntryId(id)));
     } catch (cause) {
       claim.current = false;
       setBusy(false);
-      setCreateError(cause instanceof Error ? cause.message : "建立對話失敗");
+      setCreateError(claimErrorMessage(cause));
     }
   }
   return (
@@ -63,8 +106,11 @@ function ThreadPage({ threadId }: { threadId: string }) {
   const { threads, error: listError } = useThreadList();
   const thread = useThread(threadId);
   const { messages, send } = thread;
-  const isLoading = thread.phase === "busy";
   const sendDisabled = thread.phase !== "ready";
+  const mainPane = toMainPane(threadId, threads, messages, thread.phase === "busy");
+  const threadSummaries = threads.map((item) =>
+    toSidebarSummary(item, threadId, mainPane.status, 1 + agentPanes.length),
+  );
 
   function openAgentPane() {
     setAgentPanes((panes) => [
@@ -84,24 +130,6 @@ function ThreadPage({ threadId }: { threadId: string }) {
   function closeAgentPane(id: string) {
     setAgentPanes((panes) => panes.filter((pane) => pane.id !== id));
   }
-
-  const mainPane: PaneModel = {
-    id: threadId ?? "draft",
-    title: threads.find((item) => item.id === threadId)?.title ?? "新對話",
-    agent: "main",
-    status: isLoading ? "running" : "idle",
-    progress: [],
-    messages,
-    kind: "main",
-  };
-  const panes = [mainPane, ...agentPanes];
-
-  const threadSummaries: ThreadSummary[] = threads.map((thread) => ({
-    ...thread,
-    agent: "main",
-    status: thread.id === threadId ? mainPane.status : "idle",
-    paneCount: thread.id === threadId ? panes.length : 1,
-  }));
 
   return (
     <Provider>
@@ -123,16 +151,22 @@ function ThreadPage({ threadId }: { threadId: string }) {
             tabIndex={0}
             className="flex min-w-0 flex-1 snap-x snap-proximity items-stretch overflow-x-auto overflow-y-hidden overscroll-x-contain"
           >
-            {panes.map((pane) => (
+            <Pane
+              key={mainPane.id}
+              pane={mainPane}
+              onOpenAgentPane={openAgentPane}
+              onSend={send}
+              sendDisabled={sendDisabled}
+              isHydrating={thread.phase === "loading"}
+              hydrationError={thread.error}
+            />
+            {agentPanes.map((pane) => (
               <Pane
                 key={pane.id}
                 pane={pane}
                 onOpenAgentPane={openAgentPane}
-                onClose={pane.kind === "agent" ? () => closeAgentPane(pane.id) : undefined}
-                onSend={pane.kind === "main" ? send : undefined}
+                onClose={() => closeAgentPane(pane.id)}
                 sendDisabled={sendDisabled}
-                isHydrating={pane.kind === "main" && thread.phase === "loading"}
-                hydrationError={pane.kind === "main" ? thread.error : null}
               />
             ))}
           </main>

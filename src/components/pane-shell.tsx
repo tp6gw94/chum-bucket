@@ -10,6 +10,22 @@ function clampWidth(width: number) {
   return Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, width));
 }
 
+type WidthTransform = (width: number, step: number) => number;
+
+const WIDTH_KEYS: Record<string, WidthTransform> = {
+  ArrowLeft: (width, step) => clampWidth(width - step),
+  ArrowRight: (width, step) => clampWidth(width + step),
+  Home: () => MIN_WIDTH,
+  End: () => MAX_WIDTH,
+};
+
+function ownTransform(key: string): WidthTransform | undefined {
+  if (!Object.hasOwn(WIDTH_KEYS, key)) {
+    return undefined;
+  }
+  return WIDTH_KEYS[key];
+}
+
 export function PaneShell({
   label,
   defaultWidth,
@@ -42,19 +58,12 @@ export function PaneShell({
 
   function handleKeyDown(event: React.KeyboardEvent<HTMLDivElement>) {
     const step = event.shiftKey ? COARSE_KEYBOARD_STEP : KEYBOARD_STEP;
-    if (event.key === "ArrowLeft") {
-      event.preventDefault();
-      setWidth((current) => clampWidth(current - step));
-    } else if (event.key === "ArrowRight") {
-      event.preventDefault();
-      setWidth((current) => clampWidth(current + step));
-    } else if (event.key === "Home") {
-      event.preventDefault();
-      setWidth(MIN_WIDTH);
-    } else if (event.key === "End") {
-      event.preventDefault();
-      setWidth(MAX_WIDTH);
+    const transform = ownTransform(event.key);
+    if (!transform) {
+      return;
     }
+    event.preventDefault();
+    setWidth((current) => transform(current, step));
   }
 
   return (

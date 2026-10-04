@@ -1303,97 +1303,165 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
   let events: Row[] = [];
   let tail: Promise<void> = Promise.resolve();
   const statements: string[] = [];
-  const query = async (
+  const threadColumns =
+    "id, title, agent, revision, active_run_id, messages, parent_thread_id, created_at, updated_at";
+  const runColumns =
+    "id, thread_id, request, accepted, projection, state, next_sequence, log_bytes, created_at";
+  type SqlHandler = {
+    matches: (text: string) => boolean;
+    execute: (values: readonly unknown[]) => Row[];
+  };
+  const assertSql = (text: string, prefix: string, exact: string) => {
+    if (!text.startsWith(prefix)) {
+      return false;
+    }
+    assert.equal(text, exact);
+    return true;
+  };
+  const sqlHandlers: ReadonlyArray<SqlHandler> = [
+    {
+      matches: (text) => ["begin", "commit", "rollback"].includes(text),
+      execute: () => [],
+    },
+    {
+      matches: (text) => text.startsWith(`select ${threadColumns} from threads`),
+      execute: (values) => [threads.get(String(values[0]))].filter((row): row is Row => !!row),
+    },
+    {
+      matches: (text) =>
+        text.startsWith("select thread_id from chat_runs") ||
+        text.startsWith(`select ${runColumns} from chat_runs where id`),
+      execute: (values) => [runs.get(String(values[0]))].filter((row): row is Row => !!row),
+    },
+    {
+      matches: (text) =>
+        assertSql(
+          text,
+          `select ${runColumns} from chat_runs where state`,
+          `select ${runColumns} from chat_runs where state = $1 order by created_at`,
+        ),
+      execute: (values) => {
+        assert.equal(values[0], "pending");
+        return [...runs.values()].filter((row) => row.state === values[0]);
+      },
+    },
+    {
+      matches: (text) => {
+        if (!text.startsWith("insert into chat_runs")) {
+          return false;
+        }
+        assert.ok(text.endsWith(`on conflict (id) do nothing returning ${runColumns}`));
+        return true;
+      },
+      execute: (values) => {
+        const [a, b, c, d, e] = values;
+        if (!runs.has(String(a))) {
+          const row = {
+            id: a,
+            thread_id: b,
+            request: JSON.parse(String(c)),
+            accepted: JSON.parse(String(d)),
+            projection: JSON.parse(String(e)),
+            state: "pending",
+            next_sequence: 0,
+            log_bytes: 0,
+          };
+          runs.set(String(a), row);
+          return [row];
+        }
+        return [];
+      },
+    },
+    {
+      matches: (text) => text.startsWith("update chat_runs set projection"),
+      execute: (values) => {
+        runs.get(String(values[1]))!.projection = JSON.parse(String(values[0]));
+        return [];
+      },
+    },
+    {
+      matches: (text) =>
+        assertSql(
+          text,
+          "update threads set title",
+          "update threads set title = $1, revision = revision + 1, active_run_id = $2, messages = $3, updated_at = now() where id = $4",
+        ),
+      execute: (values) => {
+        const [a, b, c, d] = values;
+        assert.equal(b, null);
+        const thread = threads.get(String(d))!;
+        thread.title = a;
+        thread.messages = JSON.parse(String(c));
+        thread.revision = Number(thread.revision) + 1;
+        thread.active_run_id = null;
+        return [];
+      },
+    },
+    {
+      matches: (text) => text.startsWith("update threads set active_run_id"),
+      execute: (values) => {
+        threads.get(String(values[1]))!.active_run_id = values[0];
+        return [];
+      },
+    },
+    {
+      matches: (text) =>
+        assertSql(
+          text,
+          "select sequence, payload from chat_events",
+          "select sequence, payload from chat_events where (run_id = $1 and sequence > $2) order by sequence limit $3",
+        ),
+      execute: (values) => {
+        const [a, b, c] = values;
+        assert.equal(c, 100);
+        return events
+          .filter((row) => row.run_id === a && Number(row.sequence) > Number(b))
+          .sort((a, b) => Number(a.sequence) - Number(b.sequence))
+          .slice(0, Number(c));
+      },
+    },
+    {
+      matches: (text) => text.startsWith("insert into chat_events"),
+      execute: (values) => {
+        const [a, b, c, d] = values;
+        events.push({ run_id: a, sequence: b, event_key: c, payload: JSON.parse(String(d)) });
+        return [];
+      },
+    },
+    {
+      matches: (text) =>
+        assertSql(
+          text,
+          "update chat_runs set next_sequence",
+          "update chat_runs set next_sequence = next_sequence + 1, log_bytes = log_bytes + $1 where id = $2",
+        ),
+      execute: (values) => {
+        const run = runs.get(String(values[1]))!;
+        run.next_sequence = Number(run.next_sequence) + 1;
+        run.log_bytes = Number(run.log_bytes) + Number(values[0]);
+        return [];
+      },
+    },
+    {
+      matches: (text) => text.startsWith("update chat_runs set state"),
+      execute: (values) => {
+        runs.get(String(values[1]))!.state = values[0];
+        return [];
+      },
+    },
+  ];
+  const assertChatRunLock = (text: string) => {
+    if (!text.endsWith("from chat_runs where id = $1 for update")) {
+      return;
+    }
+    assert.ok(statements.at(-1)?.endsWith("from threads where id = $1 for update"));
+    assert.equal(statements.at(-2), "select thread_id from chat_runs where id = $1");
+  };
+  const projectQueryRows = (
     config: string | { text: string; rowMode?: string },
-    values: unknown[] = [],
+    text: string,
+    rows: Row[],
   ) => {
-    const text = (typeof config === "string" ? config : config.text)
-      .replace(/"(?:threads|chat_runs|chat_events)"\./g, "")
-      .replaceAll('"', "");
-    if (text.endsWith("from chat_runs where id = $1 for update")) {
-      assert.ok(statements.at(-1)?.endsWith("from threads where id = $1 for update"));
-      assert.equal(statements.at(-2), "select thread_id from chat_runs where id = $1");
-    }
-    statements.push(text);
-    const threadColumns =
-      "id, title, agent, revision, active_run_id, messages, parent_thread_id, created_at, updated_at";
-    const runColumns =
-      "id, thread_id, request, accepted, projection, state, next_sequence, log_bytes, created_at";
-    const [a, b, c, d, e] = values;
-    let rows: Row[] = [];
-    if (["begin", "commit", "rollback"].includes(text)) {
-      return { rows, rowCount: 0 };
-    }
-    if (text.startsWith(`select ${threadColumns} from threads`)) {
-      rows = [threads.get(String(a))].filter((row): row is Row => !!row);
-    } else if (
-      text.startsWith("select thread_id from chat_runs") ||
-      text.startsWith(`select ${runColumns} from chat_runs where id`)
-    ) {
-      rows = [runs.get(String(a))].filter((row): row is Row => !!row);
-    } else if (text.startsWith(`select ${runColumns} from chat_runs where state`)) {
-      assert.equal(
-        text,
-        `select ${runColumns} from chat_runs where state = $1 order by created_at`,
-      );
-      assert.equal(a, "pending");
-      rows = [...runs.values()].filter((row) => row.state === a);
-    } else if (text.startsWith("insert into chat_runs")) {
-      assert.ok(text.endsWith(`on conflict (id) do nothing returning ${runColumns}`));
-      if (!runs.has(String(a))) {
-        const row = {
-          id: a,
-          thread_id: b,
-          request: JSON.parse(String(c)),
-          accepted: JSON.parse(String(d)),
-          projection: JSON.parse(String(e)),
-          state: "pending",
-          next_sequence: 0,
-          log_bytes: 0,
-        };
-        runs.set(String(a), row);
-        rows = [row];
-      }
-    } else if (text.startsWith("update chat_runs set projection")) {
-      runs.get(String(b))!.projection = JSON.parse(String(a));
-    } else if (text.startsWith("update threads set title")) {
-      assert.equal(
-        text,
-        "update threads set title = $1, revision = revision + 1, active_run_id = $2, messages = $3, updated_at = now() where id = $4",
-      );
-      assert.equal(b, null);
-      const thread = threads.get(String(d))!;
-      thread.title = a;
-      thread.messages = JSON.parse(String(c));
-      thread.revision = Number(thread.revision) + 1;
-      thread.active_run_id = null;
-    } else if (text.startsWith("update threads set active_run_id")) {
-      threads.get(String(b))!.active_run_id = a;
-    } else if (text.startsWith("select sequence, payload from chat_events")) {
-      assert.equal(
-        text,
-        "select sequence, payload from chat_events where (run_id = $1 and sequence > $2) order by sequence limit $3",
-      );
-      assert.equal(c, 100);
-      rows = events
-        .filter((row) => row.run_id === a && Number(row.sequence) > Number(b))
-        .sort((a, b) => Number(a.sequence) - Number(b.sequence))
-        .slice(0, Number(c));
-    } else if (text.startsWith("insert into chat_events")) {
-      events.push({ run_id: a, sequence: b, event_key: c, payload: JSON.parse(String(d)) });
-    } else if (text.startsWith("update chat_runs set next_sequence")) {
-      assert.equal(
-        text,
-        "update chat_runs set next_sequence = next_sequence + 1, log_bytes = log_bytes + $1 where id = $2",
-      );
-      const run = runs.get(String(b))!;
-      run.next_sequence = Number(run.next_sequence) + 1;
-      run.log_bytes = Number(run.log_bytes) + Number(a);
-    } else if (text.startsWith("update chat_runs set state")) {
-      runs.get(String(b))!.state = a;
-    } else {
-      throw new Error(`Unsupported offline SQL: ${text}`);
-    }
     const columns = text.startsWith("select ")
       ? text.slice(7, text.indexOf(" from "))
       : text.split(" returning ")[1];
@@ -1405,6 +1473,21 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
       ),
       rowCount: rows.length,
     };
+  };
+  const query = async (
+    config: string | { text: string; rowMode?: string },
+    values: unknown[] = [],
+  ) => {
+    const text = (typeof config === "string" ? config : config.text)
+      .replace(/"(?:threads|chat_runs|chat_events)"\./g, "")
+      .replaceAll('"', "");
+    assertChatRunLock(text);
+    statements.push(text);
+    const handler = sqlHandlers.find((entry) => entry.matches(text));
+    if (!handler) {
+      throw new Error(`Unsupported offline SQL: ${text}`);
+    }
+    return projectQueryRows(config, text, handler.execute(values));
   };
   const pool = Pool.prototype as unknown as {
     connect: () => Promise<{ query: typeof query; release: () => void }>;

@@ -29,7 +29,7 @@ const codeModeInputSchema = z
   })
   .strict();
 
-export class CodeModeBoundaryError extends Error {}
+class CodeModeBoundaryError extends Error {}
 
 export type CodeModePolicy = Readonly<{
   timeoutMs: number;
@@ -199,50 +199,55 @@ function byteLength(value: unknown): number {
 }
 
 type ProjectedEvent = Readonly<{ name: string; value: Record<string, unknown> }>;
+type EventProjector = (payload: Record<string, unknown>) => Record<string, unknown>;
+
+const eventProjectors = new Map<string, EventProjector>([
+  ["code_mode:execution_started", (payload) => ({ codeLength: payload.codeLength ?? 0 })],
+  [
+    "code_mode:console",
+    (payload) => ({
+      level: payload.level ?? "log",
+      byteLength: typeof payload.message === "string" ? payload.message.length : 0,
+    }),
+  ],
+  [
+    "code_mode:external_call",
+    (payload) => ({ function: payload.function ?? "", argumentBytes: byteLength(payload.args) }),
+  ],
+  [
+    "code_mode:external_result",
+    (payload) => ({
+      function: payload.function ?? "",
+      duration: payload.duration ?? 0,
+      resultBytes: byteLength(payload.result),
+    }),
+  ],
+  [
+    "code_mode:external_error",
+    (payload) => ({ function: payload.function ?? "", duration: payload.duration ?? 0 }),
+  ],
+  [
+    "code_mode:execution_finished",
+    (payload) => ({
+      phase: payload.phase ?? "",
+      success: payload.success === true,
+      durationMs: payload.durationMs ?? 0,
+      logCount: payload.logCount ?? 0,
+    }),
+  ],
+]);
 
 function projectEvent(name: string, payload: Record<string, unknown>): ProjectedEvent | undefined {
-  switch (name) {
-    case "code_mode:execution_started":
-      return { name, value: { codeLength: payload.codeLength ?? 0 } };
-    case "code_mode:console":
-      return {
-        name,
-        value: {
-          level: payload.level ?? "log",
-          byteLength: typeof payload.message === "string" ? payload.message.length : 0,
-        },
-      };
-    case "code_mode:external_call":
-      return {
-        name,
-        value: { function: payload.function ?? "", argumentBytes: byteLength(payload.args) },
-      };
-    case "code_mode:external_result":
-      return {
-        name,
-        value: {
-          function: payload.function ?? "",
-          duration: payload.duration ?? 0,
-          resultBytes: byteLength(payload.result),
-        },
-      };
-    case "code_mode:external_error":
-      return {
-        name,
-        value: { function: payload.function ?? "", duration: payload.duration ?? 0 },
-      };
-    case "code_mode:execution_finished":
-      return {
-        name,
-        value: {
-          phase: payload.phase ?? "",
-          success: payload.success === true,
-          durationMs: payload.durationMs ?? 0,
-          logCount: payload.logCount ?? 0,
-        },
-      };
-    default:
-      return undefined;
+  const projector = eventProjectors.get(name);
+  if (!projector) {
+    return undefined;
+  }
+  return { name, value: projector(payload) };
+}
+
+function assertObjectInput(value: unknown): asserts value is Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new CodeModeBoundaryError("codemode tool input must be an object");
   }
 }
 
@@ -278,31 +283,108 @@ export function composeCodeModeTurn(input: {
       throw stop(failure instanceof Error ? failure.message : "codemode boundary check failed");
     }
   };
+  function assertHostCallOpen(): void {
+    if (state.fatal) {
+      throw stopped();
+    }
+    if (state.closed) {
+      throw new CodeModeBoundaryError("codemode is no longer accepting tool calls");
+    }
+    if (state.signal?.aborted) {
+      throw stop("codemode was cancelled");
+    }
+  }
+  function assertHostCallStillOpen(): void {
+    if (state.signal?.aborted) {
+      throw stop("codemode was cancelled");
+    }
+    if (state.fatal) {
+      throw stopped();
+    }
+    if (state.closed) {
+      throw new CodeModeBoundaryError("codemode is no longer accepting tool calls");
+    }
+  }
+  function rethrowHostFailure(failure: unknown): never {
+    if (state.signal?.aborted) {
+      throw stop("codemode was cancelled");
+    }
+    if (failure instanceof ToolBoundaryError) {
+      throw stop(failure.message);
+    }
+    throw failure;
+  }
+  function boundHostResult(output: unknown): unknown {
+    assertHostCallStillOpen();
+    guarded(output);
+    if (byteLength(output) > policy.maxHostResultBytes) {
+      throw stop("codemode tool result is too large");
+    }
+    return output;
+  }
+  function boundSandboxResult(result: unknown): unknown {
+    guarded(result);
+    if (byteLength(result) > policy.maxResultBytes) {
+      throw stop("codemode result is too large");
+    }
+    const logs = (result as { logs?: unknown }).logs;
+    if (Array.isArray(logs) && logs.length > policy.maxConsoleEntries) {
+      throw stop("codemode console output exceeded its bound");
+    }
+    return result;
+  }
+  type CustomEmit = ToolExecutionContext["emitCustomEvent"];
+  function emitProjected(
+    emit: CustomEmit,
+    name: string,
+    payload: Record<string, unknown>,
+    options?: Parameters<CustomEmit>[2],
+  ): void {
+    guarded(payload);
+    const projected = projectEvent(name, payload);
+    if (projected) {
+      emit(projected.name, projected.value, options);
+    }
+  }
+  function onSandboxEvent(
+    emit: CustomEmit,
+    controller: AbortController,
+    name: string,
+    payload: Record<string, unknown>,
+    options?: Parameters<CustomEmit>[2],
+  ): void {
+    if (name === "code_mode:execution_finished") {
+      state.closed = true;
+      controller.abort();
+      emitProjected(emit, name, payload, options);
+      return;
+    }
+    if (state.closed) {
+      return;
+    }
+    try {
+      emitProjected(emit, name, payload, options);
+    } catch (failure) {
+      state.fatal = true;
+      state.closed = true;
+      controller.abort();
+      throw failure;
+    }
+  }
   const adapter = (definition: ModelTool): CodeModeTool => ({
     __toolSide: "server",
     name: definition.name,
     description: definition.description,
     inputSchema: definition.inputSchema,
     execute: async (value: unknown) => {
-      if (state.fatal) {
-        throw stopped();
-      }
-      if (state.closed) {
-        throw new CodeModeBoundaryError("codemode is no longer accepting tool calls");
-      }
-      if (state.signal?.aborted) {
-        throw stop("codemode was cancelled");
-      }
+      assertHostCallOpen();
       if (state.calls >= policy.maxHostCalls) {
         throw stop(`codemode exceeded ${policy.maxHostCalls} tool calls`);
       }
-      if (!value || typeof value !== "object" || Array.isArray(value)) {
-        throw new CodeModeBoundaryError("codemode tool input must be an object");
-      }
+      assertObjectInput(value);
       state.calls += 1;
       guarded(value);
-      const parsed = value;
-      const argumentsText = encoded(parsed);
+      const argumentsText = encoded(value);
       if (Buffer.byteLength(argumentsText) > policy.maxHostInputBytes) {
         throw stop("codemode tool input is too large");
       }
@@ -310,7 +392,7 @@ export function composeCodeModeTurn(input: {
       let output: unknown;
       try {
         output = await input.dispatch(
-          { id: childId, name: definition.name, arguments: argumentsText, input: parsed },
+          { id: childId, name: definition.name, arguments: argumentsText, input: value },
           {
             toolCallId: childId,
             abortSignal: state.signal,
@@ -320,28 +402,9 @@ export function composeCodeModeTurn(input: {
           },
         );
       } catch (failure) {
-        if (state.signal?.aborted) {
-          throw stop("codemode was cancelled");
-        }
-        if (failure instanceof ToolBoundaryError) {
-          throw stop(failure.message);
-        }
-        throw failure;
+        rethrowHostFailure(failure);
       }
-      if (state.signal?.aborted) {
-        throw stop("codemode was cancelled");
-      }
-      if (state.fatal) {
-        throw stopped();
-      }
-      if (state.closed) {
-        throw new CodeModeBoundaryError("codemode is no longer accepting tool calls");
-      }
-      guarded(output);
-      if (byteLength(output) > policy.maxHostResultBytes) {
-        throw stop("codemode tool result is too large");
-      }
-      return output;
+      return boundHostResult(output);
     },
   });
   const sandboxTools = input.definitions
@@ -409,46 +472,14 @@ export function composeCodeModeTurn(input: {
       try {
         const result = await composed.tool.execute!(request, {
           ...context,
-          emitCustomEvent: (name: string, payload: Record<string, unknown>, options) => {
-            if (name === "code_mode:execution_finished") {
-              state.closed = true;
-              controller.abort();
-              guarded(payload);
-              const projected = projectEvent(name, payload);
-              if (projected) {
-                emit(projected.name, projected.value, options);
-              }
-              return;
-            }
-            if (state.closed) {
-              return;
-            }
-            try {
-              guarded(payload);
-              const projected = projectEvent(name, payload);
-              if (projected) {
-                emit(projected.name, projected.value, options);
-              }
-            } catch (failure) {
-              state.fatal = true;
-              state.closed = true;
-              controller.abort();
-              throw failure;
-            }
+          emitCustomEvent: (name, payload, options) => {
+            onSandboxEvent(emit, controller, name, payload, options);
           },
         });
         if (state.fatal) {
           throw stopped();
         }
-        guarded(result);
-        if (byteLength(result) > policy.maxResultBytes) {
-          throw stop("codemode result is too large");
-        }
-        const logs = (result as { logs?: unknown }).logs;
-        if (Array.isArray(logs) && logs.length > policy.maxConsoleEntries) {
-          throw stop("codemode console output exceeded its bound");
-        }
-        return result;
+        return boundSandboxResult(result);
       } finally {
         state.closed = true;
         controller.abort();

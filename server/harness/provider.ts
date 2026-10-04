@@ -6,5 +6,3 @@ export const deepinfra = openaiCompatible({
   apiKey: process.env.MODEL_API_KEY!,
   models: ["deepseek-ai/DeepSeek-V4.1-Flash"],
 });
-
-export { openaiCompatibleText } from "@tanstack/ai-openai/compatible";

@@ -28,91 +28,149 @@ function hold(name) {
 const posts = () =>
   requests.filter((request) => request.path === "/api/chat" && request.method === "POST");
 const ready = () => page.waitForFunction(() => window.api?.phase === "ready");
-await page.route("**/*", async (route) => {
-  const request = route.request();
-  const url = new URL(request.url());
+function abortForeignOrigin(url, route) {
   if (url.origin !== origin) {
     return route.abort();
   }
-  if (probe && url.pathname === "/src/main.tsx") {
-    const response = await route.fetch();
-    const source = await response.text();
-    const react = source.match(/import __vite__cjsImport0_react from "([^"]+)"/)[1];
-    const dom = source.match(/import __vite__cjsImport1_reactDom_client from "([^"]+)"/)[1];
-    return route.fulfill({
-      contentType: "text/javascript",
-      body: `import React from '${react}'; import ReactDOM from '${dom}'; import {useThread} from '/src/hooks/use-threads.ts'; function Probe(){window.api=useThread('${id}');return React.createElement('pre',{},JSON.stringify({phase:window.api.phase,messages:window.api.messages}));} ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(React.StrictMode,{},React.createElement(Probe)));`,
-    });
+}
+function isProbeMain(url) {
+  return probe && url.pathname === "/src/main.tsx";
+}
+function isStaticAsset(url) {
+  return !url.pathname.startsWith("/api/");
+}
+async function fulfillProbe(route) {
+  const response = await route.fetch();
+  const source = await response.text();
+  const react = source.match(/import __vite__cjsImport0_react from "([^"]+)"/)[1];
+  const dom = source.match(/import __vite__cjsImport1_reactDom_client from "([^"]+)"/)[1];
+  return route.fulfill({
+    contentType: "text/javascript",
+    body: `import React from '${react}'; import ReactDOM from '${dom}'; import {useThread} from '/src/hooks/use-threads.ts'; function Probe(){window.api=useThread('${id}');return React.createElement('pre',{},JSON.stringify({phase:window.api.phase,messages:window.api.messages}));} ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(React.StrictMode,{},React.createElement(Probe)));`,
+  });
+}
+async function handleThreadCollection(route, method) {
+  if (method === "POST") {
+    await gates.get("create")?.promise;
   }
-  if (!url.pathname.startsWith("/api/")) {
-    return route.continue();
+  return route.fulfill({
+    json:
+      method === "POST"
+        ? { id: next, title: "新對話" }
+        : [
+            { id, title: "既有對話" },
+            { id: next, title: "另一對話" },
+          ],
+  });
+}
+async function handleThreadRevision(route) {
+  await gates.get("revision")?.promise;
+  if (mode === "revision-fail") {
+    return route.fulfill({ status: 503, json: { error: "fixture" } });
   }
-  const method = request.method();
-  const body = request.postDataJSON();
-  requests.push({ path: url.pathname, method, body, url });
-  if (url.pathname === "/api/thread") {
-    if (method === "POST") {
-      await gates.get("create")?.promise;
-    }
-    return route.fulfill({
-      json:
-        method === "POST"
-          ? { id: next, title: "新對話" }
-          : [
-              { id, title: "既有對話" },
-              { id: next, title: "另一對話" },
-            ],
-    });
-  }
-  if (url.pathname.startsWith("/api/thread/")) {
-    await gates.get("revision")?.promise;
-    if (mode === "revision-fail") {
-      return route.fulfill({ status: 503, json: { error: "fixture" } });
-    }
-    return route.fulfill({ json: { messages: [], revision: 7 } });
-  }
-  if (method === "GET" && !url.searchParams.has("runId")) {
-    await gates.get("hydrate")?.promise;
-    return route.fulfill({
-      status: hydrateStatus,
-      json: hydrateStatus === 200 ? { messages, activeRun } : { error: "fixture" },
-    });
-  }
+  return route.fulfill({ json: { messages: [], revision: 7 } });
+}
+async function handleHydrate(route) {
+  await gates.get("hydrate")?.promise;
+  return route.fulfill({
+    status: hydrateStatus,
+    json: hydrateStatus === 200 ? { messages, activeRun } : { error: "fixture" },
+  });
+}
+const httpErrorModes = new Map([
+  ["409", 409],
+  ["503", 503],
+]);
+async function applyChatTransport(route) {
   await gates.get("post")?.promise;
-  if (mode === "409" || mode === "503") {
-    return route.fulfill({ status: Number(mode), json: { error: "fixture" } });
+  const status = httpErrorModes.get(mode);
+  if (status !== undefined) {
+    await route.fulfill({ status, json: { error: "fixture" } });
+    return true;
   }
   if (mode === "network") {
-    return route.abort();
+    await route.abort();
+    return true;
   }
-  const runId = body?.runId ?? activeRun.runId;
+  return false;
+}
+const terminalByMode = new Map([
+  ["success", (runId) => ({ type: "RUN_FINISHED", threadId: id, runId })],
+  ["failed", (runId) => ({ type: "RUN_ERROR", message: "失敗", metadata: { tanstack: { runId } } })],
+  [
+    "tools",
+    (runId) => ({
+      type: "RUN_FINISHED",
+      threadId: id,
+      runId,
+      metadata: { tanstack: { finishReason: "tool_calls" } },
+    }),
+  ],
+  ["wrong", () => ({ type: "RUN_FINISHED", threadId: id, runId: "wrong-run" })],
+]);
+function chatEvents(runId) {
   const events = [
     { type: "RUN_STARTED", threadId: id, runId },
     { type: "TEXT_MESSAGE_START", messageId: "answer", role: "assistant" },
     { type: "TEXT_MESSAGE_CONTENT", messageId: "answer", delta: "串流回答" },
     { type: "TEXT_MESSAGE_END", messageId: "answer" },
   ];
-  if (mode === "success") {
-    events.push({ type: "RUN_FINISHED", threadId: id, runId });
+  const extra = terminalByMode.get(mode);
+  if (extra !== undefined) {
+    events.push(extra(runId));
   }
-  if (mode === "failed") {
-    events.push({ type: "RUN_ERROR", message: "失敗", metadata: { tanstack: { runId } } });
-  }
-  if (mode === "tools") {
-    events.push({
-      type: "RUN_FINISHED",
-      threadId: id,
-      runId,
-      metadata: { tanstack: { finishReason: "tool_calls" } },
-    });
-  }
-  if (mode === "wrong") {
-    events.push({ type: "RUN_FINISHED", threadId: id, runId: "wrong-run" });
-  }
+  return events;
+}
+function handleChatStream(route, body) {
+  const runId = body?.runId ?? activeRun.runId;
   return route.fulfill({
     contentType: "text/event-stream",
-    body: events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""),
+    body: chatEvents(runId)
+      .map((event) => `data: ${JSON.stringify(event)}\n\n`)
+      .join(""),
   });
+}
+const apiHandlers = [
+  {
+    matches: (url) => url.pathname === "/api/thread",
+    handle: (route, _url, method) => handleThreadCollection(route, method),
+  },
+  {
+    matches: (url) => url.pathname.startsWith("/api/thread/"),
+    handle: (route) => handleThreadRevision(route),
+  },
+  {
+    matches: (url, method) => method === "GET" && !url.searchParams.has("runId"),
+    handle: (route) => handleHydrate(route),
+  },
+];
+async function handleApi(route, url, method, body) {
+  const handler = apiHandlers.find((entry) => entry.matches(url, method));
+  if (handler) {
+    return handler.handle(route, url, method, body);
+  }
+  if (await applyChatTransport(route)) {
+    return;
+  }
+  return handleChatStream(route, body);
+}
+await page.route("**/*", async (route) => {
+  const request = route.request();
+  const url = new URL(request.url());
+  const foreign = abortForeignOrigin(url, route);
+  if (foreign) {
+    return foreign;
+  }
+  if (isProbeMain(url)) {
+    return fulfillProbe(route);
+  }
+  if (isStaticAsset(url)) {
+    return route.continue();
+  }
+  const method = request.method();
+  const body = request.postDataJSON();
+  requests.push({ path: url.pathname, method, body, url });
+  return handleApi(route, url, method, body);
 });
 try {
   await page.goto(origin);
