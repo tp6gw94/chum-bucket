@@ -1,0 +1,698 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QuickJS 如何存取伺服器檔案？</title>
+<style>
+:root{color-scheme:light;--ink:#172b46;--muted:#53657b;--blue:#2563bd;--orange:#b75c17;--teal:#087f77;--paper:#fffefb}*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font-family:system-ui,-apple-system,"Noto Sans TC",sans-serif}main{max-width:1280px;margin:auto;padding:32px 28px 24px}.eyebrow{color:var(--teal);font-size:13px;font-weight:750;letter-spacing:.14em}h1{font-size:clamp(26px,4vw,42px);margin:8px 0 12px;line-height:1.2}.intro{color:var(--muted);line-height:1.65;margin:0 0 20px}.stage{border:1px solid #d8e1e9;border-radius:18px;background:white;overflow:hidden}.scene[hidden]{display:none}.scene svg{display:block;width:100%;height:auto;aspect-ratio:16/9}.scene text{font-family:system-ui,-apple-system,"Noto Sans TC",sans-serif;fill:var(--ink);font-size:22px}.scene .mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:20px}.scene .small{font-size:18px;fill:var(--muted)}.scene .heading{font-size:27px;font-weight:750}.scene .blue{fill:var(--blue)}.scene .orange{fill:var(--orange)}.scene .teal{fill:var(--teal)}.scene .packet text{fill:white;font-size:16px;font-weight:700}#caption{min-height:5em;line-height:1.8;font-size:18px;margin:18px 0}.controls{display:flex;flex-wrap:wrap;align-items:center;gap:10px}button{font:inherit;font-weight:650;border:1px solid #cbd6e1;border-radius:9px;padding:10px 16px;background:white;color:var(--ink);cursor:pointer}button:hover:not(:disabled){background:#edf4ff}button:focus-visible{outline:3px solid var(--blue);outline-offset:3px}button:disabled{opacity:.45;cursor:default}#toggle{background:var(--ink);color:white;min-width:94px}#toggle:hover:not(:disabled){background:#284867}.jumps{display:grid;grid-template-columns:repeat(6,1fr);gap:8px;margin:18px 0}.jumps button{font-size:14px;padding:10px 6px}.jumps [aria-current]{border-color:var(--blue);background:#eaf2ff;color:var(--blue)}.progress{height:7px;border-radius:5px;background:#e5ebf0;overflow:hidden;margin-top:16px}#progressBar{height:100%;width:0;background:var(--teal)}#status{color:var(--muted);font-size:14px;min-height:2.7em;line-height:1.5;margin:10px 0}.keyboard{font-size:13px;color:var(--muted)}footer{border-top:1px solid #e2e7ed;margin-top:18px;padding-top:14px;font-size:13px;line-height:1.8;color:var(--muted)}footer code{overflow-wrap:anywhere}.legend{display:flex;gap:18px;flex-wrap:wrap;font-size:13px;margin:12px 0}.legend span:before{content:"";display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:7px;background:currentColor}.legend .blue{color:var(--blue)}.legend .orange{color:var(--orange)}.legend .teal{color:var(--teal)}@media(max-width:650px){main{padding:20px 12px}.jumps{grid-template-columns:repeat(3,1fr)}#caption{font-size:16px;min-height:8em}.controls button{padding:10px 12px}.intro{font-size:14px}.stage{border-radius:10px}}@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto}}
+</style>
+</head>
+<body>
+<main>
+<header><div class="eyebrow">隔離邊界 · 工具橋接 · 檔案位置</div><h1>檔案沒有進 VM。<br>真正讀寫的是伺服器。</h1><p class="intro">用六幕看懂 QuickJS WASM 與 Node 主機工具的分工。所有封包與磁碟變化都只是示意，不會實際讀寫檔案。</p></header>
+<div class="stage" id="stage" aria-label="六幕 QuickJS 檔案工具流程圖"></div>
+<noscript><p>請啟用 JavaScript 顯示流程圖。QuickJS 在伺服器程序內執行程式字串；主機工具讀寫伺服器磁碟，JSON 結果再回到 VM。本頁不執行任何檔案操作。</p></noscript>
+<div class="legend" aria-label="配色圖例"><span class="blue">藍：QuickJS VM</span><span class="orange">橘：請求／主機讀寫</span><span class="teal">綠：回傳結果</span></div>
+<p id="caption" aria-live="polite" aria-atomic="true"></p>
+<nav class="controls" aria-label="播放控制"><button id="previous">← 上一幕</button><button id="toggle">播放</button><button id="next">下一幕 →</button><button id="restart">重新開始</button><span id="counter" aria-label="目前幕次"></span></nav>
+<nav class="jumps" aria-label="直接選擇幕次"><button data-jump="0">1 · 隔離邊界</button><button data-jump="1">2 · JSON 請求</button><button data-jump="2">3 · 主機讀取</button><button data-jump="3">4 · 結果回傳</button><button data-jump="4">5 · 主機寫入</button><button data-jump="5">6 · 邊界總結</button></nav>
+<div class="progress" role="progressbar" aria-label="整體播放進度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="progressBar"></div></div>
+<p id="status" role="status" aria-live="polite"></p><div class="keyboard">快捷鍵（焦點不在按鈕時）：Space 播放／暫停 · ← → 換幕 · R 重新開始</div>
+<footer>依據：<code>server/harness/tools/{code-mode.ts,fs.ts,index.ts}</code> · <code>@tanstack/ai-isolate-quickjs</code><br>封包內容與工具結果為概念示意，不代表工具的完整回傳格式。此頁僅載入固定版本 GSAP，不會發出檔案工具請求。</footer>
+</main>
+<script src="https://cdn.jsdelivr.net/npm/gsap@3.13.0/dist/gsap.min.js"></script>
+<script>
+(function (global) {
+  "use strict";
+
+  var DEFAULT_LABELS = {
+    play: "Play",
+    pause: "Pause",
+    replay: "Replay",
+    previous: "Previous scene",
+    next: "Next scene",
+    restart: "Restart",
+    jump: function (index) { return "Go to scene " + index; },
+    playing: function (index, total, title) {
+      return "Playing scene " + index + " of " + total + (title ? ": " + title : "") + ".";
+    },
+    paused: function (index, total) {
+      return "Paused at scene " + index + " of " + total + ". Press Play to continue.";
+    },
+    previewText: function (index, total) {
+      return "Scene " + index + " of " + total + " is shown complete. Press Play to start this scene.";
+    },
+    completed: "Finished. The final scene is held. Press Replay to start again.",
+    missingGsap: "GSAP did not load. Playback is unavailable; use the scene navigation to read the complete diagrams.",
+    reducedMotion: "Reduced motion is active. Playback is paused; use the scene navigation."
+  };
+
+  function normalizeScenes(scenes) {
+    var list = scenes ? Array.prototype.slice.call(scenes) : [];
+    var normalized = [];
+    list.forEach(function (entry) {
+      var scene = entry && entry.nodeType === 1 ? { element: entry } : entry;
+      if (scene && scene.element && scene.element.nodeType === 1) normalized.push(scene);
+    });
+    return normalized;
+  }
+
+  function mergeLabels(overrides) {
+    var labels = {};
+    Object.keys(DEFAULT_LABELS).forEach(function (key) { labels[key] = DEFAULT_LABELS[key]; });
+    if (overrides) {
+      Object.keys(overrides).forEach(function (key) {
+        if (overrides[key] != null) labels[key] = overrides[key];
+      });
+    }
+    return labels;
+  }
+
+  function labelText(value, args) {
+    return typeof value === "function" ? value.apply(null, args) : value;
+  }
+
+  function isInteractive(target) {
+    if (!target || target.nodeType !== 1) return false;
+    if (target.isContentEditable) return true;
+    if (typeof target.closest !== "function") return false;
+    return Boolean(target.closest(
+      'a, button, input, textarea, select, summary, [contenteditable], [role="button"], [role="link"], [role="slider"]'
+    ));
+  }
+
+  function jumpIndex(button, position) {
+    var declared = button && button.dataset ? button.dataset.jump : null;
+    var numeric = Number(declared);
+    return declared != null && Number.isFinite(numeric) ? Math.floor(numeric) : position;
+  }
+
+  function ExplainerPlayer(options) {
+    var config = options || {};
+    this.scenes = normalizeScenes(config.scenes);
+    this.controls = config.controls || {};
+    this.labels = mergeLabels(config.labels);
+    this.onSceneChange = typeof config.onSceneChange === "function" ? config.onSceneChange : null;
+    this.gsap = global.gsap || null;
+    this.gsapAvailable = Boolean(this.gsap);
+    this.motionQuery = typeof global.matchMedia === "function"
+      ? global.matchMedia("(prefers-reduced-motion: reduce)")
+      : null;
+    this.reducedMotion = this.motionQuery ? this.motionQuery.matches : false;
+    this.timelines = [];
+    this.cleanups = [];
+    this.tick = null;
+    this.destroyed = false;
+    this.timelineError = null;
+    this.state = {
+      sceneIndex: 0,
+      fraction: 1,
+      playing: false,
+      preview: true,
+      completed: false,
+      rendering: false
+    };
+
+    this.buildTimelines();
+    this.wireControls();
+    this.wireKeyboard();
+    this.wireMotion();
+    this.wireTicker();
+
+    if (this.scenes.length > 0) this.goTo(0);
+    else this.update();
+  }
+
+  ExplainerPlayer.create = function (options) {
+    return new ExplainerPlayer(options || {});
+  };
+
+  ExplainerPlayer.prototype.buildTimelines = function () {
+    var self = this;
+    this.scenes.forEach(function (scene, index) {
+      var timeline = null;
+      if (self.gsapAvailable && typeof scene.createTimeline === "function") {
+        try {
+          timeline = scene.createTimeline({
+            gsap: self.gsap,
+            element: scene.element,
+            index: index,
+            animation: global.ExplainerAnimations || null
+          });
+        } catch (error) {
+          self.timelineError = error;
+          if (global.console && global.console.error) {
+            global.console.error("[ExplainerPlayer] scene timeline factory failed", error);
+          }
+        }
+      }
+      if (timeline && typeof timeline.progress === "function") {
+        timeline.pause();
+        self.timelines[index] = timeline;
+      } else {
+        self.timelines[index] = null;
+      }
+    });
+  };
+
+  ExplainerPlayer.prototype.bind = function (target, type, handler) {
+    if (!target || typeof target.addEventListener !== "function") return;
+    target.addEventListener(type, handler);
+    this.cleanups.push(function () { target.removeEventListener(type, handler); });
+  };
+
+  ExplainerPlayer.prototype.wireControls = function () {
+    var self = this;
+    var controls = this.controls;
+    ["previous", "next", "restart"].forEach(function (name) {
+      var control = controls[name];
+      if (control && !control.hasAttribute("aria-label")) {
+        control.setAttribute("aria-label", labelText(self.labels[name], [1, self.scenes.length]));
+      }
+    });
+    this.bind(controls.previous, "click", function () { self.previous(); });
+    this.bind(controls.next, "click", function () { self.next(); });
+    this.bind(controls.restart, "click", function () { self.restart(); });
+    this.bind(controls.toggle, "click", function () { self.toggle(); });
+    if (controls.jump) {
+      Array.prototype.forEach.call(controls.jump, function (button, position) {
+        var index = jumpIndex(button, position);
+        self.bind(button, "click", function () { self.goTo(index); });
+      });
+    }
+  };
+
+  ExplainerPlayer.prototype.wireKeyboard = function () {
+    var self = this;
+    this.bind(global, "keydown", function (event) { self.handleKeydown(event); });
+  };
+
+  ExplainerPlayer.prototype.handleKeydown = function (event) {
+    if (event.defaultPrevented || event.repeat || event.altKey || event.ctrlKey || event.metaKey) return;
+    if (isInteractive(event.target)) return;
+    if (event.code === "Space") {
+      event.preventDefault();
+      this.toggle();
+    } else if (event.code === "ArrowLeft") {
+      event.preventDefault();
+      this.previous();
+    } else if (event.code === "ArrowRight") {
+      event.preventDefault();
+      this.next();
+    } else if (typeof event.key === "string" && event.key.toLowerCase() === "r") {
+      event.preventDefault();
+      this.restart();
+    }
+  };
+
+  ExplainerPlayer.prototype.wireMotion = function () {
+    var self = this;
+    var query = this.motionQuery;
+    if (!query) return;
+    this.motionHandler = function (event) { self.handleMotionChange(event.matches); };
+    if (typeof query.addEventListener === "function") {
+      query.addEventListener("change", this.motionHandler);
+      this.cleanups.push(function () { query.removeEventListener("change", self.motionHandler); });
+    } else if (typeof query.addListener === "function") {
+      query.addListener(this.motionHandler);
+      this.cleanups.push(function () { query.removeListener(self.motionHandler); });
+    }
+  };
+
+  ExplainerPlayer.prototype.handleMotionChange = function (matches) {
+    this.reducedMotion = Boolean(matches);
+    if (this.reducedMotion) {
+      this.state.playing = false;
+      this.timelines.forEach(function (timeline) { if (timeline) timeline.pause(); });
+      this.activateScene(this.state.sceneIndex, 1, true);
+    } else {
+      this.update();
+    }
+  };
+
+  ExplainerPlayer.prototype.wireTicker = function () {
+    var self = this;
+    if (!this.gsapAvailable) return;
+    this.tick = function () { self.onTick(); };
+    this.gsap.ticker.add(this.tick);
+    this.cleanups.push(function () { self.gsap.ticker.remove(self.tick); });
+  };
+
+  ExplainerPlayer.prototype.onTick = function () {
+    var state = this.state;
+    if (this.destroyed || state.rendering || !state.playing) return;
+    var timeline = this.timelines[state.sceneIndex];
+    if (!timeline || timeline.duration() === 0) {
+      state.fraction = 1;
+      this.updateProgress();
+      this.advance();
+      return;
+    }
+    var progress = timeline.progress();
+    state.fraction = progress;
+    this.updateProgress();
+    if (progress >= 1 - 1e-6) this.advance();
+  };
+
+  ExplainerPlayer.prototype.playActive = function () {
+    var timeline = this.timelines[this.state.sceneIndex];
+    if (timeline) timeline.play();
+  };
+
+  ExplainerPlayer.prototype.advance = function () {
+    var state = this.state;
+    if (this.destroyed) return;
+    if (state.sceneIndex < this.scenes.length - 1) {
+      this.activateScene(state.sceneIndex + 1, 0, false);
+      this.playActive();
+    } else {
+      state.playing = false;
+      state.completed = true;
+      state.fraction = 1;
+      this.update();
+    }
+  };
+
+  ExplainerPlayer.prototype.clampIndex = function (index) {
+    var last = this.scenes.length - 1;
+    var numeric = Number(index);
+    if (!Number.isFinite(numeric)) return Math.max(0, Math.min(this.state.sceneIndex, last));
+    return Math.max(0, Math.min(last, Math.floor(numeric)));
+  };
+
+  ExplainerPlayer.prototype.activateScene = function (index, fraction, previewRequested) {
+    var state = this.state;
+    if (this.scenes.length === 0) return;
+    state.rendering = true;
+    this.timelines.forEach(function (timeline) { if (timeline) timeline.pause(); });
+
+    var target = this.clampIndex(index);
+    state.sceneIndex = target;
+    var canAnimate = this.gsapAvailable && !this.reducedMotion;
+    var numeric = Number(fraction);
+    state.fraction = canAnimate && Number.isFinite(numeric) ? Math.max(0, Math.min(1, numeric)) : 1;
+    state.preview = Boolean(previewRequested) || !canAnimate;
+    state.completed = !state.preview && target === this.scenes.length - 1 && state.fraction >= 1;
+
+    this.scenes.forEach(function (scene, position) {
+      var active = position === target;
+      if (active) scene.element.removeAttribute("hidden");
+      else scene.element.setAttribute("hidden", "");
+      scene.element.setAttribute("aria-hidden", active ? "false" : "true");
+    });
+
+    if (this.gsapAvailable) {
+      var timeline = this.timelines[target];
+      if (timeline) {
+        timeline.pause();
+        timeline.progress(state.fraction, true);
+      }
+    }
+
+    state.rendering = false;
+    this.update();
+  };
+
+  ExplainerPlayer.prototype.play = function () {
+    var state = this.state;
+    if (!this.gsapAvailable || this.reducedMotion || state.playing) return;
+    if (this.scenes.length === 0) return;
+    if (state.completed) {
+      this.activateScene(0, 0, false);
+    } else if (state.preview || state.fraction >= 1) {
+      this.activateScene(state.sceneIndex, 0, false);
+    }
+    state.playing = true;
+    state.preview = false;
+    state.completed = false;
+    this.playActive();
+    this.update();
+  };
+
+  ExplainerPlayer.prototype.pause = function () {
+    if (!this.state.playing) return;
+    this.state.playing = false;
+    this.timelines.forEach(function (timeline) { if (timeline) timeline.pause(); });
+    this.update();
+  };
+
+  ExplainerPlayer.prototype.toggle = function () {
+    if (this.state.playing) this.pause();
+    else this.play();
+  };
+
+  ExplainerPlayer.prototype.navigate = function (index) {
+    if (this.scenes.length === 0) return;
+    this.state.playing = false;
+    this.activateScene(this.clampIndex(index), 1, true);
+  };
+
+  ExplainerPlayer.prototype.previous = function () { this.navigate(this.state.sceneIndex - 1); };
+
+  ExplainerPlayer.prototype.next = function () { this.navigate(this.state.sceneIndex + 1); };
+
+  ExplainerPlayer.prototype.restart = function () { this.navigate(0); };
+
+  ExplainerPlayer.prototype.goTo = function (index) { this.navigate(index); };
+
+  ExplainerPlayer.prototype.seek = function (index, fraction) {
+    if (this.scenes.length === 0) return this.getState();
+    this.state.playing = false;
+    this.activateScene(index, fraction == null ? 1 : fraction, false);
+    return this.getState();
+  };
+
+  ExplainerPlayer.prototype.sceneDuration = function (index) {
+    var timeline = this.timelines[index];
+    return timeline && typeof timeline.duration === "function" ? timeline.duration() : 0;
+  };
+
+  ExplainerPlayer.prototype.totalDuration = function () {
+    var total = 0;
+    for (var i = 0; i < this.scenes.length; i += 1) total += this.sceneDuration(i);
+    return total;
+  };
+
+  ExplainerPlayer.prototype.elapsed = function () {
+    var elapsed = 0;
+    for (var i = 0; i < this.state.sceneIndex; i += 1) elapsed += this.sceneDuration(i);
+    var fraction = this.state.preview ? 1 : Math.max(0, Math.min(1, this.state.fraction));
+    return elapsed + this.sceneDuration(this.state.sceneIndex) * fraction;
+  };
+
+  ExplainerPlayer.prototype.overallPercent = function () {
+    var count = this.scenes.length;
+    if (count === 0) return 0;
+    var total = this.totalDuration();
+    if (total <= 0) {
+      var position = this.state.sceneIndex + (this.state.preview ? 1 : Math.max(0, Math.min(1, this.state.fraction)));
+      return Math.max(0, Math.min(100, (position / count) * 100));
+    }
+    return Math.max(0, Math.min(100, (this.elapsed() / total) * 100));
+  };
+
+  ExplainerPlayer.prototype.updateProgress = function () {
+    var progress = this.overallPercent();
+    var bar = this.controls.progress;
+    if (!bar || !bar.style) return;
+    bar.style.width = progress + "%";
+    var track = bar.parentElement;
+    if (track && typeof track.setAttribute === "function") {
+      track.setAttribute("aria-valuenow", progress.toFixed(1));
+    }
+  };
+
+  ExplainerPlayer.prototype.statusText = function () {
+    var state = this.state;
+    var total = this.scenes.length;
+    var index = state.sceneIndex + 1;
+    var scene = this.scenes[state.sceneIndex];
+    var title = scene && scene.title ? scene.title : "";
+    if (!this.gsapAvailable) return this.labels.missingGsap;
+    if (this.reducedMotion) return this.labels.reducedMotion;
+    if (state.playing) return labelText(this.labels.playing, [index, total, title]);
+    if (state.completed) return labelText(this.labels.completed, [index, total]);
+    if (state.preview) return labelText(this.labels.previewText, [index, total, title]);
+    return labelText(this.labels.paused, [index, total, title]);
+  };
+
+  ExplainerPlayer.prototype.updateControls = function () {
+    var controls = this.controls;
+    var state = this.state;
+    var total = this.scenes.length;
+    var canPlay = this.gsapAvailable && !this.reducedMotion;
+
+    if (controls.previous) controls.previous.disabled = state.sceneIndex === 0;
+    if (controls.next) controls.next.disabled = state.sceneIndex === total - 1;
+    if (controls.toggle) {
+      var key = state.playing ? "pause" : state.completed ? "replay" : "play";
+      var text = labelText(this.labels[key], [state.sceneIndex + 1, total]);
+      controls.toggle.disabled = !canPlay;
+      controls.toggle.textContent = text;
+      controls.toggle.setAttribute("aria-label", text);
+      controls.toggle.setAttribute("aria-pressed", String(state.playing));
+    }
+    if (controls.jump) {
+      Array.prototype.forEach.call(controls.jump, function (button, position) {
+        var target = this.clampIndex(jumpIndex(button, position));
+        if (target === state.sceneIndex) button.setAttribute("aria-current", "step");
+        else button.removeAttribute("aria-current");
+        if (!button.hasAttribute("aria-label")) {
+          button.setAttribute("aria-label", labelText(this.labels.jump, [target + 1]));
+        }
+      }, this);
+    }
+    if (controls.counter) controls.counter.textContent = total ? (state.sceneIndex + 1) + " / " + total : "";
+    if (controls.status) controls.status.textContent = this.statusText();
+  };
+
+  ExplainerPlayer.prototype.update = function () {
+    this.updateControls();
+    this.updateProgress();
+    this.emitChange();
+  };
+
+  ExplainerPlayer.prototype.emitChange = function () {
+    if (!this.onSceneChange) return;
+    try {
+      this.onSceneChange(this.getState());
+    } catch (error) {
+      if (global.console && global.console.error) {
+        global.console.error("[ExplainerPlayer] onSceneChange threw", error);
+      }
+    }
+  };
+
+  ExplainerPlayer.prototype.getState = function () {
+    var state = this.state;
+    var scene = this.scenes[state.sceneIndex];
+    return {
+      sceneIndex: state.sceneIndex,
+      sceneCount: this.scenes.length,
+      title: scene && scene.title ? scene.title : "",
+      playing: state.playing,
+      preview: state.preview,
+      completed: state.completed,
+      fraction: state.preview ? 1 : state.fraction,
+      reducedMotion: this.reducedMotion,
+      gsapAvailable: this.gsapAvailable,
+      duration: this.totalDuration(),
+      sceneDuration: this.sceneDuration(state.sceneIndex),
+      elapsed: this.elapsed(),
+      percent: this.overallPercent()
+    };
+  };
+
+  ExplainerPlayer.prototype.destroy = function () {
+    this.cleanups.forEach(function (cleanup) { cleanup(); });
+    this.cleanups = [];
+    this.timelines.forEach(function (timeline) {
+      if (timeline && typeof timeline.kill === "function") timeline.kill();
+    });
+    this.timelines = [];
+    this.onSceneChange = null;
+    this.destroyed = true;
+  };
+
+  global.ExplainerPlayer = ExplainerPlayer;
+})(typeof window !== "undefined" ? window : globalThis);
+</script>
+<script>
+(function (global) {
+  "use strict";
+
+  function toArray(targets) {
+    if (!targets) return [];
+    if (typeof targets === "string") {
+      if (!global.document) return [];
+      return Array.prototype.slice.call(global.document.querySelectorAll(targets));
+    }
+    if (targets.nodeType === 1) return [targets];
+    return Array.prototype.slice.call(targets);
+  }
+
+  function numberOr(value, fallback) {
+    var numeric = Number(value);
+    return Number.isFinite(numeric) ? numeric : fallback;
+  }
+
+  function requireTimeline(timeline) {
+    if (!timeline || typeof timeline.fromTo !== "function") {
+      throw new Error("[ExplainerAnimations] a GSAP timeline is required as the first argument.");
+    }
+  }
+
+  function reveal(timeline, targets, options) {
+    requireTimeline(timeline);
+    var settings = options || {};
+    var list = toArray(targets);
+    if (!list.length) return timeline;
+
+    var from = {
+      autoAlpha: 0,
+      y: numberOr(settings.dy, 24),
+      x: numberOr(settings.dx, 0)
+    };
+    var to = {
+      autoAlpha: 1,
+      y: 0,
+      x: 0,
+      duration: numberOr(settings.duration, 0.65),
+      stagger: numberOr(settings.stagger, 0),
+      ease: settings.ease || "power3.out",
+      immediateRender: true
+    };
+    if (settings.scale != null) {
+      var origin = settings.transformOrigin || "50% 50%";
+      from.scale = numberOr(settings.scale, 0.9);
+      from.transformOrigin = origin;
+      to.scale = 1;
+      to.transformOrigin = origin;
+    }
+    timeline.fromTo(list, from, to, numberOr(settings.at, 0));
+    return timeline;
+  }
+
+  function draw(timeline, targets, options) {
+    requireTimeline(timeline);
+    var settings = options || {};
+    var list = toArray(targets);
+    var at = numberOr(settings.at, 0);
+    var stagger = numberOr(settings.stagger, 0);
+    var duration = numberOr(settings.duration, 0.85);
+    var ease = settings.ease || "power2.out";
+    var finalOpacity = settings.opacity == null ? 1 : numberOr(settings.opacity, 1);
+
+    list.forEach(function (path, index) {
+      var length = 0;
+      if (typeof path.getTotalLength === "function") {
+        try { length = path.getTotalLength(); } catch (error) { length = 0; }
+      }
+      timeline.fromTo(path, {
+        strokeDasharray: length + " " + length,
+        strokeDashoffset: length,
+        autoAlpha: 0
+      }, {
+        strokeDashoffset: 0,
+        autoAlpha: finalOpacity,
+        duration: duration,
+        ease: ease,
+        immediateRender: true
+      }, at + index * stagger);
+    });
+    return timeline;
+  }
+
+  global.ExplainerAnimations = {
+    reveal: reveal,
+    draw: draw
+  };
+})(typeof window !== "undefined" ? window : globalThis);
+</script>
+<script>
+(function () {
+  "use strict";
+  var sceneData = [
+    {title:"隔離邊界", heading:"01 ／ 程式在 VM，檔案在磁碟", caption:"QuickJS WASM VM 位於 Node 伺服器程序內。VM 執行的是 JavaScript 程式字串，不是把檔案搬進沙箱；檔案仍留在伺服器磁碟。"},
+    {title:"JSON 請求", heading:"02 ／ 傳送 path，不是傳送檔案", caption:"驅動程式安裝 external_read 橋接函式，將 path 序列化成 JSON。主機轉接器交給 input.dispatch，再找到讀取工具。這是同一程序內的橋接，不是網路 RPC。"},
+    {title:"主機讀取", heading:"03 ／ 真正接觸磁碟的是主機工具", caption:"nativeRead 以 process.cwd() 設定工作目錄。nativeRead.execute 使用伺服器的作業系統檔案系統讀取 notes.txt；資料先到主機端，檔案仍在磁碟。"},
+    {title:"結果回傳", heading:"04 ／ JSON 結果回 VM，await 繼續", caption:"工具結果序列化成 JSON，經驅動程式回傳，再由 VM 解析。await 隨結果回傳而繼續；收到的是結果資料，不是磁碟檔案，也不是主機物件的共用參照。"},
+    {title:"主機寫入", heading:"05 ／ 寫入也走同一條橋接", caption:"external_write 傳送 JSON 的 path 與 content。nativeWrite.execute 在伺服器端更新檔案，再回傳完成結果。邊界沒有改變；本頁的 Hello 與寫入效果只是示意，不會實際寫入。"},
+    {title:"邊界總結", heading:"06 ／ 磁碟在哪裡，取決於伺服器在哪裡", caption:"伺服器在本機執行，就存取這台機器；部署到遠端，就存取遠端伺服器磁碟。工具能力透過驅動程式橋接授予，但 VM 隔離不等於檔案權限政策：路徑與存取權限仍須由主機端強制檢查。"}
+  ];
+  function packet(name, color, x, y) {
+    return '<g class="packet '+name+'" opacity="0" aria-hidden="true"><rect x="'+(x-29)+'" y="'+(y-15)+'" width="58" height="30" rx="8" fill="'+color+'"/><text x="'+x+'" y="'+(y+6)+'" text-anchor="middle">JSON</text></g>';
+  }
+  function diagram(index) {
+    var id = 's'+index;
+    var bridge = index > 0;
+    var readDisk = index >= 2;
+    var result = index >= 3;
+    var write = index === 4;
+    var summary = index === 5;
+    var vmLines = index === 0 ? '<text x="100" y="326" class="mono">vm.evalCode(code)</text><text x="100" y="370">執行 JavaScript 字串</text><text x="100" y="409" class="small">沒有內建主機檔案系統</text>' : write ? '<text x="100" y="319" class="mono">await external_write({</text><text x="100" y="350" class="mono"> path: "notes.txt",</text><text x="100" y="381" class="mono"> content: "Hello"</text><text x="100" y="412" class="mono">})</text>' : summary ? '<text x="100" y="326">程式呼叫橋接工具</text><text x="100" y="367">JSON 請求 →</text><text x="100" y="407" class="teal">← JSON 結果</text>' : '<text x="100" y="319" class="mono">await external_read(</text><text x="100" y="350" class="mono"> {path:"notes.txt"}</text><text x="100" y="381" class="mono">)</text><text class="result-card '+(result?'teal':'small')+'" x="100" y="419">'+(result?'await 繼續 · 結果資料':'等待工具結果')+'</text>';
+    return '<svg viewBox="0 0 1280 720" role="img" aria-labelledby="'+id+'-title '+id+'-desc"><title id="'+id+'-title">'+sceneData[index].heading+'</title><desc id="'+id+'-desc">'+sceneData[index].caption+'</desc><defs><marker id="'+id+'-request" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 Z" fill="#b75c17"/></marker><marker id="'+id+'-result" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 Z" fill="#087f77"/></marker></defs><text x="32" y="43" class="heading">'+sceneData[index].heading+'</text><g class="machine"><rect x="24" y="74" width="1232" height="546" rx="18" fill="#fafbfd" stroke="#bac8d7" stroke-width="2"/><text x="46" y="108">伺服器所在機器</text></g><g class="server"><rect x="48" y="127" width="940" height="477" rx="14" fill="white" stroke="#8296ad" stroke-width="2" stroke-dasharray="8 6"/><text x="72" y="166">Node 伺服器程序</text><text x="730" y="166" class="small">同一程序 · 非網路 RPC</text></g><g class="vm"><rect x="76" y="215" width="320" height="235" rx="14" fill="#eff5ff" stroke="#2563bd" stroke-width="3"/><text x="100" y="259" class="heading blue">QuickJS WASM</text><text x="100" y="289" class="small">隔離的 VM</text>'+vmLines+'</g>'+(bridge?'<g class="bridge"><rect x="452" y="215" width="198" height="235" rx="14" fill="#f5f8fc" stroke="#8296ad" stroke-width="2"/><text x="472" y="258" class="heading">驅動程式</text><text x="472" y="292">工具橋接</text><text x="472" y="344" class="small">安裝外部函式</text><text x="472" y="378" class="small">JSON 序列化</text><text x="472" y="412" class="small">／解析</text></g><g class="host"><rect x="708" y="215" width="248" height="235" rx="14" fill="#fff5eb" stroke="#b75c17" stroke-width="2"/><text x="730" y="258" class="heading orange">主機工具</text><text x="730" y="297" class="mono">input.dispatch</text><text x="730" y="344" class="mono">'+(summary?'nativeRead /':write?'nativeWrite':'nativeRead')+'</text><text x="730" y="376" class="mono">'+(summary?'nativeWrite':'.execute')+'</text><text x="730" y="416" class="small">process.cwd()</text></g>':'<text x="495" y="333" class="heading">主機端空間</text><text x="495" y="375" class="small">工具在 VM 之外執行</text>')+'<g class="disk"><rect class="disk-body" x="1034" y="270" width="184" height="174" rx="16" fill="#fff5eb" stroke="#b75c17" stroke-width="3"/><ellipse cx="1126" cy="284" rx="92" ry="21" fill="#ffead3" stroke="#b75c17" stroke-width="3"/><text x="1126" y="337" text-anchor="middle" class="heading orange">磁碟</text><text x="1126" y="374" text-anchor="middle" class="mono">notes.txt</text>'+(write?'<text class="disk-old small" x="1126" y="412" text-anchor="middle" opacity="0">原內容</text><text class="disk-new teal" x="1126" y="412" text-anchor="middle">Hello</text>':'<text x="1126" y="412" text-anchor="middle" class="small">檔案留在這裡</text>')+'<text x="1126" y="475" text-anchor="middle" class="small">主機 OS 檔案系統</text><text x="1126" y="505" text-anchor="middle" class="small">在 VM ／程序之外</text></g>'+(bridge?'<g fill="none" stroke-width="3"><path class="request-link" d="M236 450 V500 H832 V450" stroke="#b75c17" marker-end="url(#'+id+'-request)"/><path class="bridge-stem" d="M551 450 V500" stroke="#8296ad"/>'+(readDisk?'<path class="disk-link" d="M956 330 H1034" stroke="#b75c17" marker-end="url(#'+id+'-request)"/><path class="disk-result-link" d="M1034 402 H956" stroke="#087f77" marker-end="url(#'+id+'-result)"/>':'')+(result?'<path class="result-link" d="M832 450 V559 H236 V450" stroke="#087f77" marker-end="url(#'+id+'-result)"/><path d="M551 500 V559" stroke="#8296ad" stroke-dasharray="4 5"/>':'')+'</g><text x="425" y="486" class="small orange">JSON '+(write?'path + content':'path 請求')+'</text>'+(result?'<text x="400" y="590" class="small teal">JSON '+(write?'完成結果':'工具結果')+' ← 驅動程式 ← 主機</text>':'')+packet('request-packet','#b75c17',236,500)+(readDisk?packet('disk-packet','#b75c17',967,330)+packet('disk-result-packet','#087f77',1025,402):'')+(result?packet('result-packet','#087f77',832,559):''):'')+(summary?'<g class="summary"><rect x="24" y="636" width="600" height="64" rx="10" fill="#eff5ff"/><text x="42" y="675">本機伺服器 → 本機磁碟　／　遠端 → 遠端磁碟</text><rect x="640" y="636" width="616" height="64" rx="10" fill="#fff5eb"/><text x="660" y="675">主機端必須強制檢查路徑與存取權限</text></g>':'<text x="40" y="668" class="small">'+(index===0?'邊界重點：VM 裡有程式，不代表 VM 裡有磁碟。':write?'示意更新：只有主機工具接觸磁碟；邊界與幾何配置保持不變。':result?'回傳的是資料，不是檔案搬移，也不是共用物件參照。':'橋接是資料往返；真正的檔案存取發生在伺服器主機端。')+'</text>')+'</svg>';
+  }
+  var stage = document.getElementById('stage');
+  sceneData.forEach(function (data, index) {
+    var section = document.createElement('section');
+    section.className = 'scene';
+    section.id = 'scene-'+(index+1);
+    section.setAttribute('aria-label', data.title);
+    section.hidden = index !== 0;
+    section.innerHTML = diagram(index);
+    stage.appendChild(section);
+  });
+  function createTimeline(context) {
+    var timeline = context.gsap.timeline({paused:true});
+    var element = context.element;
+    var index = context.index;
+    var animation = context.animation;
+    function reveal(selector, at) {
+      animation.reveal(timeline, element.querySelectorAll(selector), {at:at,duration:0.7,dy:0});
+    }
+    function draw(selector, at) {
+      animation.draw(timeline, element.querySelectorAll(selector), {at:at,duration:0.9});
+    }
+    function move(selector, x, at, duration) {
+      var target = element.querySelector(selector);
+      timeline.fromTo(target, {x:0,opacity:0}, {x:0,opacity:1,duration:0.12,immediateRender:true}, at);
+      timeline.to(target, {x:x,duration:duration,ease:'none'}, at+0.12);
+      timeline.to(target, {opacity:0,duration:0.16}, at+duration+0.12);
+    }
+    if (index === 0) {
+      reveal('.machine',0);
+      reveal('.server',0.7);
+      reveal('.vm',1.5);
+      reveal('.disk',2.5);
+    } else if (index === 5) {
+      reveal('.summary',0.5);
+    } else {
+      if (index === 1) { reveal('.bridge, .host',0.2); }
+      draw('.request-link',0.8);
+      move('.request-packet',596,1.8,1.6);
+      if (index >= 2) {
+        draw('.disk-link',3.1);
+        move('.disk-packet',58,3.6,0.6);
+        timeline.fromTo(element.querySelector('.disk-body'),{fill:'#fff5eb'},{fill:'#ffd6a5',duration:0.4,immediateRender:true},4.0);
+        timeline.to(element.querySelector('.disk-body'),{fill:'#fff5eb',duration:0.5},4.7);
+        if (index === 4) {
+          timeline.fromTo(element.querySelector('.disk-old'),{opacity:1},{opacity:0,duration:0.3,immediateRender:true},4.2);
+          timeline.fromTo(element.querySelector('.disk-new'),{opacity:0},{opacity:1,duration:0.3,immediateRender:true},4.5);
+        }
+        draw('.disk-result-link',4.7);
+        move('.disk-result-packet',-58,5.1,0.6);
+      }
+      if (index >= 3) {
+        draw('.result-link',5.6);
+        move('.result-packet',-596,6.1,1.6);
+        if (index === 3) { reveal('.result-card',7.6); }
+      }
+    }
+    timeline.to({}, {duration:2}, index >= 3 && index <= 4 ? 8 : 6);
+    return timeline;
+  }
+  var controls = {};
+  ['previous','next','restart','toggle','status','counter'].forEach(function (name) { controls[name] = document.getElementById(name); });
+  controls.progress = document.getElementById('progressBar');
+  controls.jump = document.querySelectorAll('[data-jump]');
+  window.explainer = window.ExplainerPlayer.create({
+    scenes: sceneData.map(function (data,index) { return {element:document.getElementById('scene-'+(index+1)),title:data.title,createTimeline:createTimeline}; }),
+    controls: controls,
+    labels: {
+      play:'播放', pause:'暫停', replay:'重播', previous:'上一幕', next:'下一幕', restart:'重新開始',
+      jump:function (index) { return '前往第 '+index+' 幕：'+sceneData[index-1].title; },
+      playing:function (index,total,title) { return '播放中：'+index+' / '+total+' · '+title; },
+      paused:function (index,total) { return '已暫停：'+index+' / '+total+'。按播放繼續。'; },
+      previewText:function (index,total) { return '第 '+index+' / '+total+' 幕已顯示完整流程。按播放觀看本幕動畫。'; },
+      completed:'播放完畢，保留最後一幕。按重播從第一幕開始。',
+      missingGsap:'GSAP 未載入，無法播放動畫；仍可使用上一幕、下一幕或幕次按鈕閱讀完整圖解。',
+      reducedMotion:'已啟用減少動態效果，動畫暫停；請使用幕次導覽閱讀完整圖解。'
+    },
+    onSceneChange:function (state) { document.getElementById('caption').textContent = sceneData[state.sceneIndex].caption; }
+  });
+})();
+</script>
+</body>
+</html>

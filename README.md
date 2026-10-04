@@ -162,6 +162,8 @@ Code Mode 就是給 LLM 一個 Sandbox，讓他可以在裡面執行程式，我
 
 讓他可以自由運用順序、讀取等。
 
+[Explain](./explains/codemode-sandbox.html)
+
 ### Target
 
 - [ ] 提供 Code Mode
