@@ -1,10 +1,20 @@
-import { PlusIcon, XIcon } from "lucide-react";
+import { ArrowDownIcon, PlusIcon, XIcon } from "lucide-react";
+import { useEffect } from "react";
 import type { SendResult } from "../hooks/use-threads";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import {
+  MessageScroller,
+  MessageScrollerButton,
+  MessageScrollerContent,
+  MessageScrollerItem,
+  MessageScrollerProvider,
+  MessageScrollerViewport,
+  useMessageScroller,
+} from "@/components/ui/message-scroller";
 import { Composer } from "./composer";
-import { MessageList } from "./message-list";
+import { CompactMarker, MessageList } from "./message-list";
 import { PaneShell } from "./pane-shell";
 import { ProgressPanel } from "./progress-panel";
 import { StatusBadge } from "./status-badge";
@@ -70,23 +80,33 @@ function HydrationFeedback({
   );
 }
 
-function PaneMessages({
-  pane,
-  presentation,
-}: {
-  pane: PaneModel;
-  presentation: PanePresentation;
-}) {
+function PaneMessages({ pane, presentation }: { pane: PaneModel; presentation: PanePresentation }) {
   if (pane.messages.length === 0) {
-    return <p className="m-auto text-sm text-muted-foreground">{presentation.emptyCopy}</p>;
+    return (
+      <>
+        <MessageScrollerItem className="m-auto">
+          <p className="text-sm text-muted-foreground">{presentation.emptyCopy}</p>
+        </MessageScrollerItem>
+        {pane.status === "compacting" ? <CompactMarker /> : null}
+      </>
+    );
   }
   return (
     <MessageList
       messages={pane.messages}
       agent={pane.agent}
       isStreaming={pane.status === "running"}
+      compacting={pane.status === "compacting"}
     />
   );
+}
+
+function TranscriptAutoFollow({ pane }: { pane: PaneModel }) {
+  const { scrollToEnd } = useMessageScroller();
+  useEffect(() => {
+    scrollToEnd({ behavior: "auto" });
+  }, [scrollToEnd, pane.messages, pane.status]);
+  return null;
 }
 
 export function Pane({
@@ -129,14 +149,29 @@ export function Pane({
           </div>
         </div>
       </header>
-      <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-4">
-        <PaneMessages pane={pane} presentation={presentation} />
-        <ProgressPanel
-          status={pane.status}
-          label={presentation.progressLabel}
-          lines={pane.progress}
-        />
-      </div>
+      <MessageScrollerProvider autoScroll defaultScrollPosition="end">
+        <MessageScroller className="min-h-0 flex-1">
+          <MessageScrollerViewport aria-label={`${pane.title}對話訊息`} className="p-4">
+            <MessageScrollerContent className="gap-4">
+              <TranscriptAutoFollow pane={pane} />
+              <PaneMessages pane={pane} presentation={presentation} />
+              {pane.progress.length > 0 ? (
+                <MessageScrollerItem messageId="pane-progress">
+                  <ProgressPanel
+                    status={pane.status}
+                    label={presentation.progressLabel}
+                    lines={pane.progress}
+                  />
+                </MessageScrollerItem>
+              ) : null}
+            </MessageScrollerContent>
+          </MessageScrollerViewport>
+          <MessageScrollerButton direction="end">
+            <ArrowDownIcon />
+            <span className="sr-only">跳到最新</span>
+          </MessageScrollerButton>
+        </MessageScroller>
+      </MessageScrollerProvider>
       <HydrationFeedback isHydrating={isHydrating} hydrationError={hydrationError} />
       <Composer
         label={composerFieldLabel(pane)}

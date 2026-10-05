@@ -41,12 +41,24 @@ test("the durable loop runs codemode and persists its events before the result",
         [threads.get(String(values[0]))].filter((row): row is Row => !!row),
     },
     {
+      matches: (text) => text.startsWith(`select ${runColumns} from chat_runs where (thread_id`),
+      execute: (_text, values) =>
+        [...runs.values()].filter(
+          (row) =>
+            row.thread_id === values[0] &&
+            row.state === values[1] &&
+            String((row.request as { baseRevision: number }).baseRevision) === values[2],
+        ),
+    },
+    {
       matches: (text) =>
         text.startsWith("select thread_id from chat_runs") ||
         text.startsWith(`select ${runColumns} from chat_runs where id`) ||
         text.startsWith(`select ${runColumns} from chat_runs where state`),
       execute: (text, values) =>
-        [...runs.values()].filter((row) => (text.includes("where id") ? row.id === values[0] : true)),
+        [...runs.values()].filter((row) =>
+          text.includes("where id") ? row.id === values[0] : true,
+        ),
     },
     {
       matches: (text) => text.startsWith("insert into chat_runs"),

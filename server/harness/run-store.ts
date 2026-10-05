@@ -7,8 +7,10 @@ import { z } from "zod";
 import { chatEventsTable, chatRunsTable, threadsTable } from "../db/schema";
 import { openuiInstructions } from "./prompts";
 import { snapshot } from "./model-turn";
+import { projectConversation, readProjection, type ConversationState } from "./conversation";
+import { compactionEvent, parseCompactionEvent } from "../../shared/compaction-event";
 
-export const BUILD = "durable-chat-loop-v5";
+export const BUILD = "durable-chat-loop-v8";
 export const MODEL = "deepseek-ai/DeepSeek-V4.1-Flash";
 const runIdSchema = z
   .string()
@@ -28,6 +30,7 @@ export const runInputSchema = z
 export type RunInput = z.infer<typeof runInputSchema>;
 export type AcceptedRun = RunInput & {
   messages: UIMessage[];
+  context: UIMessage[];
   prompt: string;
   model: typeof MODEL;
   build: typeof BUILD;
@@ -85,6 +88,31 @@ async function appendEvent(tx: Transaction, run: RunRow, key: string, event: Str
   run.log_bytes += bytes;
 }
 
+async function committedModelContext(tx: Transaction, thread: ThreadRow): Promise<UIMessage[]> {
+  const anchors = await tx
+    .select()
+    .from(chatRunsTable)
+    .where(
+      and(
+        eq(chatRunsTable.thread_id, thread.id),
+        eq(chatRunsTable.state, "succeeded"),
+        sql`${chatRunsTable.request}->>'baseRevision' = ${String(thread.revision - 1)}`,
+      ),
+    );
+  if (anchors.length > 1) {
+    throw new RunRequestError(409, "Ambiguous conversation context anchor");
+  }
+  const anchor = anchors[0];
+  if (!anchor || Array.isArray(anchor.projection)) {
+    return thread.messages;
+  }
+  const prior = readProjection(anchor.projection);
+  if (!isDeepStrictEqual(prior.display, thread.messages)) {
+    throw new RunRequestError(409, "Conversation context anchor does not match saved history");
+  }
+  return prior.context;
+}
+
 export async function persistRun(value: RunInput) {
   const parsed = runInputSchema.safeParse(value);
   if (!parsed.success) {
@@ -117,16 +145,19 @@ export async function persistRun(value: RunInput) {
     if (thread.messages.some((message) => message.id === input.message.id)) {
       throw new RunRequestError(409, "Message ID already exists");
     }
+    const priorContext = await committedModelContext(tx, thread);
+    const message: UIMessage = {
+      id: input.message.id,
+      role: "user",
+      parts: [{ type: "text", content: input.message.text }],
+    };
+    if (priorContext.some((entry) => entry.id === message.id)) {
+      throw new RunRequestError(409, "Message ID already exists in context");
+    }
     const run: AcceptedRun = {
       ...input,
-      messages: [
-        ...thread.messages,
-        {
-          id: input.message.id,
-          role: "user",
-          parts: [{ type: "text", content: input.message.text }],
-        },
-      ],
+      messages: [...thread.messages, message],
+      context: [...priorContext, message],
       prompt: openuiInstructions(),
       model: MODEL,
       build: BUILD,
@@ -138,7 +169,7 @@ export async function persistRun(value: RunInput) {
         thread_id: run.threadId,
         request: input,
         accepted: run,
-        projection: run.messages,
+        projection: projectConversation({ display: run.messages, context: run.context }),
       })
       .onConflictDoNothing({ target: chatRunsTable.id })
       .returning();
@@ -159,21 +190,85 @@ export async function persistRun(value: RunInput) {
   return accepted;
 }
 
-export async function emit(runId: string, event: StreamChunk, messages?: UIMessage[]) {
+export async function emit(runId: string, event: StreamChunk, conversation?: ConversationState) {
   const db = await database();
   await db.transaction(async (tx) => {
     const { run } = await lockRun(tx, runId);
     await appendEvent(tx, run, randomUUID(), event);
-    if (messages) {
+    if (conversation) {
       await tx
         .update(chatRunsTable)
-        .set({ projection: messages })
+        .set({ projection: projectConversation(conversation) })
         .where(eq(chatRunsTable.id, runId));
     }
   });
 }
 
-export async function finishRun(runId: string, messages?: UIMessage[], code = "execution_failed") {
+export async function checkpointCompaction(
+  runId: string,
+  operationId: string,
+  conversation: ConversationState,
+  state: "done" | "failed",
+) {
+  const db = await database();
+  await db.transaction(async (tx) => {
+    const { run } = await lockRun(tx, runId);
+    const key = `compact:${operationId}`;
+    const [receipt] = await tx
+      .select()
+      .from(chatEventsTable)
+      .where(and(eq(chatEventsTable.run_id, runId), eq(chatEventsTable.event_key, key)));
+    if (receipt) {
+      if (
+        !isDeepStrictEqual(parseCompactionEvent(receipt.payload), { runId, operationId, state })
+      ) {
+        throw new Error("Compaction receipt outcome mismatch");
+      }
+      return;
+    }
+    if (state === "done") {
+      await tx
+        .update(chatRunsTable)
+        .set({ projection: projectConversation(conversation) })
+        .where(eq(chatRunsTable.id, runId));
+    }
+    await appendEvent(tx, run, key, compactionEvent({ runId, operationId, state }));
+  });
+}
+
+export function nextThreadTitle(input: {
+  current: string;
+  history: readonly UIMessage[];
+  accepted: readonly UIMessage[];
+}): string {
+  if (input.current !== "" && input.history.length > 0) {
+    return input.current;
+  }
+  return threadTitle(input.accepted);
+}
+
+function threadTitle(messages: readonly UIMessage[]): string {
+  for (const message of messages) {
+    if (message.role !== "user" || message.metadata?.fromSummary === true) {
+      continue;
+    }
+    const text = message.parts
+      .filter((part) => part.type === "text")
+      .map((part) => part.content)
+      .join("");
+    if (text !== "") {
+      return text.slice(0, 10);
+    }
+  }
+  return "新對話";
+}
+
+export async function finishRun(
+  runId: string,
+  conversation?: ConversationState,
+  code = "execution_failed",
+) {
+  const messages = conversation?.display;
   const db = await database();
   await db.transaction(async (tx) => {
     const { run, thread } = await lockRun(tx, runId);
@@ -184,13 +279,11 @@ export async function finishRun(runId: string, messages?: UIMessage[], code = "e
       throw new Error("Thread claim changed");
     }
     if (messages) {
-      const title =
-        messages
-          .find((message) => message.role === "user")
-          ?.parts.filter((part) => part.type === "text")
-          .map((part) => part.content)
-          .join("")
-          .slice(0, 10) || "新對話";
+      const title = nextThreadTitle({
+        current: thread.title,
+        history: thread.messages,
+        accepted: run.accepted.messages,
+      });
       await appendEvent(tx, run, "finished:snapshot", snapshot(messages));
       await tx
         .update(threadsTable)
@@ -203,7 +296,12 @@ export async function finishRun(runId: string, messages?: UIMessage[], code = "e
         })
         .where(eq(threadsTable.id, thread.id));
     } else {
-      await appendEvent(tx, run, "failed:snapshot", snapshot(run.projection));
+      await appendEvent(
+        tx,
+        run,
+        "failed:snapshot",
+        snapshot(readProjection(run.projection).display),
+      );
       await tx
         .update(threadsTable)
         .set({ active_run_id: null })
@@ -222,6 +320,12 @@ export async function finishRun(runId: string, messages?: UIMessage[], code = "e
             metadata: { tanstack: { runId, threadId: thread.id } },
           },
     );
+    if (conversation) {
+      await tx
+        .update(chatRunsTable)
+        .set({ projection: projectConversation(conversation) })
+        .where(eq(chatRunsTable.id, runId));
+    }
     await tx
       .update(chatRunsTable)
       .set({ state: messages ? "succeeded" : "failed" })

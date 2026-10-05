@@ -12,6 +12,7 @@ import {
   threadUrl,
   useThread,
   useThreadList,
+  type ThreadPhase,
 } from "./hooks/use-threads";
 import { Button } from "@/components/ui/button";
 import { Provider } from "./Provider";
@@ -28,17 +29,24 @@ function threadTitle(threads: readonly { id: string; title: string }[], threadId
   return threads.find((item) => item.id === threadId)?.title ?? "新對話";
 }
 
+function paneStatus(phase: ThreadPhase): RunStatus {
+  if (phase === "compacting") {
+    return "compacting";
+  }
+  return phase === "busy" ? "running" : "idle";
+}
+
 function toMainPane(
   threadId: string,
   threads: readonly { id: string; title: string }[],
   messages: PaneModel["messages"],
-  busy: boolean,
+  status: RunStatus,
 ): PaneModel {
   return {
     id: threadId ?? "draft",
     title: threadTitle(threads, threadId),
     agent: "main",
-    status: busy ? "running" : "idle",
+    status,
     progress: [],
     messages,
     kind: "main",
@@ -107,7 +115,7 @@ function ThreadPage({ threadId }: { threadId: string }) {
   const thread = useThread(threadId);
   const { messages, send } = thread;
   const sendDisabled = thread.phase !== "ready";
-  const mainPane = toMainPane(threadId, threads, messages, thread.phase === "busy");
+  const mainPane = toMainPane(threadId, threads, messages, paneStatus(thread.phase));
   const threadSummaries = threads.map((item) =>
     toSidebarSummary(item, threadId, mainPane.status, 1 + agentPanes.length),
   );

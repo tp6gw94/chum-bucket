@@ -3,6 +3,7 @@ import { z } from "zod";
 import { flushSync } from "react-dom";
 import type { StreamChunk } from "@tanstack/ai";
 import { fetchServerSentEvents, useChat } from "@tanstack/ai-react";
+import { parseCompactionEvent } from "@/shared/compaction-event";
 
 const threadSchema = z.object({ id: z.uuid(), title: z.string() });
 type ThreadRecord = z.infer<typeof threadSchema>;
@@ -10,7 +11,7 @@ export type PageEntry =
   | { kind: "choose" }
   | { kind: "invalid" }
   | { kind: "thread"; threadId: string };
-type ThreadPhase = "loading" | "ready" | "busy" | "uncertain" | "load-error";
+export type ThreadPhase = "loading" | "ready" | "busy" | "compacting" | "uncertain" | "load-error";
 export type SendResult = "succeeded" | "failed" | "uncertain";
 
 export function readPageEntry(): PageEntry {
@@ -117,6 +118,7 @@ export function useThread(threadId: string) {
     submitting: false,
     runId: null as string | null,
     terminal: null as SendResult | null,
+    compactOperationId: null as string | null,
     hydrationTimer: undefined as ReturnType<typeof setTimeout> | undefined,
     terminalTimer: undefined as ReturnType<typeof setTimeout> | undefined,
   }).current;
@@ -127,6 +129,7 @@ export function useThread(threadId: string) {
     }
   }
   function settle() {
+    owner.compactOperationId = null;
     if (!owner.mounted || owner.hydrating || owner.submitting) {
       return;
     }
@@ -147,10 +150,22 @@ export function useThread(threadId: string) {
           const terminal = terminalResult(chunk, owner.runId);
           if (terminal) {
             owner.terminal = terminal;
+            owner.compactOperationId = null;
+          }
+          const compaction = parseCompactionEvent(chunk);
+          if (!owner.terminal && compaction && compaction.runId === owner.runId) {
+            if (compaction.state === "started") {
+              owner.compactOperationId = compaction.operationId;
+              publish("compacting");
+            } else if (compaction.operationId === owner.compactOperationId) {
+              owner.compactOperationId = null;
+              publish("busy");
+            }
           }
           yield chunk;
         }
       } finally {
+        owner.compactOperationId = null;
         if (owner.mounted) {
           owner.terminalTimer = setTimeout(settle, 0);
         }
@@ -193,6 +208,7 @@ export function useThread(threadId: string) {
           })
           .catch((cause: unknown) => {
             if (owner.mounted) {
+              owner.compactOperationId = null;
               publish("load-error");
               setError(`載入對話失敗：${errorMessage(cause)}`);
             }
@@ -218,6 +234,7 @@ export function useThread(threadId: string) {
     flushSync(() => publish("busy"));
     owner.submitting = true;
     owner.terminal = null;
+    owner.compactOperationId = null;
     setError(null);
     let submitted = false;
     try {

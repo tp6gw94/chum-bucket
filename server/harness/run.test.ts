@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -33,8 +34,13 @@ import {
 } from "@tanstack/ai";
 import { acceptRun, reconcileRuns, executeRun } from "./run";
 import { snapshot, streamModelTurn, type Turn } from "./model-turn";
+import { COMPACT_TOKEN_THRESHOLD } from "./compaction";
+import { readProjection, type RunProjection, type ConversationState } from "./conversation";
+import { parseCompactionEvent } from "../../shared/compaction-event";
 import {
+  BUILD,
   persistRun,
+  checkpointCompaction,
   emit,
   finishRun,
   hydrateThread,
@@ -90,15 +96,19 @@ async function discoveryHistory(tools: RunTools, toolNames: string[]): Promise<U
   ];
 }
 
-async function* textStream(wait?: Promise<void>): AsyncGenerator<AdapterYieldChunk> {
+let textSequence = 0;
+async function* textStream(
+  wait?: Promise<void>,
+  messageId = "provider-id",
+): AsyncGenerator<AdapterYieldChunk> {
   yield { type: EventType.RUN_STARTED, threadId: "provider-thread", runId: "provider-run" };
-  yield { type: EventType.TEXT_MESSAGE_START, messageId: "provider-id", role: "assistant" };
-  yield { type: EventType.TEXT_MESSAGE_CONTENT, messageId: "provider-id", delta: "root = Stack(" };
+  yield { type: EventType.TEXT_MESSAGE_START, messageId, role: "assistant" };
+  yield { type: EventType.TEXT_MESSAGE_CONTENT, messageId, delta: "root = Stack(" };
   if (wait) {
     await wait;
   }
-  yield { type: EventType.TEXT_MESSAGE_CONTENT, messageId: "provider-id", delta: ")" };
-  yield { type: EventType.TEXT_MESSAGE_END, messageId: "provider-id" };
+  yield { type: EventType.TEXT_MESSAGE_CONTENT, messageId, delta: ")" };
+  yield { type: EventType.TEXT_MESSAGE_END, messageId };
   yield { type: EventType.RUN_FINISHED, threadId: "provider-thread", runId: "provider-run" };
 }
 
@@ -297,9 +307,10 @@ const accepted: AcceptedRun = {
   baseRevision: 0,
   message: { id: "user-1", text: "Hello" },
   messages: baseline,
+  context: baseline,
   prompt: "offline",
   model: "deepseek-ai/DeepSeek-V4.1-Flash",
-  build: "durable-chat-loop-v5",
+  build: BUILD,
 };
 const toolTurn: Turn = {
   messages: baseline,
@@ -324,14 +335,18 @@ test("model checkpoint serialization failure halts all tools", async () => {
   const stepping = mock.method(
     DBOS,
     "runStep",
-    async (_callback: () => Promise<unknown>, config?: { name?: string }) => {
-      names.push(config?.name ?? "");
-      throw new Error("Checkpoint serialization rejected");
+    async (callback: () => Promise<unknown>, config?: { name?: string }) => {
+      const name = config?.name ?? "";
+      names.push(name);
+      if (name.startsWith("model:")) {
+        throw new Error("Checkpoint serialization rejected");
+      }
+      return callback();
     },
   );
   try {
     await assert.rejects(executeRun(accepted), /Checkpoint serialization rejected/);
-    assert.deepEqual(names, ["model:0"]);
+    assert.deepEqual(names, ["compact:0", "model:0"]);
   } finally {
     stepping.mock.restore();
   }
@@ -1293,7 +1308,7 @@ test(
   },
 );
 
-test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal release, replay cursor, and uncapped capacity", async () => {
+test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal release, replay cursor, and uncapped capacity", async (t) => {
   process.env.DATABASE_URL = "postgresql://offline:offline@127.0.0.1:1/offline";
   type Row = Record<string, unknown>;
   let threads = new Map<string, Row>([
@@ -1303,6 +1318,7 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
   let events: Row[] = [];
   let tail: Promise<void> = Promise.resolve();
   const statements: string[] = [];
+  let failCompactCompletion = false;
   const threadColumns =
     "id, title, agent, revision, active_run_id, messages, parent_thread_id, created_at, updated_at";
   const runColumns =
@@ -1325,7 +1341,10 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
     },
     {
       matches: (text) => text.startsWith(`select ${threadColumns} from threads`),
-      execute: (values) => [threads.get(String(values[0]))].filter((row): row is Row => !!row),
+      execute: (values) =>
+        [threads.get(String(values[0]))]
+          .filter((row): row is Row => !!row)
+          .map((row) => ({ title: "新對話", ...row })),
     },
     {
       matches: (text) =>
@@ -1421,10 +1440,27 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
       },
     },
     {
+      matches: (text) =>
+        text.startsWith("select run_id, sequence, event_key, payload from chat_events"),
+      execute: (values) =>
+        events.filter((row) => row.run_id === values[0] && row.event_key === values[1]),
+    },
+    {
+      matches: (text) => text.startsWith(`select ${runColumns} from chat_runs where (thread_id`),
+      execute: (values) =>
+        [...runs.values()].filter(
+          (row) =>
+            row.thread_id === values[0] &&
+            row.state === values[1] &&
+            String((row.request as { baseRevision: number }).baseRevision) === values[2],
+        ),
+    },
+    {
       matches: (text) => text.startsWith("insert into chat_events"),
       execute: (values) => {
         const [a, b, c, d] = values;
-        events.push({ run_id: a, sequence: b, event_key: c, payload: JSON.parse(String(d)) });
+        const payload = JSON.parse(String(d));
+        events.push({ run_id: a, sequence: b, event_key: c, payload });
         return [];
       },
     },
@@ -1445,7 +1481,11 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
     {
       matches: (text) => text.startsWith("update chat_runs set state"),
       execute: (values) => {
-        runs.get(String(values[1]))!.state = values[0];
+        const run = runs.get(String(values.at(-1)))!;
+        run.state = values[0];
+        if (values.length === 3) {
+          run.projection = JSON.parse(String(values[1]));
+        }
         return [];
       },
     },
@@ -1619,7 +1659,11 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
         parts: [{ type: "text" as const, content: "complete" }],
       },
     ];
-    const modelTurn: Turn = { calls: [], messages: canonical };
+    const modelTurn = {
+      state: "done",
+      calls: [],
+      conversation: { display: canonical, context: canonical },
+    };
     const completed = new Map<string, unknown>();
     const failures = new Set(["finish"]);
     const steps = mock.method(
@@ -1741,7 +1785,7 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
             assert.ok(JSON.stringify(history).includes("Offline result 3"));
             assert.equal(JSON.stringify(history).includes("Offline result 2"), false);
           }
-          yield* textStream();
+          yield* textStream(undefined, `provider-text-${++textSequence}`);
         }
       },
     );
@@ -1762,6 +1806,10 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
           assert.ok(cached.has("model:0"));
         }
         const output = await callback();
+        if (failCompactCompletion && name.startsWith("publish-compact:")) {
+          failCompactCompletion = false;
+          throw new Error("Offline compact completion");
+        }
         if (gaps.delete(name)) {
           throw new Error(`Uncheckpointed ${name}`);
         }
@@ -1775,7 +1823,7 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
         rejectedStream = invalidEvents;
         await assert.rejects(executeRun(nextRun), error);
         assert.deepEqual(external, []);
-        assert.equal(cached.size, 0);
+        assert.equal(cached.has("model:0"), false);
         assert.equal(rejectedGenerations, executedModelCallbacks);
       }
       rejectedStream = undefined;
@@ -1795,7 +1843,7 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
       await assert.rejects(executeRun(nextRun), /Uncheckpointed finish/);
       assert.deepEqual(
         runEvents()[beforeToolRetry]!.payload,
-        snapshot(cached.get("tool:0:0") as UIMessage[]),
+        snapshot((cached.get("tool:0:0") as ConversationState).display),
       );
       assert.deepEqual(external, ["TEST-1", "TEST-2", "TEST-2"]);
       assert.equal(modelCalls, 3);
@@ -1826,7 +1874,9 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
       cached.clear();
       gaps.add("model:0");
       await assert.rejects(executeRun(failedRun), /Uncheckpointed model:0/);
-      const speculative = runs.get(failedRun.runId)!.projection as UIMessage[];
+      const speculative = readProjection(
+        runs.get(failedRun.runId)!.projection as RunProjection,
+      ).display;
       assert.equal(speculative.at(-1)!.parts[0]!.type, "text");
       statuses.set(failedRun.runId, "ERROR");
       await reconcileRuns();
@@ -1883,10 +1933,16 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
       await largeReplay.return(undefined);
       const largeThreadRow = threads.get(largeThread)!;
       largeThreadRow.active_run_id = "other-run";
-      await assert.rejects(finishRun(largeRun.runId, largeRun.messages), /Thread claim changed/);
+      await assert.rejects(
+        finishRun(largeRun.runId, { display: largeRun.messages, context: largeRun.context }),
+        /Thread claim changed/,
+      );
       threads.get(largeThread)!.active_run_id = largeRun.runId;
       threads.get(largeThread)!.revision = 1;
-      await assert.rejects(finishRun(largeRun.runId, largeRun.messages), /Thread claim changed/);
+      await assert.rejects(
+        finishRun(largeRun.runId, { display: largeRun.messages, context: largeRun.context }),
+        /Thread claim changed/,
+      );
       threads.get(largeThread)!.revision = 0;
       cached.clear();
       gaps.clear();
@@ -1899,7 +1955,7 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
           yield* [toolStart, toolArgs, toolEnd, providerFinish];
         } else {
           assert.equal(toolHistory[0]!.content, toolContent);
-          yield* textStream();
+          yield* textStream(undefined, `provider-text-${++textSequence}`);
         }
       });
       const circular: Record<string, unknown> = {};
@@ -1936,7 +1992,7 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
         Array.from({ length: sequences.length - 1 }, (_, index) => 100_000 + index),
       );
       const beforeTerminal = largeEvents().length;
-      await finishRun(largeRun.runId, largeSaved);
+      await finishRun(largeRun.runId, { display: largeSaved, context: largeSaved });
       await assert.rejects(emit(largeRun.runId, largeEvent), /Run is terminal/);
       assert.equal(largeEvents().length, beforeTerminal);
       assert.equal(threads.get(largeThread)!.revision, 1);
@@ -2036,7 +2092,7 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
               '{"content":[{"type":"text","text":"after\\nsame\\nsame\\n"}]}',
             );
             assert.equal(history[7]!.content, '{"error":"Unknown tool"}');
-            yield* textStream();
+            yield* textStream(undefined, `provider-text-${++textSequence}`);
           }
         });
         await executeRun(filesystemRun);
@@ -2207,7 +2263,7 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
               }
               yield providerFinish;
             } else {
-              yield* textStream();
+              yield* textStream(undefined, `provider-text-${++textSequence}`);
             }
           });
           cached.clear();
@@ -2310,7 +2366,7 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
                 .filter((message) => message.role === "tool")
                 .map((message) => message.toolCallId);
               if (toolIds.includes("mcp-gap")) {
-                yield* textStream();
+                yield* textStream(undefined, `provider-text-${++textSequence}`);
                 return;
               }
               const discoveryInput = { toolNames: ["jira_get_issue"] };
@@ -2425,6 +2481,599 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
         limitFixture,
       );
 
+      await t.test(
+        "compaction resumes an interrupted snapshot publication without repeating its summary",
+        async () => {
+          const compactThread = "662e5aef-073f-4489-a5b8-d991c3135b9c";
+          const compactHistory: UIMessage[] = [
+            {
+              id: "compact-old-user",
+              role: "user",
+              parts: [{ type: "text", content: "Original compact request" }],
+            },
+            {
+              id: "compact-old-answer",
+              role: "assistant",
+              parts: [
+                { type: "text", content: "字".repeat(COMPACT_TOKEN_THRESHOLD + 5_000) },
+                {
+                  type: "tool-call",
+                  id: "compact-read-1",
+                  name: "read",
+                  arguments: '{"path":"old-a"}',
+                  state: "complete",
+                },
+                {
+                  type: "tool-call",
+                  id: "compact-read-2",
+                  name: "read",
+                  arguments: '{"path":"old-b"}',
+                  state: "complete",
+                },
+                {
+                  type: "tool-result",
+                  toolCallId: "compact-read-1",
+                  content: '{"content":"old-a"}',
+                  state: "complete",
+                },
+                {
+                  type: "tool-result",
+                  toolCallId: "compact-read-2",
+                  content: '{"content":"old-b"}',
+                  state: "complete",
+                },
+              ],
+            },
+            {
+              id: "compact-recent-user",
+              role: "user",
+              parts: [{ type: "text", content: "Retain exact identifiers RECENT-42" }],
+            },
+            {
+              id: "compact-recent-answer",
+              role: "assistant",
+              parts: [{ type: "text", content: "Retain the exact recent answer" }],
+            },
+          ];
+          threads.set(compactThread, {
+            id: compactThread,
+            title: "Stable compact title",
+            messages: compactHistory,
+            revision: 0,
+            active_run_id: null,
+          });
+          const compactRun = await acceptRun({
+            ...input,
+            threadId: compactThread,
+            runId: "compact-publication-recovery",
+            message: { id: "compact-current-user", text: "Current request CURRENT-73" },
+          });
+          let summaryGenerations = 0;
+          let ordinaryGenerations = 0;
+          let ordinaryInput: ReturnType<typeof convertMessagesToModelMessages> | undefined;
+          provider.mock.mockImplementation(async function* (options: {
+            messages: ReturnType<typeof convertMessagesToModelMessages>;
+            systemPrompts?: string[];
+            tools?: { name: string }[];
+          }) {
+            if (options.systemPrompts?.[0]?.startsWith("You summarize earlier")) {
+              summaryGenerations++;
+              assert.deepEqual(options.tools, []);
+              assert.equal(JSON.stringify(options.messages).includes("CURRENT-73"), false);
+              yield {
+                type: EventType.TEXT_MESSAGE_START,
+                messageId: "private-compaction-summary",
+                role: "assistant",
+              };
+              yield {
+                type: EventType.TEXT_MESSAGE_CONTENT,
+                messageId: "private-compaction-summary",
+                delta: "Historical summary keeps ORIGINAL-17 and the completed reads.",
+              };
+              yield { type: EventType.TEXT_MESSAGE_END, messageId: "private-compaction-summary" };
+              yield {
+                type: EventType.RUN_FINISHED,
+                threadId: "provider",
+                runId: "provider",
+                finishReason: "stop",
+              };
+              return;
+            }
+            ordinaryGenerations++;
+            ordinaryInput = structuredClone(options.messages);
+            yield* textStream(undefined, `provider-text-${++textSequence}`);
+          });
+          cached.clear();
+          gaps.clear();
+          failCompactCompletion = true;
+          await assert.rejects(executeRun(compactRun), (error: unknown) => {
+            assert.ok(error instanceof Error);
+            assert.equal(error.message, "Offline compact completion");
+            return true;
+          });
+          assert.equal(summaryGenerations, 1);
+          assert.equal(ordinaryGenerations, 0);
+          const projection = readProjection(
+            runs.get(compactRun.runId)!.projection as RunProjection,
+          );
+          assert.deepEqual(projection.display, compactRun.messages);
+          const candidate = structuredClone(projection.context);
+          assert.equal(candidate[0]!.metadata?.fromSummary, true);
+          assert.deepEqual(candidate.slice(1), compactRun.messages.slice(2));
+          assert.equal(runs.get(compactRun.runId)!.state, "pending");
+          const compactEvents = () =>
+            events
+              .filter((row) => row.run_id === compactRun.runId)
+              .map((row) => row.payload as StreamChunk);
+          assert.deepEqual(
+            compactEvents().flatMap((event) => {
+              const compact = parseCompactionEvent(event);
+              return compact ? [compact.state] : [];
+            }),
+            ["started", "done"],
+          );
+          await executeRun(compactRun);
+          assert.equal(summaryGenerations, 1);
+          assert.equal(ordinaryGenerations, 1);
+          assert.deepEqual(ordinaryInput, convertMessagesToModelMessages(candidate));
+          const compactSaved = threads.get(compactThread)!.messages as UIMessage[];
+          assert.deepEqual(compactSaved.slice(0, -1), compactRun.messages);
+          assert.equal(threads.get(compactThread)!.title, "Stable compact title");
+          assert.equal(runs.get(compactRun.runId)!.state, "succeeded");
+          assert.deepEqual(
+            compactEvents().flatMap((event) => {
+              const compact = parseCompactionEvent(event);
+              return compact ? [compact.state] : [];
+            }),
+            ["started", "done"],
+          );
+          assert.equal(
+            compactEvents().some(
+              (event) =>
+                event.type === EventType.TEXT_MESSAGE_CONTENT &&
+                event.messageId === "private-compaction-summary",
+            ),
+            false,
+          );
+          const compactHydrated = await hydrateThread(compactThread);
+          assert.deepEqual(compactHydrated.messages, compactSaved);
+          assert.equal(
+            compactHydrated.messages.some((message) => message.metadata?.fromSummary),
+            false,
+          );
+          assert.equal(compactHydrated.activeRun, null);
+          const replayed = new StreamProcessor({ initialMessages: compactRun.messages });
+          for (const event of compactEvents()) {
+            replayed.processChunk(event);
+          }
+          assert.deepEqual(
+            snapshot(replayed.getMessages()),
+            compactEvents().findLast((event) => event.type === EventType.MESSAGES_SNAPSHOT),
+          );
+          const committedProjection = structuredClone(runs.get(compactRun.runId)!.projection);
+          const committedEventCount = compactEvents().length;
+          await checkpointCompaction(
+            compactRun.runId,
+            `${compactRun.runId}/compact/0`,
+            projection,
+            "done",
+          );
+          assert.deepEqual(runs.get(compactRun.runId)!.projection, committedProjection);
+          assert.equal(compactEvents().length, committedEventCount);
+          await assert.rejects(
+            checkpointCompaction(
+              compactRun.runId,
+              `${compactRun.runId}/compact/0`,
+              projection,
+              "failed",
+            ),
+            /outcome mismatch/,
+          );
+          threads.get(compactThread)!.messages = [
+            ...compactSaved,
+            { id: "unanchored", role: "user", parts: [] },
+          ];
+          await assert.rejects(
+            acceptRun({
+              ...input,
+              threadId: compactThread,
+              runId: "mismatched-anchor",
+              baseRevision: 1,
+              message: { id: "mismatch-user", text: "Must not revive old grants" },
+            }),
+            /anchor does not match/,
+          );
+          threads.get(compactThread)!.messages = compactSaved;
+          const followingCompactRun = await acceptRun({
+            ...input,
+            threadId: compactThread,
+            runId: "compact-following-run",
+            baseRevision: 1,
+            message: { id: "compact-following-user", text: "The next request" },
+          });
+          assert.deepEqual(followingCompactRun.messages.slice(0, -1), compactSaved);
+          assert.deepEqual(
+            followingCompactRun.context.slice(0, -1),
+            readProjection(runs.get(compactRun.runId)!.projection as RunProjection).context,
+          );
+          cached.clear();
+          await executeRun(followingCompactRun);
+          assert.equal(threads.get(compactThread)!.title, "Stable compact title");
+          assert.equal(runs.get(followingCompactRun.runId)!.state, "succeeded");
+        },
+      );
+
+      await t.test(
+        "overflow recovery replays JSON receipts and clears partial tools without repeating completed tools",
+        async () => {
+          const threadId = "4bcd2480-aa13-4c70-81ba-e64b6e718bc0";
+          const history: UIMessage[] = [
+            {
+              id: "overflow-old-user",
+              role: "user",
+              parts: [{ type: "text", content: "Read OLD-17" }],
+            },
+            {
+              id: "overflow-archived",
+              role: "assistant",
+              parts: [{ type: "text", content: "字".repeat(10_000) }],
+            },
+          ];
+          threads.set(threadId, {
+            id: threadId,
+            messages: history,
+            revision: 0,
+            active_run_id: null,
+          });
+          const run = await acceptRun({
+            ...input,
+            threadId,
+            runId: "overflow-replay",
+            message: { id: "overflow-current", text: "Continue CURRENT-73" },
+          });
+          const receipts = new Map<string, string>();
+          let interrupt = true;
+          const durable = mock.method(
+            DBOS,
+            "runStep",
+            async (callback: () => Promise<unknown>, config?: { name?: string }) => {
+              const name = config?.name ?? "";
+              const receipt = receipts.get(name);
+              if (receipt !== undefined) {
+                return JSON.parse(receipt);
+              }
+              const result = await callback();
+              if (name === "publish-compact-overflow:1" && interrupt) {
+                interrupt = false;
+                throw new Error("Interrupted overflow publication");
+              }
+              receipts.set(name, JSON.stringify(result) ?? "null");
+              return result;
+            },
+          );
+          const sideEffects: string[] = [];
+          const executed = mock.method(readTool, "execute", async (value: { path: string }) => {
+            sideEffects.push(value.path);
+            return { content: "Read completed EXACT-42" };
+          });
+          let primary = 0;
+          let summaries = 0;
+          let recovered = 0;
+          provider.mock.mockImplementation(async function* (options: {
+            messages: ReturnType<typeof convertMessagesToModelMessages>;
+            tools?: { name: string }[];
+          }) {
+            if (options.tools?.length === 0) {
+              summaries++;
+              const data = JSON.parse(String(options.messages[0]!.content));
+              assert.equal(data.previousSummary, null);
+              assert.equal(JSON.stringify(data.transcript).includes("overflow-partial"), false);
+              yield* textStream(undefined, "overflow-summary");
+              return;
+            }
+            if (receipts.has("compact-overflow:1")) {
+              recovered++;
+              assert.equal(JSON.stringify(options.messages).includes("字".repeat(1_000)), false);
+              assert.equal(JSON.stringify(options.messages).includes("EXACT-42"), true);
+              yield* textStream(undefined, "overflow-final");
+              return;
+            }
+            primary++;
+            if (primary === 1) {
+              yield {
+                type: EventType.TEXT_MESSAGE_START,
+                messageId: "overflow-tool-owner",
+                role: "assistant",
+              };
+              yield {
+                type: EventType.TOOL_CALL_START,
+                toolCallId: "overflow-completed-read",
+                toolCallName: "read",
+              };
+              yield {
+                type: EventType.TOOL_CALL_ARGS,
+                toolCallId: "overflow-completed-read",
+                delta: '{"path":"once-only"}',
+              };
+              yield { type: EventType.TOOL_CALL_END, toolCallId: "overflow-completed-read" };
+              yield { type: EventType.RUN_FINISHED, threadId: "provider", runId: "provider" };
+              return;
+            }
+            yield {
+              type: EventType.TEXT_MESSAGE_START,
+              messageId: "overflow-partial",
+              role: "assistant",
+            };
+            yield {
+              type: EventType.TEXT_MESSAGE_CONTENT,
+              messageId: "overflow-partial",
+              delta: "Not committed",
+            };
+            yield {
+              type: EventType.TOOL_CALL_START,
+              toolCallId: "overflow-unfinished",
+              toolCallName: "read",
+            };
+            yield {
+              type: EventType.RUN_ERROR,
+              code: "context_length_exceeded",
+              message: "private credential-like diagnostic must not persist",
+            };
+          });
+          try {
+            await assert.rejects(executeRun(run), /Interrupted overflow publication/);
+            assert.deepEqual(JSON.parse(receipts.get("model:1")!), {
+              state: "overflow",
+              error: "Model context capacity exceeded",
+            });
+            assert.equal(summaries, 1);
+            assert.equal(recovered, 0);
+            const projection = readProjection(runs.get(run.runId)!.projection as RunProjection);
+            assert.deepEqual(projection.display.slice(0, run.messages.length), run.messages);
+            assert.equal(JSON.stringify(projection).includes("overflow-partial"), false);
+            assert.equal(JSON.stringify(projection).includes("overflow-unfinished"), false);
+            await executeRun(run);
+            assert.equal(summaries, 1);
+            assert.equal(primary, 2);
+            assert.equal(recovered, 1);
+            assert.deepEqual(sideEffects, ["once-only"]);
+            assert.equal(receipts.has("reset-model:1:overflow"), true);
+            const saved = threads.get(threadId)!.messages as UIMessage[];
+            assert.deepEqual(saved.slice(0, run.messages.length), run.messages);
+            assert.equal(saved.at(-1)?.id, "overflow-final");
+            assert.equal(JSON.stringify(saved).includes("overflow-unfinished"), false);
+            const replayed = new StreamProcessor({ initialMessages: run.messages });
+            const emitted = events
+              .filter((row) => row.run_id === run.runId)
+              .map((row) => row.payload as StreamChunk);
+            for (const event of emitted) {
+              replayed.processChunk(event);
+            }
+            assert.deepEqual(snapshot(replayed.getMessages()), snapshot(saved));
+            assert.deepEqual(
+              emitted.flatMap((event) => {
+                const compact = parseCompactionEvent(event);
+                return compact ? [compact.state] : [];
+              }),
+              ["started", "done"],
+            );
+            assert.equal(JSON.stringify(emitted).includes("private credential-like"), false);
+          } finally {
+            executed.mock.restore();
+            durable.mock.restore();
+          }
+        },
+      );
+
+      const overflowCases: {
+        name: string;
+        atomic?: boolean;
+        invalidSummary?: boolean;
+        creation?: boolean;
+        providerFailure?: Error;
+        recoveredId?: string;
+        generations: number;
+        summaries: number;
+        failure?: RegExp;
+        exhausted?: boolean;
+        originalContext?: boolean;
+      }[] = [
+        {
+          name: "second-overflow",
+          generations: 2,
+          summaries: 1,
+          failure: /Model context capacity exceeded/,
+          exhausted: true,
+        },
+        {
+          name: "invalid-summary",
+          invalidSummary: true,
+          generations: 1,
+          summaries: 1,
+          failure: /Model context capacity exceeded/,
+          originalContext: true,
+        },
+        {
+          name: "atomic",
+          atomic: true,
+          generations: 1,
+          summaries: 0,
+          failure: /Model context capacity exceeded/,
+          originalContext: true,
+        },
+        {
+          name: "creation",
+          creation: true,
+          recoveredId: "creation-final",
+          generations: 2,
+          summaries: 1,
+        },
+        {
+          name: "rate",
+          providerFailure: Object.assign(new Error("rate limited"), {
+            status: 429,
+            code: "context_length_exceeded",
+          }),
+          generations: 3,
+          summaries: 0,
+          failure: /rate limited/,
+        },
+        {
+          name: "network",
+          providerFailure: Object.assign(new Error("connection reset"), { code: "ECONNRESET" }),
+          generations: 3,
+          summaries: 0,
+          failure: /connection reset/,
+        },
+        {
+          name: "unknown",
+          providerFailure: new Error("Unknown provider failure"),
+          generations: 3,
+          summaries: 0,
+          failure: /Unknown provider failure/,
+        },
+        {
+          name: "archived-collision",
+          recoveredId: "archived-collision-archived",
+          generations: 4,
+          summaries: 1,
+          failure: /collides with conversation history/,
+        },
+      ];
+      for (const scenario of overflowCases) {
+        await t.test(
+          `overflow boundary ${scenario.name} has bounded recovery and safe persisted output`,
+          async () => {
+            const threadId = randomUUID();
+            const history: UIMessage[] = scenario.atomic
+              ? []
+              : [
+                  {
+                    id: `${scenario.name}-old-user`,
+                    role: "user",
+                    parts: [{ type: "text", content: "Old request" }],
+                  },
+                  {
+                    id: `${scenario.name}-archived`,
+                    role: "assistant",
+                    parts: [{ type: "text", content: "字".repeat(8_000) }],
+                  },
+                ];
+            threads.set(threadId, {
+              id: threadId,
+              messages: history,
+              revision: 0,
+              active_run_id: null,
+            });
+            const run = await acceptRun({
+              ...input,
+              threadId,
+              runId: `overflow-${scenario.name}`,
+              message: { id: `${scenario.name}-current`, text: "Continue" },
+            });
+            const receipts = new Map<string, string>();
+            const durable = mock.method(
+              DBOS,
+              "runStep",
+              async (
+                callback: () => Promise<unknown>,
+                config?: { name?: string; maxAttempts?: number },
+              ) => {
+                const name = config?.name ?? "";
+                const receipt = receipts.get(name);
+                if (receipt !== undefined) {
+                  return JSON.parse(receipt);
+                }
+                for (let attempt = 1; ; attempt++) {
+                  try {
+                    const result = await callback();
+                    receipts.set(name, JSON.stringify(result) ?? "null");
+                    return result;
+                  } catch (error) {
+                    if (attempt >= (config?.maxAttempts ?? 1)) {
+                      throw error;
+                    }
+                  }
+                }
+              },
+            );
+            let summaries = 0;
+            let generations = 0;
+            provider.mock.mockImplementation((options: { tools?: { name: string }[] }) => {
+              if (options.tools?.length !== 0) {
+                generations++;
+                if (scenario.creation && generations === 1) {
+                  throw Object.assign(new Error("private creation error"), {
+                    code: "context_length_exceeded",
+                  });
+                }
+              }
+              return (async function* (): AsyncGenerator<AdapterYieldChunk> {
+                if (options.tools?.length === 0) {
+                  summaries++;
+                  if (scenario.invalidSummary) {
+                    return;
+                  }
+                  yield* textStream(undefined, `${scenario.name}-summary`);
+                  return;
+                }
+                if (scenario.providerFailure) {
+                  throw scenario.providerFailure;
+                }
+                if (generations > 1 && scenario.recoveredId) {
+                  yield* textStream(undefined, scenario.recoveredId);
+                  return;
+                }
+                yield {
+                  type: EventType.TEXT_MESSAGE_START,
+                  messageId: `${scenario.name}-partial-${generations}`,
+                  role: "assistant",
+                };
+                yield {
+                  type: EventType.TEXT_MESSAGE_CONTENT,
+                  messageId: `${scenario.name}-partial-${generations}`,
+                  delta: "Discard partial response",
+                };
+                throw Object.assign(new Error("private overflow detail"), {
+                  code: "context_length_exceeded",
+                });
+              })();
+            });
+            try {
+              if (scenario.failure) {
+                await assert.rejects(executeRun(run), scenario.failure);
+              } else {
+                await executeRun(run);
+              }
+              assert.equal(generations, scenario.generations);
+              assert.equal(summaries, scenario.summaries);
+              const projection = readProjection(runs.get(run.runId)!.projection as RunProjection);
+              assert.deepEqual(projection.display.slice(0, run.messages.length), run.messages);
+              assert.equal(JSON.stringify(projection).includes("Discard partial response"), false);
+              assert.equal(
+                JSON.stringify([...receipts.values()]).includes("private overflow"),
+                false,
+              );
+              assert.equal(receipts.has("reset-model:0:exhausted"), scenario.exhausted ?? false);
+              if (scenario.originalContext) {
+                assert.deepEqual(projection.context, run.context);
+              }
+              assert.equal(runs.get(run.runId)!.state, scenario.failure ? "pending" : "succeeded");
+              const emitted = events
+                .filter((row) => row.run_id === run.runId)
+                .map((row) => row.payload as StreamChunk);
+              const replay = new StreamProcessor({ initialMessages: run.messages });
+              for (const event of emitted) {
+                replay.processChunk(event);
+              }
+              assert.deepEqual(snapshot(replay.getMessages()), snapshot(projection.display));
+            } finally {
+              durable.mock.restore();
+            }
+          },
+        );
+      }
+
       const legacyThread = "58b47547-a3b2-4f61-9d92-f29cf9f6cb83";
       threads.set(legacyThread, {
         id: legacyThread,
@@ -2474,7 +3123,7 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
       gaps.clear();
       cached.set("model:0", savedOfficialTurn);
       provider.mock.mockImplementation(async function* () {
-        yield* textStream();
+        yield* textStream(undefined, `provider-text-${++textSequence}`);
       });
       const legacyFixture = mcpFixture();
       await withMcpEnvironment(

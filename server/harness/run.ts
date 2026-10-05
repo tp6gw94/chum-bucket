@@ -9,7 +9,16 @@ import {
 } from "@tanstack/ai";
 import { resolveDebugOption } from "@tanstack/ai/adapter-internals";
 import { withRunTools, type RunTools } from "./tools";
-import { snapshot, streamModelTurn, type ModelCall } from "./model-turn";
+import { prepareCompaction, publishCompaction } from "./compaction";
+import { advanceConversation, type ConversationState } from "./conversation";
+import {
+  ContextOverflowError,
+  snapshot,
+  streamModelTurn,
+  throwProviderError,
+  type ModelCall,
+  type Turn,
+} from "./model-turn";
 import { createToolEventBuffer, drainToolEvents } from "./tool-events";
 import {
   BUILD,
@@ -36,11 +45,12 @@ export async function acceptRun(value: RunInput): Promise<AcceptedRun> {
 
 async function toolStep(
   runId: string,
-  messages: UIMessage[],
+  conversation: ConversationState,
   call: ModelCall,
   tools: RunTools,
-): Promise<UIMessage[]> {
-  await emit(runId, snapshot(messages), messages);
+): Promise<ConversationState> {
+  const messages = conversation.context;
+  await emit(runId, snapshot(conversation.display), conversation);
   const events = createToolEventBuffer(call.id);
   let output: unknown;
   let error = false;
@@ -73,8 +83,103 @@ async function toolStep(
   processor.processChunk(event);
   const encoded = JSON.stringify(processor.getMessages());
   const next = JSON.parse(encoded) as UIMessage[];
-  await emit(runId, event, next);
-  return next;
+  const owner = messages.find((message) =>
+    message.parts.some((part) => part.type === "tool-call" && part.id === call.id),
+  );
+  const updated = advanceConversation(conversation, next, owner?.id);
+  await emit(runId, event, updated);
+  return updated;
+}
+
+type ModelOutcome =
+  | { state: "done"; conversation: ConversationState; calls: ModelCall[] }
+  | { state: "overflow"; error: string };
+
+async function modelStep(
+  run: AcceptedRun,
+  conversation: ConversationState,
+  tools: RunTools,
+): Promise<ModelOutcome> {
+  await emit(run.runId, snapshot(conversation.display), conversation);
+  const { deepinfra } = await import("./provider");
+  const adapter = deepinfra(run.model);
+  const turn = await tools.getModelTools(conversation.context);
+  const options: Parameters<typeof adapter.chatStream>[0] = {
+    model: run.model,
+    messages: convertMessagesToModelMessages(conversation.context),
+    systemPrompts: [run.prompt, turn.systemPrompt],
+    tools: turn.definitions,
+    logger: resolveDebugOption(false),
+    request: { signal: AbortSignal.timeout(120_000) },
+  };
+  let result: Turn;
+  try {
+    let stream: ReturnType<typeof adapter.chatStream>;
+    try {
+      stream = adapter.chatStream(options);
+    } catch (error) {
+      throwProviderError(error);
+    }
+    result = await streamModelTurn({
+      messages: conversation.context,
+      protectedMessages: conversation.display,
+      stream,
+      append: (event) => emit(run.runId, event),
+    });
+  } catch (error) {
+    if (error instanceof ContextOverflowError) {
+      return { state: "overflow", error: error.message };
+    }
+    throw error;
+  }
+  const next = advanceConversation(conversation, result.messages);
+  await emit(run.runId, snapshot(next.display), next);
+  return { state: "done", conversation: next, calls: result.calls };
+}
+
+const MODEL_RETRY = {
+  retriesAllowed: true,
+  maxAttempts: 3,
+  intervalSeconds: 1,
+  backoffRate: 2,
+};
+
+async function compactConversation(
+  run: AcceptedRun,
+  conversation: ConversationState,
+  tools: RunTools,
+  turn: number,
+  reason: "threshold" | "overflow",
+): Promise<ConversationState> {
+  const name = reason === "overflow" ? "compact-overflow" : "compact";
+  const operationId = `${run.runId}/${name}/${turn}`;
+  const outcome = await DBOS.runStep(
+    () =>
+      prepareCompaction({
+        runId: run.runId,
+        operationId,
+        messages: conversation.context,
+        prompt: run.prompt,
+        model: run.model,
+        tools,
+        emit: (event) => emit(run.runId, event),
+        reason,
+      }),
+    { name: `${name}:${turn}` },
+  );
+  if (outcome.state !== "skipped") {
+    await DBOS.runStep(
+      () => publishCompaction({ runId: run.runId, operationId, outcome, conversation }),
+      { name: `publish-${name}:${turn}` },
+    );
+  }
+  if (outcome.state === "done") {
+    return { ...conversation, context: outcome.messages };
+  }
+  if (reason === "overflow") {
+    throw new ContextOverflowError();
+  }
+  return conversation;
 }
 
 export async function executeRun(run: AcceptedRun) {
@@ -82,45 +187,37 @@ export async function executeRun(run: AcceptedRun) {
     throw new Error("Incompatible run build");
   }
   return withRunTools(async (tools) => {
-    let messages = run.messages;
+    let conversation: ConversationState = { display: run.messages, context: run.context };
     let turn = 0;
     while (turn < MAX_TURN) {
-      const result = await DBOS.runStep(
-        async () => {
-          await emit(run.runId, snapshot(messages), messages);
-          const { deepinfra } = await import("./provider");
-          const adapter = deepinfra(run.model);
-          const turn = await tools.getModelTools(messages);
-          const result = await streamModelTurn({
-            messages,
-            stream: adapter.chatStream({
-              model: run.model,
-              messages: convertMessagesToModelMessages(messages),
-              systemPrompts: [run.prompt, turn.systemPrompt],
-              tools: turn.definitions,
-              logger: resolveDebugOption(false),
-              request: { signal: AbortSignal.timeout(120_000) },
-            }),
-            append: (event) => emit(run.runId, event),
+      conversation = await compactConversation(run, conversation, tools, turn, "threshold");
+      let result = await DBOS.runStep(() => modelStep(run, conversation, tools), {
+        name: `model:${turn}`,
+        ...MODEL_RETRY,
+      });
+      if (result.state === "overflow") {
+        await DBOS.runStep(() => emit(run.runId, snapshot(conversation.display), conversation), {
+          name: `reset-model:${turn}:overflow`,
+        });
+        conversation = await compactConversation(run, conversation, tools, turn, "overflow");
+        result = await DBOS.runStep(() => modelStep(run, conversation, tools), {
+          name: `model-overflow:${turn}`,
+          ...MODEL_RETRY,
+        });
+        if (result.state === "overflow") {
+          await DBOS.runStep(() => emit(run.runId, snapshot(conversation.display), conversation), {
+            name: `reset-model:${turn}:exhausted`,
           });
-          await emit(run.runId, snapshot(result.messages), result.messages);
-          return result;
-        },
-        {
-          name: `model:${turn}`,
-          retriesAllowed: true,
-          maxAttempts: 3,
-          intervalSeconds: 1,
-          backoffRate: 2,
-        },
-      );
-      messages = result.messages;
+          throw new ContextOverflowError();
+        }
+      }
+      conversation = result.conversation;
       if (!result.calls.length) {
-        await DBOS.runStep(() => finishRun(run.runId, messages), { name: "finish" });
+        await DBOS.runStep(() => finishRun(run.runId, conversation), { name: "finish" });
         return;
       }
       for (const [index, call] of result.calls.entries()) {
-        messages = await DBOS.runStep(() => toolStep(run.runId, messages, call, tools), {
+        conversation = await DBOS.runStep(() => toolStep(run.runId, conversation, call, tools), {
           name: `tool:${turn}:${index}`,
         });
       }

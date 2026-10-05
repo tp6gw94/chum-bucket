@@ -4,7 +4,8 @@ import { useMemo } from "react";
 
 import { Bubble, BubbleContent } from "@/components/ui/bubble";
 import { Marker, MarkerContent } from "@/components/ui/marker";
-import { Message, MessageContent, MessageGroup, MessageHeader } from "@/components/ui/message";
+import { Message, MessageContent, MessageHeader } from "@/components/ui/message";
+import { MessageScrollerItem } from "@/components/ui/message-scroller";
 import { type ChatMessage } from "./types";
 import { ToolCall } from "./tool-call";
 
@@ -140,27 +141,41 @@ function ChatMessageRow({
   );
 }
 
+export function CompactMarker() {
+  return (
+    <MessageScrollerItem messageId="transient-compact-status">
+      <Marker role="status" variant="separator">
+        <MarkerContent>compact...</MarkerContent>
+      </Marker>
+    </MessageScrollerItem>
+  );
+}
+
 export function MessageList({
   messages,
   agent,
   isStreaming = false,
+  compacting = false,
 }: {
   messages: ChatMessage[];
   agent: string;
   isStreaming?: boolean;
+  compacting?: boolean;
 }) {
   const streamingId = isStreaming ? messages.at(-1)?.id : undefined;
 
   return (
-    <MessageGroup className="gap-4">
+    <>
       {messages.map((message) => (
-        <ChatMessageRow
-          key={message.id}
-          message={message}
-          agent={agent}
-          isStreaming={message.id === streamingId && message.role === "assistant"}
-        />
+        <MessageScrollerItem key={message.id} messageId={message.id}>
+          <ChatMessageRow
+            message={message}
+            agent={agent}
+            isStreaming={message.id === streamingId && message.role === "assistant"}
+          />
+        </MessageScrollerItem>
       ))}
-    </MessageGroup>
+      {compacting ? <CompactMarker /> : null}
+    </>
   );
 }
