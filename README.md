@@ -94,26 +94,34 @@ sequenceDiagram
 
 ### Target
 
-實作時一個勾選一 PR；工具掛在 `server/harness/tools/`，由 `tools/index.ts` 組成模型可見清單。
+一次只做一個勾選。把工具放在 `server/harness/tools/`。在 `tools/index.ts` 註冊，模型才看得到。
 
 1. 建立 Tool
-    1. [ ] **get_figma tool**  
-       - 形狀：`toolDefinition({ name, description, inputSchema })` + `execute`；輸入用 Zod（Figma URL／fileKey／nodeId／depth）。  
-       - 行為：打 Figma REST API，回傳精簡樹（隱藏節點可略、名稱截斷），避免把整份 file JSON 灌進 context。  
-       - Token：只從環境變數讀，不可進 repo／CLI 參數。  
-       - 驗收：單元測 mock `fetch`（成功、4xx、壞 URL）；必要時在 `run.test.ts` 證明模型叫得到。
-    2. [ ] **fs tool**  
-       - 形狀：`read`／`write`／`edit` 三支本地工具，同樣經 `toolDefinition`。  
-       - 行為：路徑限制在專案允許根目錄；寫入／編輯要可預測、可測。  
-       - 掛載：寫進 `localCatalog`，與遠端 MCP 工具合併時名稱不可撞車。  
-       - 驗收：fs 單元測 + 一條 durable run 測「模型呼叫 → 檔案變更」。
+    1. [ ] **get_figma**
+       1. 用 `toolDefinition` 建立名為 `get_figma` 的工具。
+       2. 用 Zod 定義輸入：Figma URL 或 `fileKey`，可選 `nodeId` 與 `depth`。
+       3. 在 `execute` 裡呼叫 Figma REST API。
+       4. 只回傳精簡節點樹。略過隱藏節點。截斷過長名稱。
+       5. 只從環境變數讀取 API token。不要寫進 repo 或 CLI 旗標。
+       6. 用 mock `fetch` 寫單元測試：成功、HTTP 錯誤、壞 URL。
+       完成時：測試通過，且一次 run 裡模型能呼叫 `get_figma`。
+    2. [ ] **fs**
+       1. 用 `toolDefinition` 建立 `read`、`write`、`edit`。
+       2. 把路徑限制在允許的專案根目錄內。
+       3. 把三支工具註冊進本地 catalog。名稱不可與 MCP 工具重複。
+       4. 為三支工具寫單元測試。
+       5. 加一條 run 測試：模型呼叫後，磁碟上的檔案有對應變更。
+       完成時：單元測試與 run 測試都通過。
 2. 建立 MCP Tool
-    1. [ ] **[sooperset/mcp-atlassian](https://github.com/sooperset/mcp-atlassian/tree/v0.23.1) 本機唯讀 HTTP + lazy**  
-       - 啟動：本機 loopback MCP（例如 `scripts/mcp-atlassian.ts`），URL／憑證經 policy 校驗（禁止非 loopback、禁止把 secret 塞進 URL）。  
-       - 目錄：先不要把全部 Atlassian tool schema 塞進每次 model 請求。預設只暴露 discovery（如 `discover_atlassian_tools`）；模型點名後再把完整 schema 加入該 run 的可用清單。  
-       - 範圍：`withAtlassianScope`（或同等）包住一次 run 的 MCP session／catalog，結束釋放。  
-       - 早夭路徑可記：先做過薄的 `get-ticket`／`read-confluence`／`write-jira-comment` 直連，再收斂成 MCP + lazy——新實作直接走 MCP，不要兩套並存。  
-       - 驗收：policy 測、fixture MCP 測、lazy「未 discover 不能叫；discover 後可叫」；run 測重啟後仍遵守 scope。
+    1. [ ] **本機 Atlassian MCP（lazy）**
+       1. 用 [sooperset/mcp-atlassian v0.23.1](https://github.com/sooperset/mcp-atlassian/tree/v0.23.1) 在本機啟動 HTTP MCP。
+       2. 只允許 loopback URL。拒絕把密鑰放進 URL。
+       3. 預設不要把全部 Atlassian tool schema 送給模型。
+       4. 先只暴露一支 discovery 工具（例如 `discover_atlassian_tools`）。
+       5. 模型點名後，再把那些工具的完整 schema 加入**這一次** run。
+       6. 用 scope 包住一次 run 的 MCP session。run 結束就釋放。
+       7. 不要同時保留「直連 Jira／Confluence HTTP」與「MCP」兩套工具。
+       完成時：未 discover 時呼叫遠端工具會失敗；discover 後可以成功；policy 與 fixture 測試通過。
 
 ## 2. Durable Execution
 
@@ -163,19 +171,27 @@ Checkpoint 決定恢復時要執行哪些步驟；事件紀錄則讓人看得見
 
 ### Target
 
-1. [ ] **拆除原生 chat**  
-   - 從「單次 request／記憶體 messages」改成：先建立空 thread → 之後每次訊息是一個 `run`（固定 `threadId`）。  
-   - UI：載入歷史、run 進行中鎖切換／導覽；只認 transport 的 terminal，不要被 SDK 合成 EOF 誤開閘。  
-   - 文件契約見 `docs/frontend-thread.md`；離線用 mock DB／攔截網路的 browser check，不要依賴真後端。
-2. [ ] **DBOS 驅動的回覆工作**  
-   - `acceptRun` 持久化後啟動 workflow；`executeRun` 迴圈：`model` step → 若有 tool calls 則逐個 `tool` step → 再 model，直到結束 `finish`。  
-   - 每個 step 經 `DBOS.runStep`；重啟時已完成 step 重放結果、不重打模型／工具。  
-   - 並行：Drizzle 存 stream 事件，UI `observeRun` 從 cursor 追；`reconcileRuns` 啟動時接手未完成 run。  
-   - 驗收：殺進程後同一 `runId` 續跑；已 checkpoint 的 tool 不重複執行（測裡 mock 外部）。
-3. [ ] **自訂 discovery tool（lazy）**  
-   - 與 §1 MCP lazy 同一條線：discovery 是 Harness 擁有的本地工具，不是把 MCP 全量 schema 丟給模型。  
-   - 壓縮或新 run 後，scoped 授權應失效，需重新 discover（摘要 preamble 可提醒模型）。  
-   - 驗收：未 discover 呼叫遠端工具失敗；discover 後成功；重啟／compact 後行為符合設計。
+1. [ ] **拆除原生 chat**
+   1. 改成先建立空 thread，再對固定 `threadId` 送 run。
+   2. UI 載入歷史。run 進行中禁止切換 thread 與導覽。
+   3. 只把 transport 的 terminal 當成結束。忽略 SDK 為 EOF 合成的成功。
+   4. 依 `docs/frontend-thread.md` 實作行為。
+   5. 用 mock DB 與攔截網路的 browser check 驗證。不要依賴真後端。
+   完成時：建立 thread、送訊、重載歷史、busy 鎖定都符合 `docs/frontend-thread.md`。
+2. [ ] **用 DBOS 跑回覆**
+   1. `acceptRun` 先把 run 寫進資料庫，再啟動 workflow。
+   2. 在 `executeRun` 裡循環：`model` step → 每個 tool call 一個 `tool` step → 再 `model`，直到沒有 tool call。
+   3. 結束時跑 `finish` step。
+   4. 每個 step 都包在 `DBOS.runStep` 裡。
+   5. 重啟後，已完成的 step 重用 checkpoint，不要再呼叫模型或工具。
+   6. 用 Drizzle 存 stream 事件。UI 用 cursor 訂閱。
+   7. 程序啟動時，用 `reconcileRuns` 接回未完成的 run。
+   完成時：殺掉進程後，同一 `runId` 能續跑；已 checkpoint 的 tool 不會再執行一次（測試裡 mock 外部系統）。
+3. [ ] **自訂 discovery（lazy）**
+   1. Discovery 做成 Harness 的本地工具，不要把 MCP 全量 schema 塞進每次請求。
+   2. Compact 或新 run 之後，清掉已 discover 的授權。模型必須再 discover 一次。
+   3. 可在摘要前言提醒模型重新呼叫 discovery。
+   完成時：未 discover 失敗；discover 後成功；compact 後必須再 discover。
 
 ## 3.Code Mode
 
@@ -191,12 +207,16 @@ Code Mode 就是給 LLM 一個 Sandbox，讓他可以在裡面執行程式，我
 
 ### Target
 
-- [ ] **提供 Code Mode**  
-  - 對模型只多一支工具（如 `codemode`），輸入 `{ code: string }`；在 QuickJS（或同等）isolate 執行。  
-  - 把「當前已授權／已暴露」的工具編成 sandbox binding（`external_*`），程式內 `await` 呼叫；主迴圈仍走既有 tool dispatch，不要另開無權限通道。  
-  - 限制：timeout、記憶體、原始碼大小、host call 次數／位元組、console 上限——寫死 policy，測裡打滿要失敗。  
-  - 事件：執行起迄、console、external call／result 可進 tool-event buffer，UI 能顯示。  
-  - 驗收：單元測 sandbox 邊界；一條 run 測「多步外部呼叫在一段 code 內完成，模型只看到最終回傳」。說明圖見 `explains/codemode-sandbox.html`。
+1. [ ] **提供 Code Mode**
+   1. 對模型只多加一支工具，名稱如 `codemode`。
+   2. 輸入是 `{ "code": "<typescript>" }`。
+   3. 在 QuickJS isolate（或同等 sandbox）執行這段程式。
+   4. 把目前已授權的工具編成 sandbox 裡的 `external_*` 函式。
+   5. 程式裡必須 `await` 這些呼叫。實際執行仍走既有的 tool dispatch。
+   6. 用固定 policy 限制：timeout、記憶體、原始碼大小、host 呼叫次數與位元組、console 上限。
+   7. 超出限制時執行失敗。
+   8. 把執行起迄、console、external 呼叫結果送進 tool-event buffer，讓 UI 能顯示。
+   完成時：邊界單元測試通過；一條 run 測試證明多步外部呼叫可在一段 code 內完成，且模型只收到最終回傳。說明見 `explains/codemode-sandbox.html`。
 
 ## 4. Compact
 
@@ -263,21 +283,27 @@ Prompt caching 透過重用相同的輸入前綴，減少重複處理的成本�
 
 ### Target
 
-1. [ ] **設定 Buffer，提早 Compact**  
-   - 估 token（訊息 + system + tool definitions），設 `triggerTokens`（低於硬上限）與 `keepRecentTokens`。  
-   - 每輪 model **之前**檢查；超過則 `prepareCompaction`（獨立摘要請求、無工具）→ `publishCompaction` 寫回 conversation。  
-   - 切分必須落在「無未完成 tool-call／result 配對」的邊界。  
-   - 另做 **overflow**：provider 報 context 過大時 compact 一次再重試 model，且次數有上限。  
-   - 狀態分離：`display` 保留全文給 UI；`context` 才是模型輸入（摘要 + tail）。事件名如 `context-compaction`，UI 顯示 `compacting`。  
-   - 驗收：offline／單元測 plan 邊界與 threshold；run 測 threshold 與 overflow 恢復（含中斷後續 publish）。
-2. [ ] **手動 Compact**  
-   - 在自動門檻之外提供明確觸發（HTTP 或 UI 按鈕）：同一套 prepare／publish／DBOS step／事件，只是 `reason` 不同（如 `manual`）。  
-   - 未達門檻也應能壓縮；進行中 run 要定義清楚是拒絕還是排程。  
-   - 驗收：手動後 `context` 變短、`display` 仍完整；事件與 phase 與自動路徑一致。
-3. [ ] **BTW**  
-   - 建議語意（工作坊可改）：旁路短問／註記——可進 `display`，**預設不進**（或可標記排除）主 `context`／摘要 transcript，避免污染交接摘要。  
-   - 實作前用一則 issue 釘死：觸發方式、是否產生 assistant 回覆、與手動 compact 的關係。  
-   - 驗收：BTW 往來不讓下一次主任務請求無故膨脹；摘要不含（或僅含標記後的）BTW 雜訊。
+1. [ ] **設定 Buffer，提早 Compact**
+   1. 估算 token：訊息、system prompt、tool definitions。
+   2. 設定 `triggerTokens`（低於模型硬上限）與 `keepRecentTokens`。
+   3. 每一輪 model 呼叫**之前**檢查用量。
+   4. 超過門檻時：跑獨立摘要請求（不要給工具），再把結果寫回 conversation。
+   5. 切分點必須落在完整的 tool-call 與 tool-result 配對之外。
+   6. 若 provider 回報 context 過大：先 compact 一次，再重試 model。限制重試次數。
+   7. 分開兩份狀態：`display` 給 UI 看全文；`context` 給模型看（摘要 + 近期原文）。
+   8. 發出壓縮事件（例如 `context-compaction`）。UI 顯示 `compacting`。
+   完成時：單元測試覆蓋切分與門檻；run 測試覆蓋門檻觸發與 overflow 恢復（含中斷後續寫入）。
+2. [ ] **手動 Compact**
+   1. 提供明確觸發：HTTP 或 UI 按鈕。
+   2. 走與自動 compact 同一套 prepare、publish、DBOS step、事件。用不同的 `reason`（例如 `manual`）。
+   3. 未達門檻時也要能壓縮。
+   4. 若 run 正在進行：拒絕手動 compact，或排到安全點再跑。在程式裡選一種並測試它。
+   完成時：手動後 `context` 變短；`display` 仍完整；事件與 UI phase 與自動路徑相同。
+3. [ ] **BTW**
+   1. 先開 issue 定義行為：怎麼觸發、要不要產生助理回覆、與手動 compact 的關係。
+   2. 建議預設：BTW 可寫入 `display`；預設不進入模型用的 `context`，也不進入摘要來源。
+   3. 實作該行為與測試。
+   完成時：BTW 不會讓下一次主任務請求無故變長；摘要不含未標記的 BTW 內容。
 
 ## 5. Agent Routing / Subagent
 
@@ -292,14 +318,27 @@ Prompt caching 透過重用相同的輸入前綴，減少重複處理的成本�
 
 ### Target
 
-每個 Agent 是「縮之後的 context + 允許的工具子集 +（可選）不同模型」；由父 run **委派**子任務，結果摘要回父 context，不要把所有工具一次性塞進同一對話。
+父 run 委派子任務。每個 agent 只有自己的短 context、允許的工具子集，以及可選的不同模型。子任務結束後，只把摘要或產物寫回父 context。
 
-1. [ ] **Test Planner Agent** — 讀需求／票證，產出測試計畫；工具偏讀（Jira／Confluence／fs），無瀏覽器寫入。
-2. [ ] **Test AC Agent** — 依計畫把 acceptance criteria 拆成可驗證案例；可讀票、寫回留言（須冪等）。
-3. [ ] **Test UI Agent** — 唯一（或少數）持有瀏覽器工具的 agent；只執行指定案例並回傳證據（截圖／log／結果結構）。
-4. [ ] **Atlassian Agent** — 封裝 MCP／Jira／Confluence 讀寫與 lazy discover，供其他 agent 經委派使用，避免每人一份全量 schema。
+1. [ ] **Test Planner Agent**
+   1. 讀需求與票證。
+   2. 產出測試計畫。
+   3. 只給讀取類工具（Jira、Confluence、fs）。不要給瀏覽器寫入。
+2. [ ] **Test AC Agent**
+   1. 依計畫把 acceptance criteria 拆成可驗證案例。
+   2. 可讀票。寫回留言時必須可重試且可去重。
+3. [ ] **Test UI Agent**
+   1. 成為持有瀏覽器工具的 agent（唯一或少數）。
+   2. 只跑指定案例。
+   3. 回傳證據：截圖、log、結構化結果。
+4. [ ] **Atlassian Agent**
+   1. 封裝 Atlassian MCP 與 lazy discover。
+   2. 其他 agent 只透過委派使用它。
+   3. 不要讓每個 agent 各拿一份全量 schema。
 
-實作方向：在 Durable run 上加「子 run／委派 step」（同樣 checkpoint）；權限表寫死在程式，不靠 prompt 約定。驗收：父 context 看不到子 agent 的完整 tool transcript，只看到交回的摘要／產物。
+實作時：在 Durable run 上加可 checkpoint 的委派 step。權限表寫在程式裡，不要只靠 prompt。
+
+完成時：父 context 看不到子 agent 的完整 tool 對話，只看得到交回的摘要或產物。
 
 ## 6. User Approve
 
@@ -318,8 +357,20 @@ flowchart TD
 
 ### Target
 
-1. [ ] **批准閘門** — 在 tool step 前依政策判斷：安全／唯讀直接跑；高風險（寫 Jira、開瀏覽器提交、刪改）暫停 run，對 UI 發「待批准」事件，使用者批准／拒絕後再續 DBOS step。  
-2. [ ] **拒絕可恢復** — 拒絕時把結果當 tool result 寫回 conversation（說明被拒），模型可改計畫；不要把整個 thread 弄成死狀態。  
-3. [ ] **與 Durable 一致** — 等待批准期間進程可重啟：checkpoint 必須記得「停在哪個 tool call、等誰批准」，重掛 UI 能再連上同一等待。
+1. [ ] **批准閘門**
+   1. 在 tool step 前讀取政策。
+   2. 唯讀或安全工具直接執行。
+   3. 高風險工具（寫 Jira、瀏覽器提交、刪改）暫停 run。
+   4. 對 UI 發出「待批准」事件。
+   5. 使用者批准或拒絕後，再繼續 DBOS step。
+2. [ ] **拒絕後仍可繼續**
+   1. 把拒絕寫成 tool result 放回 conversation。
+   2. 讓模型改計畫。
+   3. 不要把整個 thread 鎖死。
+3. [ ] **等待期間可重啟**
+   1. Checkpoint 必須記下：停在哪個 tool call、在等誰批准。
+   2. 進程重啟後，UI 能連回同一個等待狀態。
+
+完成時：高風險工具會停等批准；拒絕後對話能繼續；重啟後等待狀態還在。
 
 ## 7. Eval
