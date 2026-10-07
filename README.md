@@ -19,8 +19,6 @@ Agent = Model + Harness
 
 目標：建立會閱讀 Jira 和 Confluence 的 Agent，替我們撰寫 test case，並操作瀏覽器進行真實的測試，記錄下來結果。
 
-各章 **Target** 是給參與者／Coding Agent 的實作指引（可勾選進度）。程式碼可能被 reset；請依 Target 方向重做，不要假設 repo 裡永遠留著上一輪實作。
-
 ## 1. Tool
 
 LLM 要使用 tool 時，底層會透過特殊的 Token 進行輸出(通常在訓練後進行 fine-tuned 做處理)，以 `<|tool_call|>`, `<|end_tool_call|>` 當作範例，實際上這個 Token 不代表任何的文字：
@@ -280,26 +278,6 @@ Prompt caching 透過重用相同的輸入前綴，減少重複處理的成本�
    - 建議語意（工作坊可改）：旁路短問／註記——可進 `display`，**預設不進**（或可標記排除）主 `context`／摘要 transcript，避免污染交接摘要。  
    - 實作前用一則 issue 釘死：觸發方式、是否產生 assistant 回覆、與手動 compact 的關係。  
    - 驗收：BTW 往來不讓下一次主任務請求無故膨脹；摘要不含（或僅含標記後的）BTW 雜訊。
-
-## 怎麼跟著做（給參與者與 Agent）
-
-教學過程中程式可能被 reset；**以本 README 的 Target 為準**，用 Agent 一次只做一個勾選。
-
-建議順序：
-
-```text
-§1 Tools → §2 Durable（含 lazy discovery）→ §3 Code Mode → §4 Compact → §5 Routing → §6 Approve → §7 Eval
-```
-
-約束：
-
-1. 疊在同一條 run loop 上，不要第二套 chat。  
-2. 副作用工具可重試／可去重；checkpoint ≠ 外部只執行一次。  
-3. 秘密只走環境變數；測試可離線（mock DB／MCP／fetch）。  
-4. 一 PR 一 Target；PR 寫清驗收指令與結果。  
-5. 遵守 `AGENTS.md`（含 fallow）；不寫註解當文件——行為以測試固定。
-
-產品終局仍是 Intro：讀 Jira／Confluence → 寫 test case → 瀏覽器實測 → 留下結果。§1–4 先讓長任務「跑得動、接得上、塞得下」。
 
 ## 5. Agent Routing / Subagent
 
