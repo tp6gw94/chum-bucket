@@ -19,6 +19,95 @@ Agent = Model + Harness
 
 目標：建立會閱讀 Jira 和 Confluence 的 Agent，替我們撰寫 test case，並操作瀏覽器進行真實的測試，記錄下來結果。
 
+
+## Architecture
+
+Harness 脊柱到 Compact 為止：
+
+```text
+Tools（含 lazy MCP） → Durable run（DBOS + Drizzle） → Code Mode → Compaction
+```
+
+後續能力若要加，疊在這條脊柱上。不要另起第二套 chat loop。
+
+### 目錄怎麼對應
+
+| 路徑 | 職責 |
+|---|---|
+| `server/index.ts` | Hono 入口。掛 `/api/chat`、`/api/thread`，啟動與關閉 `launchChatRuntime` / `shutdownChatRuntime`。 |
+| `server/chat.ts` | 接受 AG-UI run、解析 cursor、把事件流回傳給客戶端。呼叫 `acceptRun`。 |
+| `server/thread.ts` | 建立／列出／讀取 thread。不負責跑模型。 |
+| `server/db/schema.ts` | Drizzle 表：`threads`、`chat_runs`、`chat_events`（run 投影與事件 log）。 |
+| `server/harness/run.ts` | Durable 主迴圈：`acceptRun` → `executeRun`（compact → model → tools）→ `finishRun`；`reconcileRuns` 接回未完成 run。 |
+| `server/harness/run-store.ts` | Run 持久化：`persistRun`、`emit`、`checkpointCompaction`、`finishRun`、`observeRun`、`hydrateThread`。常數 `BUILD`、`MODEL`。 |
+| `server/harness/conversation.ts` | `ConversationState`：`display`（UI 全文）與 `context`（模型用）。`advanceConversation` 推進兩份狀態。 |
+| `server/harness/model-turn.ts` | `streamModelTurn`、overflow 偵測（`ContextOverflowError`）、`snapshot`。 |
+| `server/harness/compaction.ts` | `estimateInputTokens`、`planCompaction`、`prepareCompaction`、`publishCompaction`。門檻預設 `COMPACT_TOKEN_THRESHOLD`。 |
+| `server/harness/tools/index.ts` | `withRunTools`：合併本地 catalog、Atlassian scope、Code Mode，暴露 `getModelTools` / `executeTool`。 |
+| `server/harness/tools/get-figma.ts` | 本地工具 `get_figma`。 |
+| `server/harness/tools/fs.ts` | 本地工具 `read` / `write` / `edit`（根目錄為 `process.cwd()`）。 |
+| `server/harness/tools/atlassian.ts` | MCP scope 與 `discover_atlassian_tools`。 |
+| `server/harness/tools/atlassian-policy.ts` | 允許的 Atlassian 工具名、loopback endpoint、環境讀取。 |
+| `server/harness/tools/code-mode.ts` | `codemode`：`createCodeMode` + `toolsToBindings` + `@tanstack/ai-isolate-quickjs`。 |
+| `server/harness/tool-events.ts` | Tool 自訂事件 buffer；`drainToolEvents` 寫進 run event log。 |
+| `server/harness/provider.ts` | DeepInfra OpenAI-compatible adapter。 |
+| `server/harness/prompts.ts` | System prompt（含 OpenUI 指示）。 |
+| `shared/compaction-event.ts` | `context-compaction` 事件的編碼／解析（server 與 `src/hooks` 共用）。 |
+| `src/hooks/use-threads.ts` | Thread phase（含 `compacting`）、cursor 訂閱、hydration。行為見 `docs/frontend-thread.md`。 |
+| `docs/frontend-thread.md` | 前端 thread／busy／terminal 契約。 |
+| `explains/codemode-sandbox.html` | Code Mode sandbox 說明。 |
+
+### 一次 run 的資料流
+
+1. 客戶端對 `/api/chat` 送 `threadId`、`runId`、`baseRevision`、使用者訊息。
+2. `persistRun` 在交易裡鎖定 thread、寫入 `chat_runs`、設 `active_run_id`、append `RUN_STARTED`。
+3. `acceptRun` 以 `runId` 當 DBOS workflow id 啟動 `executeRun`。
+4. 每一輪 turn：
+   1. `compactConversation`（reason `threshold`）在 model 前檢查用量。
+   2. `DBOS.runStep(modelStep)`：用 `conversation.context` 呼叫模型；串流事件經 `emit` 進 `chat_events`。
+   3. 若 overflow：compact（reason `overflow`）後重試一次 model。
+   4. 每個 tool call 一個 `DBOS.runStep(toolStep)`；結果經 `advanceConversation` 更新 `display` 與 `context`。
+5. 沒有 tool call 時 `finishRun`：把 projection 寫回 thread、清 `active_run_id`、標記 run 終態。
+6. UI 用 cursor 訂閱 `observeRun`；`parseCompactionEvent` 把 phase 設成 `compacting`。
+
+`display` 與 `context` 分開保存。Compact 只縮短 `context`（摘要 + 近期原文）。`display` 仍保留完整歷史給 UI。
+
+### 工具邊界
+
+- 本地工具寫在 `server/harness/tools/`，用 `toolDefinition` 建立，並在 `tools/index.ts` 的 `localCatalog` 註冊。未註冊則模型看不到、也執行不到。
+- Atlassian 走 MCP。預設只暴露 `discover_atlassian_tools`；模型點名後，該次 run 才加入完整 schema。允許名單在 `atlassian-policy.ts`。
+- `withAtlassianScope` 包住一次 run 的 MCP session；run 結束釋放。
+- Code Mode 對模型多一支 `codemode`。Sandbox 內的 `external_*` 仍走同一套 `executeTool` dispatch，不是第二條執行路徑。
+- 不要同時保留「直連 Jira／Confluence HTTP」與「MCP」兩套同名能力。
+- Token 與密鑰只從環境變數讀。不要寫進 repo、URL query 或 CLI 旗標。
+
+### 約定：要做／不要做
+
+**要**
+
+- 延伸現有模組：新工具放 `tools/`；壓縮邏輯放 `compaction.ts`；持久化放 `run-store.ts`。
+- 每個 step 包在 `DBOS.runStep` 裡，讓重啟能重用 checkpoint。
+- 副作用工具做成可重試、可去重。不要假設「跑過一次就不會再跑」。
+- 新行為補單元測試與 run 測試（見同目錄 `*.test.ts`）。
+- 改前端 thread 行為前先讀 `docs/frontend-thread.md`。
+- 遵守 `AGENTS.md` 的 fallow gate（commit／push 前 `fallow audit`）。
+
+**不要**
+
+- 重寫 `executeRun` 主迴圈，或把 conversation 又改成純記憶體。
+- 讓 Compact 改寫 `display` 全文，或把 tool-call／tool-result 拆到切分點兩側。
+- 自製 Code Mode runtime 取代 `@tanstack/ai-code-mode` 與 `@tanstack/ai-isolate-quickjs`。
+- 把尚未落地的 Routing、Approve、Eval 寫進 README Target，或另開平行的 agent loop。
+- 在文件裡發明碼裡沒有的模組、事件名或 API。
+
+### 目前缺口（仍屬 Compact）
+
+自動門檻 compact 與 overflow 恢復已在 `run.ts` / `compaction.ts`。尚未完成的 Target 只剩：
+
+- 手動 Compact（HTTP 或 UI，同一套 prepare／publish／事件，不同 `reason`）
+- BTW（先定義行為再實作；預設不進模型 `context`）
+
+
 ## 1. Tool
 
 LLM 要使用 tool 時，底層會透過特殊的 Token 進行輸出(通常在訓練後進行 fine-tuned 做處理)，以 `<|tool_call|>`, `<|end_tool_call|>` 當作範例，實際上這個 Token 不代表任何的文字：
@@ -305,73 +394,3 @@ Prompt caching 透過重用相同的輸入前綴，減少重複處理的成本�
    2. 建議預設：BTW 可寫入 `display`；預設不進入模型用的 `context`，也不進入摘要來源。
    3. 實作該行為與測試。
    完成時：BTW 不會讓下一次主任務請求無故變長；摘要不含未標記的 BTW 內容。
-
-## 5. Agent Routing / Subagent
-
-每個 Agent 有各自的任務，各自可以使用的 Task。
-
-目的：
-
-1. 避免某個 Agent 的 context 被 Tool, Prompt 等塞滿
-2. 有特殊的 Tool 權限要進行設定
-3. 要各 Agent 使用不同的模型
-
-
-### Target
-
-父 run 委派子任務。每個 agent 只有自己的短 context、允許的工具子集，以及可選的不同模型。子任務結束後，只把摘要或產物寫回父 context。
-
-1. [ ] **Test Planner Agent**
-   1. 讀需求與票證。
-   2. 產出測試計畫。
-   3. 只給讀取類工具（Jira、Confluence、fs）。不要給瀏覽器寫入。
-2. [ ] **Test AC Agent**
-   1. 依計畫把 acceptance criteria 拆成可驗證案例。
-   2. 可讀票。寫回留言時必須可重試且可去重。
-3. [ ] **Test UI Agent**
-   1. 成為持有瀏覽器工具的 agent（唯一或少數）。
-   2. 只跑指定案例。
-   3. 回傳證據：截圖、log、結構化結果。
-4. [ ] **Atlassian Agent**
-   1. 封裝 Atlassian MCP 與 lazy discover。
-   2. 其他 agent 只透過委派使用它。
-   3. 不要讓每個 agent 各拿一份全量 schema。
-
-實作時：在 Durable run 上加可 checkpoint 的委派 step。權限表寫在程式裡，不要只靠 prompt。
-
-完成時：父 context 看不到子 agent 的完整 tool 對話，只看得到交回的摘要或產物。
-
-## 6. User Approve
-
-```mermaid
-flowchart TD
-    A[模型呼叫工具] --> B{需要批准？}
-    B -->|否| E[執行工具]
-    B -->|是| C[暫停並等待使用者決定]
-    C --> D{是否批准？}
-    D -->|是| E
-    D -->|拒絕或取消| F[回傳拒絕或取消結果]
-    E --> G[回傳執行結果]
-    F --> H[對話繼續]
-    G --> H
-```
-
-### Target
-
-1. [ ] **批准閘門**
-   1. 在 tool step 前讀取政策。
-   2. 唯讀或安全工具直接執行。
-   3. 高風險工具（寫 Jira、瀏覽器提交、刪改）暫停 run。
-   4. 對 UI 發出「待批准」事件。
-   5. 使用者批准或拒絕後，再繼續 DBOS step。
-2. [ ] **拒絕後仍可繼續**
-   1. 把拒絕寫成 tool result 放回 conversation。
-   2. 讓模型改計畫。
-   3. 不要把整個 thread 鎖死。
-3. [ ] **等待期間可重啟**
-   1. Checkpoint 必須記下：停在哪個 tool call、在等誰批准。
-   2. 進程重啟後，UI 能連回同一個等待狀態。
-
-完成時：高風險工具會停等批准；拒絕後對話能繼續；重啟後等待狀態還在。
-
-## 7. Eval
