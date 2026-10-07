@@ -208,14 +208,15 @@ Code Mode 就是給 LLM 一個 Sandbox，讓他可以在裡面執行程式，我
 ### Target
 
 1. [ ] **提供 Code Mode**
-   1. 對模型只多加一支工具，名稱如 `codemode`。
-   2. 輸入是 `{ "code": "<typescript>" }`。
-   3. 在 QuickJS isolate（或同等 sandbox）執行這段程式。
-   4. 把目前已授權的工具編成 sandbox 裡的 `external_*` 函式。
-   5. 程式裡必須 `await` 這些呼叫。實際執行仍走既有的 tool dispatch。
-   6. 用固定 policy 限制：timeout、記憶體、原始碼大小、host 呼叫次數與位元組、console 上限。
-   7. 超出限制時執行失敗。
-   8. 把執行起迄、console、external 呼叫結果送進 tool-event buffer，讓 UI 能顯示。
+   1. 使用 TanStack 的 `@tanstack/ai-code-mode` 與 `@tanstack/ai-isolate-quickjs`。
+   2. 對模型只多加一支工具，名稱如 `codemode`。
+   3. 輸入是 `{ "code": "<typescript>" }`。
+   4. 用 `createCodeMode` 與 QuickJS isolate driver 執行這段程式。
+   5. 用 `toolsToBindings` 把目前已授權的工具編成 sandbox 裡的 `external_*` 函式。
+   6. 程式裡必須 `await` 這些呼叫。實際執行仍走既有的 tool dispatch。
+   7. 用固定 policy 限制：timeout、記憶體、原始碼大小、host 呼叫次數與位元組、console 上限。
+   8. 超出限制時執行失敗。
+   9. 把執行起迄、console、external 呼叫結果送進 tool-event buffer，讓 UI 能顯示。
    完成時：邊界單元測試通過；一條 run 測試證明多步外部呼叫可在一段 code 內完成，且模型只收到最終回傳。說明見 `explains/codemode-sandbox.html`。
 
 ## 4. Compact
