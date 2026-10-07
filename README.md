@@ -95,10 +95,12 @@ sequenceDiagram
 ### Target
 
 1. 建立 Tool
-    1. [ ] get_figma tool
-    2. [ ] fs tool
+    1. [x] `get_figma`（`server/harness/tools/get-figma.ts`）
+    2. [x] fs：`read` / `write` / `edit`（`server/harness/tools/fs.ts`）
 2. 建立 MCP Tool
-    1. [ ] [sooperset/mcp-atlassian v0.23.1](https://github.com/sooperset/mcp-atlassian/tree/v0.23.1)，以本機唯讀 HTTP 服務提供原生工具。 (lazy)
+    1. [x] [sooperset/mcp-atlassian](https://github.com/sooperset/mcp-atlassian) 本機 HTTP + lazy discovery（`discover_atlassian_tools`，見 `server/harness/tools/atlassian.ts`）
+
+**後續方向（勿重做已完成項）：** 新工具一律掛進 `server/harness/tools/index.ts` 的 `localCatalog` 或 Atlassian scope；副作用工具必須可重試／可去重，不能假設 DBOS checkpoint 等於外部只執行一次。
 
 ## 2. Durable Execution
 
@@ -148,9 +150,11 @@ Checkpoint 決定恢復時要執行哪些步驟；事件紀錄則讓人看得見
 
 ### Target
 
-1. [ ] 拆除原生 chat
-2. [ ] DBOS 回覆工作
-3. [ ] 建立自訂的 discovery tool for lazy
+1. [x] 拆除原生 chat，改固定 thread + durable run（`server/thread.ts`、`src/hooks/use-threads.ts`）
+2. [x] DBOS step：model / tool / compact / finish（`server/harness/run.ts`、`run-store.ts`）
+3. [x] 自訂 lazy discovery（`discover_atlassian_tools`）
+
+**後續方向：** 任何新的「會改外部狀態」步驟都要包成 DBOS `runStep`，並在工具層做冪等；事件時間線走 Drizzle，不要另開一套記憶體-only 狀態。重啟恢復以 checkpoint 為準，UI 只 replay 事件。
 
 ## 3.Code Mode
 
@@ -166,7 +170,9 @@ Code Mode 就是給 LLM 一個 Sandbox，讓他可以在裡面執行程式，我
 
 ### Target
 
-- [ ] 提供 Code Mode
+- [x] Code Mode（`codemode` tool，`server/harness/tools/code-mode.ts`，TanStack isolate）
+
+**後續方向：** 新能力優先考慮「能不能當 binding 進 sandbox」而不是再加一輪 tool-call 往返；不要繞過 `composeCodeModeTurn` 另起執行路徑。Sandbox 邊界與可呼叫綁定以現有測試為契約。
 
 ## 4. Compact
 
@@ -233,9 +239,37 @@ Prompt caching 透過重用相同的輸入前綴，減少重複處理的成本�
 
 ### Target
 
-1. [ ] 設定 Buffer，避免 touch 到限制，提早進行 Compact
-2. [ ] 手動 Compact
-3. [ ] BTW
+1. [x] 門檻緩衝：`COMPACT_TOKEN_THRESHOLD`（48k）+ `keepRecentTokens`（20k）；threshold 與 overflow 兩條路徑（`server/harness/compaction.ts`、`run.ts`）
+2. [ ] **手動 Compact**：使用者／API 可在未觸門檻時強制摘要；需與 DBOS step、`context-compaction` 事件、UI `compacting` phase 對齊
+3. [ ] **BTW**（語意待產品定義）：若指「摘要旁路／附加指令不污染主摘要」，實作前先在 issue 寫清觸發條件與是否進 `display` vs `context`
+
+**後續方向：**
+- `display`（完整歷史）與 `context`（模型可見）必須繼續分離；UI 重播原文，模型只吃摘要 + tail。
+- 切分必須守 tool-call／tool-result 邊界（已有 `safeToolBoundaries`）；新格式訊息不可破壞此不變量。
+- 壓縮後 Atlassian 授權失效，須再 `discover_atlassian_tools`——新的 lazy／scoped 工具比照辦理。
+- Prompt cache：接受 compact 後前綴失效；不要為省 cache 而跳過必要壓縮。
+
+## 貢獻與 Agent 大方向（到 Compact 為止的脊柱）
+
+本 repo 已落地的 Harness 脊柱是：
+
+```text
+Tools（含 lazy MCP） → Durable run（DBOS + Drizzle 事件） → Code Mode → Compaction
+```
+
+後面章節（Routing／Approve／Eval）應**疊在這條脊柱上**，而不是另起第二套 chat loop。
+
+### 給開 PR 的人／Agent
+
+1. **先讀碼再改 README 勾選。** Target 勾選以 `server/harness/**` 與測試為準；文件只描述已存在行為。
+2. **一個 PR 只推進一個 Target 或一個明確缺口**（例如「手動 Compact API + UI phase」），附上跑過的指令與結果。
+3. **不要**：重寫 `executeRun` 主迴圈、把 context 又存回純記憶體、讓副作用工具不可重入、把 key／秘密寫進 repo。
+4. **要**：延伸現有模組（`tools/`、`compaction.ts`、`run-store.ts`）；新行為補行為測試；遵守 `AGENTS.md` 的 fallow gate。
+5. **下一階段優先順序建議：** 手動 Compact →（定義後）BTW → §5 Subagent／Routing → §6 User Approve → §7 Eval。Routing 前先確定工具權限邊界與「哪個 agent 擁有哪段 context」。
+
+### 產品終局（對齊 Intro）
+
+最終要能：讀 Jira／Confluence → 產出 test case → 操作瀏覽器實測 → 留下可查的結果紀錄。目前到 Compact 解決的是「長任務跑得下去、中斷接得回來、context 塞得下」；瀏覽器實測與多 agent 分工仍屬後段。
 
 ## 5. Agent Routing / Subagent
 
