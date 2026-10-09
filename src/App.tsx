@@ -3,6 +3,8 @@ import "./styles/globals.css";
 import { useEffect, useRef, useState } from "react";
 
 import { Pane } from "./components/pane";
+import { SideChatPane } from "./components/side-chat-pane";
+import { useSideChats } from "./hooks/use-side-chats";
 import { ThreadSidebar } from "./components/thread-sidebar";
 import { TopBar } from "./components/top-bar";
 import type { Pane as PaneModel, RunStatus, ThreadSummary } from "./components/types";
@@ -110,34 +112,16 @@ function ThreadEntry() {
 
 function ThreadPage({ threadId }: { threadId: string }) {
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  const [agentPanes, setAgentPanes] = useState<PaneModel[]>([]);
+  const sideChats = useSideChats(threadId);
   const { threads, error: listError } = useThreadList();
   const thread = useThread(threadId);
   const { messages, send } = thread;
   const sendDisabled = thread.phase !== "ready";
   const mainPane = toMainPane(threadId, threads, messages, paneStatus(thread.phase));
   const threadSummaries = threads.map((item) =>
-    toSidebarSummary(item, threadId, mainPane.status, 1 + agentPanes.length),
+    toSidebarSummary(item, threadId, mainPane.status, 1 + sideChats.entries.length),
   );
-
-  function openAgentPane() {
-    setAgentPanes((panes) => [
-      ...panes,
-      {
-        id: crypto.randomUUID(),
-        title: `附屬對話 ${panes.length + 1}`,
-        agent: "尚未連接",
-        status: "idle",
-        progress: [],
-        messages: [],
-        kind: "agent",
-      },
-    ]);
-  }
-
-  function closeAgentPane(id: string) {
-    setAgentPanes((panes) => panes.filter((pane) => pane.id !== id));
-  }
+  const hydrationError = [thread.error, sideChats.error].filter(Boolean).join(" ");
 
   return (
     <Provider>
@@ -162,19 +146,26 @@ function ThreadPage({ threadId }: { threadId: string }) {
             <Pane
               key={mainPane.id}
               pane={mainPane}
-              onOpenAgentPane={openAgentPane}
+              onOpenAgentPane={() => void sideChats.open()}
+              openDisabled={sendDisabled || sideChats.opening}
               onSend={send}
               sendDisabled={sendDisabled}
               isHydrating={thread.phase === "loading"}
-              hydrationError={thread.error}
+              hydrationError={hydrationError}
+              compactNotice={thread.compactNotice}
             />
-            {agentPanes.map((pane) => (
-              <Pane
-                key={pane.id}
-                pane={pane}
-                onOpenAgentPane={openAgentPane}
-                onClose={() => closeAgentPane(pane.id)}
-                sendDisabled={sendDisabled}
+            {sideChats.entries.map((entry) => (
+              <SideChatPane
+                key={entry.id}
+                entry={entry}
+                scope={sideChats.scope}
+                mainBusy={
+                  thread.phase === "busy" ||
+                  thread.phase === "compacting" ||
+                  thread.phase === "loading"
+                }
+                acceptIntoMain={thread.acceptExternalRun}
+                onClose={() => sideChats.close(entry.id)}
               />
             ))}
           </main>

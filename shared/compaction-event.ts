@@ -9,7 +9,7 @@ const compactionEventSchema = z.object({
   value: z.object({
     runId: z.string().min(1).max(200),
     operationId: z.string().min(1).max(400),
-    state: z.enum(["started", "done", "failed"]),
+    state: z.enum(["started", "done", "failed", "skipped"]),
   }),
 });
 

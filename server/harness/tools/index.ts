@@ -73,29 +73,54 @@ function mergeLocalDefinitions(remote: AtlassianCatalog): ModelTool[] {
   return [...definitions.values()];
 }
 
-export async function withRunTools<T>(use: (tools: RunTools) => Promise<T>): Promise<T> {
-  return withAtlassianScope((scope) => {
+export async function withRunTools<T>(
+  use: (tools: RunTools) => Promise<T>,
+  signal?: AbortSignal,
+): Promise<T> {
+  return withAtlassianScope(async (scope) => {
+    const pending = new Set<Promise<unknown>>();
     const dispatchFor =
-      (messages: readonly UIMessage[]) => (call: ModelCall, context: ToolExecutionContext) =>
-        scope.executeTool(messages, call, context, localCatalog.get(call.name)?.handler);
+      (messages: readonly UIMessage[]) => (call: ModelCall, context: ToolExecutionContext) => {
+        context.abortSignal?.throwIfAborted();
+        signal?.throwIfAborted();
+        const work = scope.executeTool(
+          messages,
+          call,
+          context,
+          localCatalog.get(call.name)?.handler,
+        );
+        pending.add(work);
+        void work.then(
+          () => pending.delete(work),
+          () => pending.delete(work),
+        );
+        return work;
+      };
     const buildTurn = async (messages: readonly UIMessage[]) => {
       const definitions = await scope.getModelTools(messages, mergeLocalDefinitions);
       const guard = await scope.guard();
       const turn = composeCodeModeTurn({ definitions, dispatch: dispatchFor(messages), guard });
       return { definitions, turn };
     };
-    return use({
-      async getModelTools(messages) {
-        const { definitions, turn } = await buildTurn(messages);
-        return { definitions: [...definitions, turn.definition], systemPrompt: turn.systemPrompt };
-      },
-      async executeTool(messages, call, context) {
-        if (call.name !== codeModeToolName) {
-          return dispatchFor(messages)(call, context);
-        }
-        const { turn } = await buildTurn(messages);
-        return turn.execute(call.input, context);
-      },
-    });
-  });
+    try {
+      return await use({
+        async getModelTools(messages) {
+          const { definitions, turn } = await buildTurn(messages);
+          return {
+            definitions: [...definitions, turn.definition],
+            systemPrompt: turn.systemPrompt,
+          };
+        },
+        async executeTool(messages, call, context) {
+          if (call.name !== codeModeToolName) {
+            return dispatchFor(messages)(call, context);
+          }
+          const { turn } = await buildTurn(messages);
+          return turn.execute(call.input, context);
+        },
+      });
+    } finally {
+      await Promise.allSettled([...pending]);
+    }
+  }, signal);
 }

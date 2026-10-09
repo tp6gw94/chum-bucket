@@ -5,7 +5,7 @@ export type ConversationState = {
   context: UIMessage[];
 };
 
-export type RunProjection = ConversationState & { version: 1 };
+export type RunProjection = ConversationState & { version: 1; committedRevision?: number };
 
 export function readProjection(value: RunProjection | UIMessage[]): ConversationState {
   if (Array.isArray(value)) {

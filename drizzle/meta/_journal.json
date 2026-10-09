@@ -15,6 +15,13 @@
       "when": 1790683155015,
       "tag": "0001_outstanding_mantis",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1791383371748,
+      "tag": "0002_side_chats",
+      "breakpoints": false
     }
   ]
 }

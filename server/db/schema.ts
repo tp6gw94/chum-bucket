@@ -2,6 +2,12 @@ import { sql } from "drizzle-orm";
 import type { UIMessage, StreamChunk } from "@tanstack/ai";
 import type { RunProjection } from "../harness/conversation";
 import type { RunInput, AcceptedRun } from "../harness/run-store";
+import type {
+  SideChatSeed,
+  SideLifecycle,
+  SummaryDraft,
+  TransferReceipt,
+} from "../../shared/side-chat";
 import {
   pgTable,
   uuid,
@@ -37,6 +43,35 @@ export const threadsTable = pgTable(
     check("threads_revision_nonnegative", sql`${t.revision} >= 0`),
   ],
 );
+
+export const sideChatsTable = pgTable(
+  "side_chats",
+  {
+    id: uuid().primaryKey(),
+    parent_thread_id: uuid().notNull(),
+    page_scope: uuid().notNull(),
+    open_key: uuid().notNull(),
+    state: text().notNull().$type<SideLifecycle["state"]>().default("open"),
+    epoch: integer().notNull().default(0),
+    lease_until: timestamp({ withTimezone: true }).notNull(),
+    seed: jsonb().$type<SideChatSeed>(),
+    draft: jsonb().$type<SummaryDraft>(),
+  },
+  (t) => [
+    unique("side_chats_open_key_unique").on(t.page_scope, t.open_key),
+    index("side_chats_lease_idx").on(t.state, t.lease_until),
+    check("side_chats_state_check", sql`${t.state} in ('open', 'closing', 'closed')`),
+    check("side_chats_epoch_check", sql`${t.epoch} >= 0`),
+  ],
+);
+
+export const sideTransfersTable = pgTable("side_transfers", {
+  transfer_key: uuid().primaryKey(),
+  page_scope: uuid().notNull(),
+  digest: text().notNull(),
+  receipt: jsonb().notNull().$type<TransferReceipt>(),
+  created_at: timestamp({ withTimezone: true }).notNull().defaultNow(),
+});
 
 export const chatRunsTable = pgTable(
   "chat_runs",

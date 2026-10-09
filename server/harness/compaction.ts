@@ -53,7 +53,7 @@ export type CompactionPlan = Readonly<{
 
 export type CompactionOutcome =
   | { state: "skipped" }
-  | { state: "done"; messages: UIMessage[] }
+  | { state: "done"; messages: UIMessage[]; summary: UIMessage }
   | { state: "failed" };
 
 export type CompactionEmit = (event: StreamChunk, messages?: UIMessage[]) => Promise<void>;
@@ -207,18 +207,25 @@ export async function prepareCompaction(input: {
   tools: RunTools;
   emit: CompactionEmit;
   policy?: CompactionPolicy;
-  reason?: "threshold" | "overflow";
+  reason?: "threshold" | "overflow" | "manual";
+  signal?: AbortSignal;
 }): Promise<CompactionOutcome> {
+  input.signal?.throwIfAborted();
   const { messages, prompt, model, tools } = input;
   const policy = input.policy ?? DEFAULT_COMPACTION_POLICY;
   validatePolicy(policy);
-  const toolTurn = await tools.getModelTools(messages);
+  let toolTurn: Awaited<ReturnType<RunTools["getModelTools"]>>;
+  try {
+    toolTurn = await tools.getModelTools(messages);
+  } catch {
+    return { state: "failed" };
+  }
   const before = estimateInputTokens({
     messages,
     systemPrompts: [prompt, toolTurn.systemPrompt],
     definitions: toolTurn.definitions,
   });
-  if (input.reason !== "overflow" && before <= policy.triggerTokens) {
+  if ((input.reason ?? "threshold") === "threshold" && before <= policy.triggerTokens) {
     return { state: "skipped" };
   }
   const plan = planCompaction(messages, policy);
@@ -229,7 +236,8 @@ export async function prepareCompaction(input: {
     compactionEvent({ runId: input.runId, operationId: input.operationId, state: "started" }),
   );
   try {
-    const summary = await summarizePrefix(plan, model);
+    const summary = await summarizeTranscript(plan, model, input.signal);
+    input.signal?.throwIfAborted();
     const next = [summaryMessage(input.operationId, summary), ...plan.tail];
     const nextTurn = await tools.getModelTools(next);
     const after = estimateInputTokens({
@@ -237,8 +245,15 @@ export async function prepareCompaction(input: {
       systemPrompts: [prompt, nextTurn.systemPrompt],
       definitions: nextTurn.definitions,
     });
-    return after < before ? { state: "done", messages: next } : { state: "failed" };
+    return after < before
+      ? {
+          state: "done",
+          messages: next,
+          summary: { ...next[0]!, parts: [{ type: "text", content: summary }] },
+        }
+      : { state: "failed" };
   } catch {
+    input.signal?.throwIfAborted();
     return { state: "failed" };
   }
 }
@@ -246,18 +261,27 @@ export async function prepareCompaction(input: {
 export async function publishCompaction(input: {
   runId: string;
   operationId: string;
-  outcome: Exclude<CompactionOutcome, { state: "skipped" }>;
+  outcome: CompactionOutcome;
   conversation: ConversationState;
-}): Promise<void> {
-  await checkpointCompaction(
-    input.runId,
-    input.operationId,
-    {
-      display: input.conversation.display,
-      context: input.outcome.state === "done" ? input.outcome.messages : input.conversation.context,
-    },
-    input.outcome.state,
-  );
+}): Promise<ConversationState> {
+  const { outcome, conversation } = input;
+  if (
+    outcome.state === "done" &&
+    [...conversation.display, ...conversation.context].some(
+      (message) => message.id === outcome.summary.id,
+    )
+  ) {
+    throw new Error("Summary ID collides with conversation history");
+  }
+  const next =
+    outcome.state === "done"
+      ? {
+          display: [...conversation.display, outcome.summary],
+          context: outcome.messages,
+        }
+      : conversation;
+  await checkpointCompaction(input.runId, input.operationId, next, outcome.state);
+  return next;
 }
 
 function summaryMessage(operationId: string, summary: string): UIMessage {
@@ -269,7 +293,13 @@ function summaryMessage(operationId: string, summary: string): UIMessage {
   };
 }
 
-async function summarizePrefix(plan: CompactionPlan, model: AcceptedRun["model"]): Promise<string> {
+export async function summarizeTranscript(
+  plan: Pick<CompactionPlan, "previousSummary" | "transcript">,
+  model: AcceptedRun["model"],
+  signal?: AbortSignal,
+  systemPrompt = SUMMARY_SYSTEM_PROMPT,
+): Promise<string> {
+  signal?.throwIfAborted();
   const { deepinfra } = await import("./provider");
   const adapter = deepinfra(model);
   const stream = adapter.chatStream({
@@ -283,15 +313,21 @@ async function summarizePrefix(plan: CompactionPlan, model: AcceptedRun["model"]
         }),
       },
     ],
-    systemPrompts: [SUMMARY_SYSTEM_PROMPT],
+    systemPrompts: [systemPrompt],
     tools: [],
     logger: resolveDebugOption(false),
     modelOptions: { max_tokens: SUMMARY_MAX_TOKENS },
-    request: { signal: AbortSignal.timeout(SUMMARY_TIMEOUT_MS) },
+    request: {
+      signal: AbortSignal.any([
+        AbortSignal.timeout(SUMMARY_TIMEOUT_MS),
+        ...(signal ? [signal] : []),
+      ]),
+    },
   });
   let finishReason: string | null | undefined;
   async function* observed(): AsyncGenerator<AdapterYieldChunk> {
     for await (const chunk of stream) {
+      signal?.throwIfAborted();
       for (const event of normalizeStreamChunk(chunk)) {
         if (event.type === EventType.RUN_FINISHED) {
           const reason = event.finishReason ?? event.metadata?.tanstack?.finishReason;
@@ -306,6 +342,7 @@ async function summarizePrefix(plan: CompactionPlan, model: AcceptedRun["model"]
     stream: observed(),
     append: async (_event: StreamChunk) => {},
   });
+  signal?.throwIfAborted();
   if (finishReason !== undefined && finishReason !== "stop") {
     throw new Error("Summary did not complete normally");
   }

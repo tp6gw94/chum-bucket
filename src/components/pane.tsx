@@ -1,6 +1,7 @@
 import { ArrowDownIcon, PlusIcon, XIcon } from "lucide-react";
-import { useEffect } from "react";
-import type { SendResult } from "../hooks/use-threads";
+import { useEffect, type ReactNode } from "react";
+import type { SendResult, CompactNotice } from "../hooks/use-threads";
+import { Marker, MarkerContent } from "@/components/ui/marker";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -38,9 +39,9 @@ const PANE_PRESENTATION: Record<PaneModel["kind"], PanePresentation> = {
   },
   agent: {
     defaultWidth: 440,
-    placeholder: "附屬對話尚未連接執行，僅為預留窗格",
-    hint: "此窗格為 UI 預留狀態，不會呼叫 agent",
-    emptyCopy: "這是預留的附屬對話窗格，尚未連接 agent 執行。",
+    placeholder: "在固定主對話快照上繼續討論",
+    hint: "獨立討論，不會修改主對話。關閉後捨棄。",
+    emptyCopy: "附屬對話已建立，輸入訊息開始獨立討論。",
     progressLabel: "附屬對話進度",
   },
 };
@@ -80,7 +81,17 @@ function HydrationFeedback({
   );
 }
 
-function PaneMessages({ pane, presentation }: { pane: PaneModel; presentation: PanePresentation }) {
+function PaneMessages({
+  pane,
+  presentation,
+  onSend,
+  actionsDisabled,
+}: {
+  pane: PaneModel;
+  presentation: PanePresentation;
+  onSend?: (text: string) => Promise<SendResult>;
+  actionsDisabled: boolean;
+}) {
   if (pane.messages.length === 0) {
     return (
       <>
@@ -95,6 +106,8 @@ function PaneMessages({ pane, presentation }: { pane: PaneModel; presentation: P
     <MessageList
       messages={pane.messages}
       agent={pane.agent}
+      onSend={onSend}
+      disabled={actionsDisabled}
       isStreaming={pane.status === "running"}
       compacting={pane.status === "compacting"}
     />
@@ -117,16 +130,25 @@ export function Pane({
   sendDisabled = false,
   isHydrating = false,
   hydrationError,
+  compactNotice,
+  headerAction,
+  footer,
+  openDisabled = false,
 }: {
   pane: PaneModel;
-  onOpenAgentPane: () => void;
+  onOpenAgentPane?: () => void;
   onClose?: () => void;
   onSend?: (text: string) => Promise<SendResult>;
   sendDisabled?: boolean;
   isHydrating?: boolean;
   hydrationError?: string | null;
+  compactNotice?: CompactNotice | null;
+  headerAction?: ReactNode;
+  footer?: ReactNode;
+  openDisabled?: boolean;
 }) {
   const presentation = PANE_PRESENTATION[pane.kind];
+  const actionsDisabled = sendDisabled || isHydrating || pane.status !== "idle" || !onSend;
 
   return (
     <PaneShell label={paneShellLabel(pane)} defaultWidth={presentation.defaultWidth}>
@@ -136,10 +158,13 @@ export function Pane({
           <Badge variant="outline">{pane.agent}</Badge>
           <StatusBadge status={pane.status} runningLabel="執行中" idleLabel="待命" />
           <div className="ml-auto flex items-center gap-1">
-            <Button variant="outline" size="sm" onClick={onOpenAgentPane}>
-              <PlusIcon data-icon="inline-start" />
-              開啟附屬對話
-            </Button>
+            {pane.kind === "main" && onOpenAgentPane ? (
+              <Button variant="outline" size="sm" disabled={openDisabled} onClick={onOpenAgentPane}>
+                <PlusIcon data-icon="inline-start" />
+                開啟附屬對話
+              </Button>
+            ) : null}
+            {headerAction}
             {onClose ? (
               <Button variant="ghost" size="sm" onClick={onClose}>
                 <XIcon data-icon="inline-start" />
@@ -154,7 +179,12 @@ export function Pane({
           <MessageScrollerViewport aria-label={`${pane.title}對話訊息`} className="p-4">
             <MessageScrollerContent className="gap-4">
               <TranscriptAutoFollow pane={pane} />
-              <PaneMessages pane={pane} presentation={presentation} />
+              <PaneMessages
+                pane={pane}
+                presentation={presentation}
+                onSend={onSend}
+                actionsDisabled={actionsDisabled}
+              />
               {pane.progress.length > 0 ? (
                 <MessageScrollerItem messageId="pane-progress">
                   <ProgressPanel
@@ -172,7 +202,19 @@ export function Pane({
           </MessageScrollerButton>
         </MessageScroller>
       </MessageScrollerProvider>
+      {compactNotice ? (
+        <Marker role={compactNotice === "failed" ? "alert" : "status"}>
+          <MarkerContent>
+            {compactNotice === "done"
+              ? "上下文已整理，完整摘要與原文已保留。"
+              : compactNotice === "skipped"
+                ? "目前沒有足夠的可整理歷史，原文與上下文未變更。"
+                : "整理上下文失敗，原文與上下文已保留。"}
+          </MarkerContent>
+        </Marker>
+      ) : null}
       <HydrationFeedback isHydrating={isHydrating} hydrationError={hydrationError} />
+      {footer}
       <Composer
         label={composerFieldLabel(pane)}
         placeholder={presentation.placeholder}

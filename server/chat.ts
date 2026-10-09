@@ -1,20 +1,23 @@
 import { Hono } from "hono";
 import { z } from "zod";
 import type { StreamChunk } from "@tanstack/ai";
+import { SIDE_SCOPE_HEADER, sideScopeSchema, type SideAccess } from "../shared/side-chat";
 import { acceptRun } from "./harness/run";
 import {
   checkCursor,
   hydrateThread,
   observeRun,
   RunRequestError,
-  runInputSchema,
+  chatInputSchema,
+  compactInputSchema,
 } from "./harness/run-store";
 
 const app = new Hono();
+export const compact = new Hono();
 const bodySchema = z.object({
   threadId: z.uuid(),
-  runId: runInputSchema.shape.runId,
-  forwardedProps: z.object({ baseRevision: runInputSchema.shape.baseRevision }),
+  runId: chatInputSchema.shape.runId,
+  forwardedProps: z.object({ baseRevision: chatInputSchema.shape.baseRevision }),
   messages: z.array(z.unknown()).min(1).max(1000),
   tools: z.array(z.never()).optional(),
   context: z.array(z.never()).optional(),
@@ -42,7 +45,7 @@ export function parseRunBody(body: unknown, header?: string) {
   if (!user.success) {
     throw new RunRequestError(400, "A single user text message is required");
   }
-  const result = runInputSchema.safeParse({
+  const result = chatInputSchema.safeParse({
     threadId: input.threadId,
     runId: input.runId,
     baseRevision: input.forwardedProps.baseRevision,
@@ -53,6 +56,17 @@ export function parseRunBody(body: unknown, header?: string) {
   });
   if (!result.success) {
     throw new RunRequestError(400, "Invalid user message");
+  }
+  return result.data;
+}
+
+export function parseCompactBody(body: unknown, header?: string) {
+  const result = compactInputSchema.safeParse(body);
+  if (!result.success) {
+    throw new RunRequestError(400, "Invalid compact command");
+  }
+  if (header !== undefined && header !== result.data.runId) {
+    throw new RunRequestError(409, "Run header mismatch");
   }
   return result.data;
 }
@@ -112,34 +126,63 @@ export function eventResponse(
   });
 }
 
-app.onError((error, c) => {
+function sideAccess(header?: string): SideAccess | undefined {
+  if (header === undefined) {
+    return undefined;
+  }
+  const scope = sideScopeSchema.safeParse(header);
+  if (!scope.success) {
+    throw new RunRequestError(400, "Invalid side chat page scope");
+  }
+  return { scope: scope.data };
+}
+
+const requestError: Parameters<typeof app.onError>[0] = (error, c) => {
   if (error instanceof RunRequestError) {
     return c.json({ error: error.message }, error.status);
   }
   console.error("Chat request failed", error);
-  return c.json({ error: "Chat service unavailable" }, 503);
+  return c.json({ error: "對話服務暫時無法使用" }, 503);
+};
+app.onError(requestError);
+compact.onError(requestError);
+compact.post("/", async (c) => {
+  const input = parseCompactBody(await c.req.json().catch(() => null), c.req.header("X-Run-Id"));
+  const cursor = parseCursor(c.req.header("Last-Event-ID"));
+  const access = sideAccess(c.req.header(SIDE_SCOPE_HEADER));
+  await acceptRun(input, access);
+  await checkCursor(input.runId, cursor, undefined, access);
+  return eventResponse(
+    (signal) => observeRun(input.runId, cursor, signal, access),
+    c.req.raw.signal,
+  );
 });
 
 app.post("/", async (c) => {
   const input = parseRunBody(await c.req.json().catch(() => null), c.req.header("X-Run-Id"));
   const cursor = parseCursor(c.req.header("Last-Event-ID"));
-  await acceptRun(input);
-  await checkCursor(input.runId, cursor);
-  return eventResponse((signal) => observeRun(input.runId, cursor, signal), c.req.raw.signal);
+  const access = sideAccess(c.req.header(SIDE_SCOPE_HEADER));
+  await acceptRun(input, access);
+  await checkCursor(input.runId, cursor, undefined, access);
+  return eventResponse(
+    (signal) => observeRun(input.runId, cursor, signal, access),
+    c.req.raw.signal,
+  );
 });
 
 app.get("/", async (c) => {
+  const access = sideAccess(c.req.header(SIDE_SCOPE_HEADER));
   const runId = c.req.query("runId");
   const threadId = c.req.query("threadId");
   if (runId !== undefined) {
     const cursor = parseCursor(c.req.header("Last-Event-ID"), c.req.query("offset"));
-    await checkCursor(runId, cursor, threadId);
-    return eventResponse((signal) => observeRun(runId, cursor, signal), c.req.raw.signal);
+    await checkCursor(runId, cursor, threadId, access);
+    return eventResponse((signal) => observeRun(runId, cursor, signal, access), c.req.raw.signal);
   }
   if (threadId === undefined) {
     throw new RunRequestError(400, "A thread or run ID is required");
   }
-  return c.json(await hydrateThread(threadId));
+  return c.json(await hydrateThread(threadId, access));
 });
 
 export default app;

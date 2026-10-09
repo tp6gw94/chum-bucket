@@ -19,7 +19,7 @@ import {
   fakeToken,
   withMcpEnvironment,
 } from "./tools/mcp-fixture";
-import { eventResponse, parseCursor, parseRunBody } from "../chat";
+import { eventResponse, parseCursor, parseRunBody, parseCompactBody } from "../chat";
 import { ChatClient, fetchServerSentEvents } from "@tanstack/ai-react";
 import { openaiCompatibleText } from "@tanstack/ai-openai/compatible";
 import { resolveDebugOption } from "@tanstack/ai/adapter-internals";
@@ -302,6 +302,7 @@ test("append failure stops provider consumption and cannot complete a turn", asy
 });
 
 const accepted: AcceptedRun = {
+  kind: "chat",
   threadId: "d08035f1-07df-49f3-b2d0-5cf5cb2b1e74",
   runId: "ca2f180a-8461-4cfb-9012-f413df6d72f9",
   baseRevision: 0,
@@ -1179,6 +1180,7 @@ test("AG-UI boundary ignores forged history, requires revision, and keeps run id
     threadId: accepted.threadId,
     runId: accepted.runId,
     baseRevision: 0,
+    kind: "chat",
     message: accepted.message,
   });
   assert.throws(() => parseRunBody({ ...body, forwardedProps: {} }), /Invalid AG-UI/);
@@ -1193,6 +1195,27 @@ test("AG-UI boundary ignores forged history, requires revision, and keeps run id
   for (const cursor of ["-1", "1.0", "1e3", "01", "9007199254740992"]) {
     assert.throws(() => parseCursor(cursor));
   }
+});
+
+test("compact HTTP input is message-free, strict, and retains run identity", () => {
+  const body = {
+    threadId: accepted.threadId,
+    runId: "compact-http",
+    baseRevision: 7,
+    kind: "compact",
+  };
+  assert.deepEqual(parseCompactBody(body, "compact-http"), body);
+  assert.throws(
+    () => parseCompactBody({ ...body, message: { id: "u", text: "/compact" } }),
+    /Invalid compact/,
+  );
+  assert.throws(() => parseCompactBody({ ...body, messages: [] }), /Invalid compact/);
+  assert.throws(() => parseCompactBody(body, "different"), /header mismatch/);
+  assert.throws(() => parseCompactBody({ ...body, baseRevision: -1 }), /Invalid compact/);
+  assert.throws(
+    () => parseRunBody({ ...body, messages: [], forwardedProps: { baseRevision: 7 } }),
+    /Invalid AG-UI/,
+  );
 });
 
 test("reader cancellation detaches without cancelling the producer", async () => {
@@ -1336,6 +1359,10 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
   };
   const sqlHandlers: ReadonlyArray<SqlHandler> = [
     {
+      matches: (text) => text.startsWith("select") && text.includes("from side_chats") && !text.includes("from chat_runs"),
+      execute: () => [],
+    },
+    {
       matches: (text) => ["begin", "commit", "rollback"].includes(text),
       execute: () => [],
     },
@@ -1356,8 +1383,8 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
       matches: (text) =>
         assertSql(
           text,
-          `select ${runColumns} from chat_runs where state`,
-          `select ${runColumns} from chat_runs where state = $1 order by created_at`,
+          `select ${runColumns} from chat_runs where (state`,
+          `select ${runColumns} from chat_runs where (state = $1 and not exists (select 1 from side_chats where side_chats.id = thread_id and (side_chats.state <> 'open' or side_chats.lease_until <= now()))) order by created_at`,
         ),
       execute: (values) => {
         assert.equal(values[0], "pending");
@@ -1443,7 +1470,21 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
       matches: (text) =>
         text.startsWith("select run_id, sequence, event_key, payload from chat_events"),
       execute: (values) =>
-        events.filter((row) => row.run_id === values[0] && row.event_key === values[1]),
+        events.filter(
+          (row) =>
+            row.run_id === values[0] && (values[1] === undefined || row.event_key === values[1]),
+        ),
+    },
+    {
+      matches: (text) =>
+        text.startsWith(`select ${runColumns} from chat_runs where (thread_id`) &&
+        text.includes("projection->>"),
+      execute: (values) =>
+        [...runs.values()].filter(
+          (row) =>
+            row.thread_id === values[0] &&
+            String((row.projection as RunProjection).committedRevision) === values[1],
+        ),
     },
     {
       matches: (text) => text.startsWith(`select ${runColumns} from chat_runs where (thread_id`),
@@ -1495,7 +1536,8 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
       return;
     }
     assert.ok(statements.at(-1)?.endsWith("from threads where id = $1 for update"));
-    assert.equal(statements.at(-2), "select thread_id from chat_runs where id = $1");
+    assert.ok(statements.at(-2)?.includes("from side_chats"));
+    assert.equal(statements.at(-3), "select thread_id from chat_runs where id = $1");
   };
   const projectQueryRows = (
     config: string | { text: string; rowMode?: string },
@@ -1574,7 +1616,7 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
         }
         started.push(options!.workflowID!);
         statuses.set(options!.workflowID!, "PENDING");
-        return {};
+        return { getResult: () => new Promise<void>(() => {}) };
       }) as never,
   );
   const input = {
@@ -1586,7 +1628,8 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
   try {
     await assert.rejects(acceptRun(input), /Start unavailable/);
     assert.equal(statements[0], "begin");
-    assert.ok(statements[1]?.endsWith("from threads where id = $1 for update"));
+    assert.ok(statements[1]?.includes("from side_chats"));
+    assert.ok(statements[2]?.endsWith("from threads where id = $1 for update"));
     assert.equal(threads.get(accepted.threadId)!.active_run_id, accepted.runId);
     assert.equal(events.length, 1);
     await reconcileRuns();
@@ -2596,7 +2639,19 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
           const projection = readProjection(
             runs.get(compactRun.runId)!.projection as RunProjection,
           );
-          assert.deepEqual(projection.display, compactRun.messages);
+          const visibleSummary: UIMessage = {
+            id: `summary:${compactRun.runId}/compact/0`,
+            role: "user",
+            parts: [
+              {
+                type: "text",
+                content: "Historical summary keeps ORIGINAL-17 and the completed reads.",
+              },
+            ],
+            metadata: { fromSummary: true },
+          };
+          assert.deepEqual(projection.display, [...compactRun.messages, visibleSummary]);
+          assert.deepEqual((await hydrateThread(compactThread)).messages, projection.display);
           const candidate = structuredClone(projection.context);
           assert.equal(candidate[0]!.metadata?.fromSummary, true);
           assert.deepEqual(candidate.slice(1), compactRun.messages.slice(2));
@@ -2617,7 +2672,7 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
           assert.equal(ordinaryGenerations, 1);
           assert.deepEqual(ordinaryInput, convertMessagesToModelMessages(candidate));
           const compactSaved = threads.get(compactThread)!.messages as UIMessage[];
-          assert.deepEqual(compactSaved.slice(0, -1), compactRun.messages);
+          assert.deepEqual(compactSaved.slice(0, -1), [...compactRun.messages, visibleSummary]);
           assert.equal(threads.get(compactThread)!.title, "Stable compact title");
           assert.equal(runs.get(compactRun.runId)!.state, "succeeded");
           assert.deepEqual(
@@ -2638,8 +2693,8 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
           const compactHydrated = await hydrateThread(compactThread);
           assert.deepEqual(compactHydrated.messages, compactSaved);
           assert.equal(
-            compactHydrated.messages.some((message) => message.metadata?.fromSummary),
-            false,
+            compactHydrated.messages.filter((message) => message.metadata?.fromSummary).length,
+            1,
           );
           assert.equal(compactHydrated.activeRun, null);
           const replayed = new StreamProcessor({ initialMessages: compactRun.messages });
@@ -3160,6 +3215,270 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
       tool.mock.restore();
     }
 
+    await t.test(
+      "manual commands preserve archives, replay once, and never create user commands or ordinary replies",
+      async () => {
+        const threadId = randomUUID();
+        const history: UIMessage[] = Array.from({ length: 3 }, (_, index) => [
+          {
+            id: `manual-u${index}`,
+            role: "user" as const,
+            parts: [{ type: "text" as const, content: `問題${index}`.repeat(500) }],
+          },
+          {
+            id: `manual-a${index}`,
+            role: "assistant" as const,
+            parts: [{ type: "text" as const, content: `回答${index}`.repeat(500) }],
+          },
+        ]).flat();
+        threads.set(threadId, {
+          id: threadId,
+          title: "固定標題",
+          messages: history,
+          revision: 0,
+          active_run_id: null,
+        });
+        const { deepinfra } = await import("./provider");
+        let summaryText = "第一份完整摘要";
+        const summaryProvider = mock.method(
+          Object.getPrototypeOf(deepinfra(accepted.model)),
+          "chatStream",
+          async function* (options: { tools: unknown[] }) {
+            assert.deepEqual(options.tools, []);
+            yield {
+              type: EventType.TEXT_MESSAGE_START,
+              messageId: "private-summary",
+              role: "assistant",
+            };
+            yield {
+              type: EventType.TEXT_MESSAGE_CONTENT,
+              messageId: "private-summary",
+              delta: summaryText,
+            };
+            yield { type: EventType.TEXT_MESSAGE_END, messageId: "private-summary" };
+            yield {
+              type: EventType.RUN_FINISHED,
+              threadId: "provider",
+              runId: "provider",
+              finishReason: "stop",
+            };
+          },
+        );
+        const durable = mock.method(DBOS, "runStep", async (callback: () => Promise<unknown>) =>
+          callback(),
+        );
+        try {
+          const command = {
+            threadId,
+            runId: "manual-first",
+            baseRevision: 0,
+            kind: "compact" as const,
+          };
+          const run = await acceptRun(command);
+          assert.deepEqual(run.messages, history);
+          assert.deepEqual(await acceptRun(command), run);
+          await assert.rejects(acceptRun({ ...command, runId: "manual-busy" }), /claim conflict/);
+          await assert.rejects(
+            acceptRun({ ...command, kind: "chat", message: { id: "slash", text: "/compact" } }),
+            /collision/,
+          );
+          await executeRun(run);
+          const saved = (await hydrateThread(threadId)).messages;
+          assert.deepEqual(saved.slice(0, -1), history);
+          assert.deepEqual(saved.at(-1)?.parts, [{ type: "text", content: "第一份完整摘要" }]);
+          assert.equal(threads.get(threadId)!.title, "固定標題");
+          assert.equal(threads.get(threadId)!.active_run_id, null);
+          assert.equal(threads.get(threadId)!.revision, 1);
+          assert.equal((runs.get(run.runId)!.projection as RunProjection).committedRevision, 1);
+          const firstEvents = events
+            .filter((row) => row.run_id === run.runId)
+            .map((row) => row.payload as StreamChunk);
+          assert.deepEqual(
+            firstEvents.map((event) => event.type),
+            [
+              "RUN_STARTED",
+              "CUSTOM",
+              "MESSAGES_SNAPSHOT",
+              "CUSTOM",
+              "MESSAGES_SNAPSHOT",
+              "RUN_FINISHED",
+            ],
+          );
+          assert.deepEqual(
+            firstEvents.flatMap((event) => {
+              const parsed = parseCompactionEvent(event);
+              return parsed ? [parsed.state] : [];
+            }),
+            ["started", "done"],
+          );
+          const eventCount = events.length;
+          await acceptRun(command);
+          await finishRun(run.runId, { display: saved, context: run.context });
+          assert.equal(events.length, eventCount);
+          await assert.rejects(
+            acceptRun({ ...command, runId: "manual-stale" }),
+            /revision or claim conflict/,
+          );
+          summaryText = "第二份完整摘要";
+          const second = await acceptRun({ ...command, runId: "manual-second", baseRevision: 1 });
+          await executeRun(second);
+          const twice = (await hydrateThread(threadId)).messages;
+          assert.deepEqual(twice.slice(0, -1), saved);
+          assert.deepEqual(twice.at(-1)?.parts, [{ type: "text", content: "第二份完整摘要" }]);
+          const after = await acceptRun({ ...command, runId: "manual-skip", baseRevision: 2 });
+          assert.deepEqual(
+            after.context
+              .filter((message) => message.metadata?.fromSummary)
+              .map((message) => message.id),
+            ["summary:manual-second/compact/0"],
+          );
+          assert.equal(JSON.stringify(after.context).includes("第一份完整摘要"), false);
+          await executeRun(after);
+          assert.deepEqual((await hydrateThread(threadId)).messages, twice);
+          assert.equal(threads.get(threadId)!.revision, 3);
+          assert.deepEqual(
+            events
+              .filter((row) => row.run_id === after.runId)
+              .flatMap((row) => {
+                const parsed = parseCompactionEvent(row.payload);
+                return parsed ? [parsed.state] : [];
+              }),
+            ["skipped"],
+          );
+          assert.equal(runs.get(after.runId)!.state, "succeeded");
+          const failedThread = randomUUID();
+          threads.set(failedThread, {
+            id: failedThread,
+            title: "失敗測試",
+            messages: history,
+            revision: 0,
+            active_run_id: null,
+          });
+          summaryText = "";
+          const failure = await acceptRun({
+            ...command,
+            threadId: failedThread,
+            runId: "manual-failed",
+          });
+          await executeRun(failure);
+          assert.deepEqual((await hydrateThread(failedThread)).messages, history);
+          assert.equal(threads.get(failedThread)!.revision, 0);
+          assert.equal(threads.get(failedThread)!.active_run_id, null);
+          assert.equal(runs.get(failure.runId)!.state, "failed");
+          assert.deepEqual(
+            events
+              .filter((row) => row.run_id === failure.runId)
+              .flatMap((row) => {
+                const parsed = parseCompactionEvent(row.payload);
+                return parsed ? [parsed.state] : [];
+              }),
+            ["started", "failed"],
+          );
+        } finally {
+          durable.mock.restore();
+          summaryProvider.mock.restore();
+        }
+      },
+    );
+
+    await t.test(
+      "recovery commits the exact automatic summary after model failure but not inherited summaries",
+      async () => {
+        const threadId = randomUUID();
+        const history: UIMessage[] = [
+          { id: "auto-old-user", role: "user", parts: [{ type: "text", content: "原始問題" }] },
+          {
+            id: "auto-old-answer",
+            role: "assistant",
+            parts: [{ type: "text", content: "字".repeat(COMPACT_TOKEN_THRESHOLD + 5000) }],
+          },
+        ];
+        threads.set(threadId, {
+          id: threadId,
+          title: "原始標題",
+          messages: history,
+          revision: 0,
+          active_run_id: null,
+        });
+        const { deepinfra } = await import("./provider");
+        const external = mock.method(
+          Object.getPrototypeOf(deepinfra(accepted.model)),
+          "chatStream",
+          async function* (options: { tools: unknown[] }) {
+            if (options.tools.length) {
+              throw new Error("Ordinary provider unavailable");
+            }
+            yield {
+              type: EventType.TEXT_MESSAGE_START,
+              messageId: "private-auto-summary",
+              role: "assistant",
+            };
+            yield {
+              type: EventType.TEXT_MESSAGE_CONTENT,
+              messageId: "private-auto-summary",
+              delta: "完整自動摘要，保留 EXACT-42。",
+            };
+            yield { type: EventType.TEXT_MESSAGE_END, messageId: "private-auto-summary" };
+            yield {
+              type: EventType.RUN_FINISHED,
+              threadId: "provider",
+              runId: "provider",
+              finishReason: "stop",
+            };
+          },
+        );
+        const durable = mock.method(DBOS, "runStep", async (callback: () => Promise<unknown>) =>
+          callback(),
+        );
+        try {
+          const run = await acceptRun({
+            ...input,
+            threadId,
+            runId: "auto-model-failed",
+            message: { id: "auto-current", text: "目前問題" },
+          });
+          await assert.rejects(executeRun(run), /Ordinary provider unavailable/);
+          const published = readProjection(runs.get(run.runId)!.projection as RunProjection);
+          assert.deepEqual(published.display.at(-1)?.parts, [
+            { type: "text", content: "完整自動摘要，保留 EXACT-42。" },
+          ]);
+          assert.deepEqual((await hydrateThread(threadId)).messages, published.display);
+          statuses.set(run.runId, "ERROR");
+          await reconcileRuns();
+          assert.equal(runs.get(run.runId)!.state, "failed");
+          assert.equal((runs.get(run.runId)!.projection as RunProjection).committedRevision, 1);
+          assert.equal(threads.get(threadId)!.active_run_id, null);
+          assert.deepEqual((await hydrateThread(threadId)).messages, published.display);
+          assert.deepEqual(published.display.slice(0, -1), run.messages);
+          const saved = structuredClone(published.display);
+          const next = await acceptRun({
+            ...input,
+            threadId,
+            runId: "inherited-summary-failed",
+            baseRevision: 1,
+            message: { id: "next-auto", text: "下一題" },
+          });
+          assert.deepEqual(next.context.slice(0, -1), published.context);
+          await assert.rejects(executeRun(next), /Ordinary provider unavailable/);
+          statuses.set(next.runId, "ERROR");
+          await reconcileRuns();
+          assert.equal(runs.get(next.runId)!.state, "failed");
+          assert.equal(
+            (runs.get(next.runId)!.projection as RunProjection).committedRevision,
+            undefined,
+          );
+          assert.equal(threads.get(threadId)!.revision, 1);
+          assert.deepEqual((await hydrateThread(threadId)).messages, saved);
+          const before = events.length;
+          await reconcileRuns();
+          assert.equal(events.length, before);
+        } finally {
+          durable.mock.restore();
+          external.mock.restore();
+        }
+      },
+    );
+
     const oldRun = await acceptRun({
       ...input,
       runId: "old-build",
@@ -3171,6 +3490,7 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
     const beforeOldStart = started.length;
     const beforeOldEvents = events.length;
     for (const legacyBuild of [
+      "durable-chat-loop-v8",
       "durable-chat-loop-v4",
       "durable-chat-loop-v3",
       "durable-chat-loop-v2",

@@ -171,9 +171,7 @@ function noteToolCall(
     order,
     arguments: part.arguments,
     state: part.state,
-    flagged: outputErrorFlagged(
-      (part.metadata as { tanstack?: unknown } | undefined)?.tanstack,
-    ),
+    flagged: outputErrorFlagged((part.metadata as { tanstack?: unknown } | undefined)?.tanstack),
   });
 }
 
@@ -595,10 +593,9 @@ async function invokeRemote(
   if (!entry) {
     throw new ToolBoundaryError("Unknown tool");
   }
-  const output = await withAbort(
-    entry.handler(remoteToolInput(call), { ...context, abortSignal: signal }),
-    signal,
-  );
+  signal.throwIfAborted();
+  const output = await entry.handler(remoteToolInput(call), { ...context, abortSignal: signal });
+  signal.throwIfAborted();
   guardCredentials(output, config);
   return output;
 }
@@ -658,14 +655,18 @@ async function runRemoteTool(
 
 export async function withAtlassianScope<T>(
   use: (scope: AtlassianScope) => Promise<T>,
+  signal?: AbortSignal,
 ): Promise<T> {
   let configuration: Promise<AtlassianConfiguration> | undefined;
   let remote: RemoteSession | undefined;
   let closed = false;
+  const onAbort = () => remote?.controller.abort();
+  signal?.addEventListener("abort", onAbort, { once: true });
   const getConfiguration = async () => {
     const config = await (configuration ??= Promise.resolve().then(() =>
       readAtlassianConfiguration(process.env),
     ));
+    signal?.throwIfAborted();
     if (closed) {
       throw new ToolBoundaryError("Tool scope is closed");
     }
@@ -740,6 +741,7 @@ export async function withAtlassianScope<T>(
     });
   } finally {
     closed = true;
+    signal?.removeEventListener("abort", onAbort);
     if (remote) {
       await retire(remote).catch(() => undefined);
     }
