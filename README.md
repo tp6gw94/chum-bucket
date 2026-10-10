@@ -94,11 +94,17 @@ sequenceDiagram
 
 ### Target
 
-1. 建立 Tool
-    1. [ ] get_figma tool
-    2. [ ] fs tool
-2. 建立 MCP Tool
-    1. [ ] [sooperset/mcp-atlassian v0.23.1](https://github.com/sooperset/mcp-atlassian/tree/v0.23.1)，以本機唯讀 HTTP 服務提供原生工具。 (lazy)
+建立兩組工具，讓 Agent 讀取 Figma、Jira 與 Confluence，把整理結果寫入本機檔案，再讀回確認。
+
+- [ ] 建立 `get_figma` 與 Pi fs 工具 `read`、`write`、`edit`。
+- [ ] 接入本機唯讀 Atlassian MCP，使用 lazy discovery 載入工具。
+
+依序閱讀以下文件：
+
+1. [工具架構](docs/tools/architecture.md)：檔案分工、資料流與 lazy discovery 的用途。
+2. [建立自訂工具](docs/tools/custom-tools.md)：get_figma、Pi fs、聊天整合與測試。
+3. [接入本機 Atlassian MCP](docs/tools/atlassian-mcp.md)：連線政策、服務程序、client、串流清理與串接驗收。
+
 
 ## 2. Durable Execution
 
