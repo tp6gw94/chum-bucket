@@ -154,9 +154,19 @@ Checkpoint 決定恢復時要執行哪些步驟；事件紀錄則讓人看得見
 
 ### Target
 
-1. [ ] 拆除原生 chat
-2. [ ] DBOS 回覆工作
-3. [ ] 建立自訂的 discovery tool for lazy
+建立可在程序重啟後接續的聊天 run，讓模型呼叫、工具結果與執行進度都有明確的保存邊界。
+
+- [ ] 接手原生 `chat()` 的工具迴圈，將模型呼叫與每個工具呼叫拆成 DBOS steps。
+- [ ] 保存 run、事件與對話終態，讓背景工作和 SSE 連線分開，支援重啟恢復與前端重連。
+- [ ] 建立 `discover_atlassian_tools`，從持久化訊息重建 lazy discovery 狀態。
+- [ ] 驗證 checkpoint 前後中斷的差異，以及工具副作用的重試風險。
+
+依序閱讀以下文件：
+
+1. [可恢復的聊天架構](docs/durable-execution/architecture.md)：模組責任、資料流與 checkpoint 邊界。
+2. [建立可恢復的 run](docs/durable-execution/implement-run.md)：資料契約、模型與工具 steps、runtime 及 SSE 重連。
+3. [建立可恢復的 lazy discovery](docs/durable-execution/lazy-discovery.md)：工具目錄、discovery 結果與恢復後的執行檢查。
+4. [驗證中斷與重連](docs/durable-execution/verify-recovery.md)：離線測試、真實程序中斷與交付驗收。
 
 ## 3.Code Mode
 
@@ -277,3 +287,4 @@ flowchart TD
 ```
 
 ## 7. Eval
+
