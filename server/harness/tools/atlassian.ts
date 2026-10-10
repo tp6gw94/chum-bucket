@@ -92,12 +92,15 @@ export class ToolBoundaryError extends Error {}
 
 function parseDiscoveryRequest(argumentsText: string): readonly string[] | undefined {
   let parsed: unknown;
+
   try {
     parsed = JSON.parse(argumentsText);
   } catch {
     return undefined;
   }
+
   const request = discoveryRequestSchema.safeParse(parsed);
+
   return request.success ? [...new Set(request.data.toolNames)] : undefined;
 }
 
@@ -142,6 +145,7 @@ function markCallIdentity(id: string, history: MutableHistory): void {
   if (history.callIds.has(id) || history.resultIds.has(id) || id.length === 0) {
     history.ambiguous.add(id);
   }
+
   history.callIds.add(id);
 }
 
@@ -149,6 +153,7 @@ function markResultIdentity(id: string, history: MutableHistory): void {
   if (history.resultIds.has(id) || id.length === 0) {
     history.ambiguous.add(id);
   }
+
   history.resultIds.add(id);
 }
 
@@ -164,9 +169,11 @@ function noteToolCall(
   history: MutableHistory,
 ): void {
   markCallIdentity(part.id, history);
+
   if (part.name !== discoveryToolName || history.calls.has(part.id)) {
     return;
   }
+
   history.calls.set(part.id, {
     order,
     arguments: part.arguments,
@@ -188,9 +195,11 @@ function noteToolResult(
   history: MutableHistory,
 ): void {
   markResultIdentity(part.toolCallId, history);
+
   if (history.results.has(part.toolCallId)) {
     return;
   }
+
   history.results.set(part.toolCallId, {
     order,
     content: part.content,
@@ -210,19 +219,23 @@ function collectDiscoveryHistory(messages: readonly UIMessage[]): DiscoveryHisto
     ambiguous: new Set(),
   };
   let order = 0;
+
   for (const message of messages) {
     if (message.role !== "assistant") {
       continue;
     }
+
     for (const part of message.parts) {
       if (part.type === "tool-call") {
         noteToolCall(part, order, history);
       } else if (part.type === "tool-result") {
         noteToolResult(part, order, history);
       }
+
       order += 1;
     }
   }
+
   return {
     calls: history.calls,
     results: history.results,
@@ -247,20 +260,25 @@ function parsedDiscoveryTools(
   config: AtlassianConfiguration,
 ): readonly { name: string }[] | undefined {
   let parsed: unknown;
+
   try {
     parsed = JSON.parse(content);
   } catch {
     return undefined;
   }
+
   const output = discoveryResultSchema.safeParse(parsed);
+
   if (!output.success) {
     return undefined;
   }
+
   try {
     guardCredentials(output.data, config);
   } catch {
     return undefined;
   }
+
   return output.data.tools;
 }
 
@@ -294,15 +312,21 @@ function discoveryGrant(
   if (!discoveryEligible(call, result)) {
     return [];
   }
+
   const requested = parseDiscoveryRequest(call.arguments);
+
   if (!requested) {
     return [];
   }
+
   const tools = parsedDiscoveryTools(result.content, config);
+
   if (!tools) {
     return [];
   }
+
   const names = tools.map((tool) => tool.name);
+
   return discoveryNamesGranted(names, requested) ? names : [];
 }
 
@@ -312,14 +336,17 @@ function grantedNames(
 ): ReadonlySet<string> {
   const history = collectDiscoveryHistory(messages);
   const granted = new Set<string>();
+
   for (const [id, call] of history.calls) {
     if (history.ambiguous.has(id)) {
       continue;
     }
+
     for (const name of discoveryGrant(call, history.results.get(id), config)) {
       granted.add(name);
     }
   }
+
   return granted;
 }
 
@@ -329,6 +356,7 @@ function armedDeadline(deadlines: Set<AbortSignal>, ms: number): Deadline {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), ms);
   deadlines.add(controller.signal);
+
   return {
     signal: controller.signal,
     release: () => {
@@ -341,18 +369,22 @@ function armedDeadline(deadlines: Set<AbortSignal>, ms: number): Deadline {
 function guardCredentials(value: unknown, config: AtlassianConfiguration) {
   const secrets = config.mode === "http" ? config.secrets : [];
   const seen = new WeakSet<object>();
+
   function inspect(value: unknown) {
     if (typeof value === "string" && secrets.some((secret) => value.includes(secret))) {
       throw new ToolBoundaryError("Tool data contains configured Atlassian credentials");
     }
+
     if (value && typeof value === "object" && !seen.has(value)) {
       seen.add(value);
+
       for (const key of Object.getOwnPropertyNames(value)) {
         inspect(key);
         inspect((value as Record<string, unknown>)[key]);
       }
     }
   }
+
   inspect(value);
 }
 
@@ -360,11 +392,13 @@ function withAbort<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
   return new Promise((resolve, reject) => {
     const onAbort = () =>
       reject(new ToolBoundaryError("Atlassian MCP operation was cancelled or timed out"));
+
     if (signal.aborted) {
       onAbort();
     } else {
       signal.addEventListener("abort", onAbort, { once: true });
     }
+
     work.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
   });
 }
@@ -372,6 +406,7 @@ function withAbort<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
 function mcpFetch(controller: AbortController, deadlines: Set<AbortSignal>): typeof fetch {
   return (input, init) => {
     const requestSignal = input instanceof Request ? input.signal : undefined;
+
     return fetch(input, {
       ...init,
       signal: AbortSignal.any([
@@ -392,12 +427,15 @@ function requireMcpTool(
   required: boolean,
 ): McpToolList[number] | undefined {
   const tool = discovered.find((candidate) => candidate.metadata.mcp.serverToolName === name);
+
   if (tool) {
     return tool;
   }
+
   if (required) {
     throw new ToolBoundaryError(`Atlassian MCP is missing required tool ${name}`);
   }
+
   return undefined;
 }
 
@@ -413,9 +451,11 @@ function assertCatalogEntry(
 
 function remoteRegistration(tool: McpToolList[number]): RemoteRegistration {
   const inputSchema = convertSchemaToJsonSchema(tool.inputSchema);
+
   if (!inputSchema) {
     throw new ToolBoundaryError("Tool schema is unavailable");
   }
+
   return {
     definition: { name: tool.name, description: tool.description, inputSchema },
     handler: async (input, context) => tool.execute!(input, context),
@@ -424,14 +464,18 @@ function remoteRegistration(tool: McpToolList[number]): RemoteRegistration {
 
 function buildRemoteRegistrations(discovered: McpToolList): Map<string, RemoteRegistration> {
   const entries = new Map<string, RemoteRegistration>();
+
   for (const [name, policy] of atlassianTools) {
     const tool = requireMcpTool(discovered, name, policy.required);
+
     if (!tool) {
       continue;
     }
+
     assertCatalogEntry(name, tool, entries);
     entries.set(name, remoteRegistration(tool));
   }
+
   return entries;
 }
 
@@ -439,9 +483,11 @@ function throwOpenRemoteFailure(failure: unknown, cancelled: boolean): never {
   if (cancelled) {
     throw new ToolBoundaryError("Atlassian MCP operation was cancelled or timed out");
   }
+
   if (failure instanceof ToolBoundaryError) {
     throw failure;
   }
+
   throw new ToolBoundaryError(
     "Atlassian MCP initialization failed; start the local service with pnpm mcp:atlassian, then check Jira credentials and site access",
   );
@@ -455,34 +501,42 @@ async function openRemote(
   const scopeFetch = mcpFetch(controller, deadlines);
   const initDeadline = armedDeadline(deadlines, MCP_TIMEOUT_MS);
   let client: MCPClient | undefined;
+
   const close = async () => {
     const connected = client;
     client = undefined;
     await connected?.close().catch(() => undefined);
   };
+
   const onAbort = () => void close();
   controller.signal.addEventListener("abort", onAbort, { once: true });
+
   try {
     controller.signal.throwIfAborted();
     const connecting = createMCPClient({
       transport: { type: "http", url: config.endpoint, fetch: scopeFetch },
     }).then(async (connected) => {
       client = connected;
+
       if (controller.signal.aborted || initDeadline.signal.aborted) {
         await close();
       }
+
       return connected;
     });
     const signal = AbortSignal.any([controller.signal, initDeadline.signal]);
     const connected = await withAbort(connecting, signal);
     const discovered = await withAbort(connected.tools(), signal);
     guardCredentials(discovered, config);
+
     return { registrations: buildRemoteRegistrations(discovered), close };
   } catch (failure) {
     const cancelled = controller.signal.aborted || initDeadline.signal.aborted;
+
     if (cancelled) {
       controller.abort();
     }
+
     await close();
     guardCredentials(failure, config);
     throwOpenRemoteFailure(failure, cancelled);
@@ -511,6 +565,7 @@ function advertisedTools(
   if (!session || !catalog) {
     return definitions;
   }
+
   return [...definitions, discoveryDefinition([...catalog.registrations.keys()])];
 }
 
@@ -521,22 +576,28 @@ function authorizeRemoteCall(
 ): readonly string[] | undefined {
   if (call.name === discoveryToolName) {
     const requested = parseDiscoveryRequest(call.arguments);
+
     if (!requested) {
       throw new ToolBoundaryError("Invalid discover_atlassian_tools input");
     }
+
     if (!requested.every((name) => atlassianTools.has(name))) {
       throw new Error("Unknown tool");
     }
+
     return requested;
   }
+
   if (!atlassianTools.has(call.name)) {
     throw new Error("Unknown tool");
   }
+
   if (!grantedNames(messages, config).has(call.name)) {
     throw new ToolBoundaryError(
       `Tool ${call.name} is not discovered; call ${discoveryToolName} first`,
     );
   }
+
   return undefined;
 }
 
@@ -549,12 +610,15 @@ async function executeLocalTool(
   try {
     const output = await local(call.input, context);
     guardCredentials(output, config);
+
     return output;
   } catch (failure) {
     guardCredentials(failure, config);
+
     if (failure instanceof ToolBoundaryError) {
       throw failure;
     }
+
     throw new Error(failure instanceof Error ? failure.message : "Tool failed");
   }
 }
@@ -566,13 +630,16 @@ function discoveryOutput(
 ): unknown {
   const tools = names.map((name) => {
     const entry = catalog.registrations.get(name);
+
     if (!entry) {
       throw new ToolBoundaryError(`Atlassian tool is unavailable: ${name}`);
     }
+
     return entry.definition;
   });
   const output = structuredClone({ tools });
   guardCredentials(output, config);
+
   return output;
 }
 
@@ -590,13 +657,16 @@ async function invokeRemote(
   config: AtlassianConfiguration,
 ): Promise<unknown> {
   const entry = catalog.registrations.get(call.name);
+
   if (!entry) {
     throw new ToolBoundaryError("Unknown tool");
   }
+
   signal.throwIfAborted();
   const output = await entry.handler(remoteToolInput(call), { ...context, abortSignal: signal });
   signal.throwIfAborted();
   guardCredentials(output, config);
+
   return output;
 }
 
@@ -608,12 +678,15 @@ function throwRemoteFailure(
   if (abortSignal?.aborted) {
     throw new ToolBoundaryError("Atlassian MCP tool was cancelled");
   }
+
   if (failure instanceof ToolBoundaryError) {
     throw failure;
   }
+
   if (cancelled) {
     throw new ToolBoundaryError("Atlassian MCP operation was cancelled or timed out");
   }
+
   throw new ToolBoundaryError(
     "Atlassian MCP tool failed; check Jira credentials, site access, and native tool arguments",
   );
@@ -636,11 +709,14 @@ async function runRemoteTool(
   ]);
   const onAbort = () => session.controller.abort();
   signal.addEventListener("abort", onAbort, { once: true });
+
   try {
     const catalog = await withAbort(session.catalog, signal);
+
     if (names) {
       return discoveryOutput(catalog, names, config);
     }
+
     return await invokeRemote(catalog, call, context, signal, config);
   } catch (failure) {
     const cancelled = signal.aborted;
@@ -653,97 +729,147 @@ async function runRemoteTool(
   }
 }
 
+type ScopeState = {
+  configuration: Promise<AtlassianConfiguration> | undefined;
+  remote: RemoteSession | undefined;
+  closed: boolean;
+};
+
+type HttpConfiguration = Extract<AtlassianConfiguration, { mode: "http" }>;
+
+function assertScopeOpen(state: ScopeState): void {
+  if (state.closed) {
+    throw new ToolBoundaryError("Tool scope is closed");
+  }
+}
+
+async function scopeConfiguration(
+  state: ScopeState,
+  signal: AbortSignal | undefined,
+): Promise<AtlassianConfiguration> {
+  const config = await (state.configuration ??= Promise.resolve().then(() =>
+    readAtlassianConfiguration(process.env),
+  ));
+  signal?.throwIfAborted();
+  assertScopeOpen(state);
+
+  return config;
+}
+
+function scopeRemote(state: ScopeState, config: HttpConfiguration): RemoteSession {
+  assertScopeOpen(state);
+
+  if (!state.remote) {
+    const controller = new AbortController();
+    const deadlines = new Set<AbortSignal>();
+    const session: RemoteSession = {
+      controller,
+      deadlines,
+      catalog: openRemote(config, controller, deadlines).catch((failure: unknown) => {
+        if (state.remote === session) {
+          state.remote = undefined;
+        }
+
+        throw failure;
+      }),
+    };
+    state.remote = session;
+  }
+
+  return state.remote;
+}
+
+async function retireSession(state: ScopeState, session: RemoteSession): Promise<void> {
+  if (state.remote === session) {
+    state.remote = undefined;
+  }
+
+  session.controller.abort();
+  const catalog = await session.catalog.catch(() => undefined);
+  await catalog?.close();
+}
+
+async function scopedModelTools(
+  state: ScopeState,
+  signal: AbortSignal | undefined,
+  messages: readonly UIMessage[],
+  compose: (remote: AtlassianCatalog) => ModelTool[],
+): Promise<ModelTool[]> {
+  const config = await scopeConfiguration(state, signal);
+  const session = config.mode === "http" ? scopeRemote(state, config) : undefined;
+
+  try {
+    const catalog = await session?.catalog;
+    const definitions = compose(selectDefinitions(catalog, grantedNames(messages, config)));
+    const advertised = advertisedTools(definitions, session, catalog);
+    guardCredentials(advertised, config);
+
+    return structuredClone(advertised);
+  } catch (failure) {
+    if (session) {
+      await retireSession(state, session);
+    }
+
+    guardCredentials(failure, config);
+    throw new Error(failure instanceof Error ? failure.message : "Tool composition failed");
+  }
+}
+
+async function scopedTool(
+  state: ScopeState,
+  signal: AbortSignal | undefined,
+  ...[messages, call, context, local]: Parameters<AtlassianScope["executeTool"]>
+): Promise<unknown> {
+  const config = await scopeConfiguration(state, signal);
+
+  if (local) {
+    return executeLocalTool(local, call, context, config);
+  }
+
+  if (config.mode === "local") {
+    throw new Error("Unknown tool");
+  }
+
+  const names = authorizeRemoteCall(messages, call, config);
+
+  if (context.abortSignal?.aborted) {
+    throw new ToolBoundaryError("Atlassian MCP tool was cancelled");
+  }
+
+  return runRemoteTool(
+    names,
+    call,
+    context,
+    config,
+    (remoteConfig) => scopeRemote(state, remoteConfig),
+    (session) => retireSession(state, session),
+  );
+}
+
 export async function withAtlassianScope<T>(
   use: (scope: AtlassianScope) => Promise<T>,
   signal?: AbortSignal,
 ): Promise<T> {
-  let configuration: Promise<AtlassianConfiguration> | undefined;
-  let remote: RemoteSession | undefined;
-  let closed = false;
-  const onAbort = () => remote?.controller.abort();
+  const state: ScopeState = { configuration: undefined, remote: undefined, closed: false };
+  const onAbort = () => state.remote?.controller.abort();
   signal?.addEventListener("abort", onAbort, { once: true });
-  const getConfiguration = async () => {
-    const config = await (configuration ??= Promise.resolve().then(() =>
-      readAtlassianConfiguration(process.env),
-    ));
-    signal?.throwIfAborted();
-    if (closed) {
-      throw new ToolBoundaryError("Tool scope is closed");
-    }
-    return config;
-  };
-  const getRemote = (config: Extract<AtlassianConfiguration, { mode: "http" }>) => {
-    if (closed) {
-      throw new ToolBoundaryError("Tool scope is closed");
-    }
-    if (!remote) {
-      const controller = new AbortController();
-      const deadlines = new Set<AbortSignal>();
-      const session: RemoteSession = {
-        controller,
-        deadlines,
-        catalog: openRemote(config, controller, deadlines).catch((failure: unknown) => {
-          if (remote === session) {
-            remote = undefined;
-          }
-          throw failure;
-        }),
-      };
-      remote = session;
-    }
-    return remote;
-  };
-  const retire = async (session: RemoteSession) => {
-    if (remote === session) {
-      remote = undefined;
-    }
-    session.controller.abort();
-    const catalog = await session.catalog.catch(() => undefined);
-    await catalog?.close();
-  };
+
   try {
     return await use({
       async guard() {
-        const config = await getConfiguration();
+        const config = await scopeConfiguration(state, signal);
+
         return (value: unknown) => guardCredentials(value, config);
       },
-      async getModelTools(messages, compose) {
-        const config = await getConfiguration();
-        const session = config.mode === "http" ? getRemote(config) : undefined;
-        try {
-          const catalog = await session?.catalog;
-          const definitions = compose(selectDefinitions(catalog, grantedNames(messages, config)));
-          const advertised = advertisedTools(definitions, session, catalog);
-          guardCredentials(advertised, config);
-          return structuredClone(advertised);
-        } catch (failure) {
-          if (session) {
-            await retire(session);
-          }
-          guardCredentials(failure, config);
-          throw new Error(failure instanceof Error ? failure.message : "Tool composition failed");
-        }
-      },
-      async executeTool(messages, call, context, local) {
-        const config = await getConfiguration();
-        if (local) {
-          return executeLocalTool(local, call, context, config);
-        }
-        if (config.mode === "local") {
-          throw new Error("Unknown tool");
-        }
-        const names = authorizeRemoteCall(messages, call, config);
-        if (context.abortSignal?.aborted) {
-          throw new ToolBoundaryError("Atlassian MCP tool was cancelled");
-        }
-        return runRemoteTool(names, call, context, config, getRemote, retire);
-      },
+      getModelTools: (messages, compose) => scopedModelTools(state, signal, messages, compose),
+      executeTool: (...args) => scopedTool(state, signal, ...args),
     });
   } finally {
-    closed = true;
+    state.closed = true;
     signal?.removeEventListener("abort", onAbort);
-    if (remote) {
-      await retire(remote).catch(() => undefined);
+
+    if (state.remote) {
+      await retireSession(state, state.remote).catch(() => undefined);
     }
   }
 }

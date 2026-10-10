@@ -14,6 +14,7 @@ function withFixture(files: Record<string, string>, fn: (fixtureDir: string) => 
   fs.mkdirSync(dir, { recursive: true });
   const localModules = path.join(dir, "node_modules");
   const repoModules = path.resolve(process.cwd(), "node_modules");
+
   if (fs.existsSync(repoModules)) {
     fs.symlinkSync(repoModules, localModules, "junction");
   }
@@ -24,6 +25,7 @@ function withFixture(files: Record<string, string>, fn: (fixtureDir: string) => 
       fs.mkdirSync(path.dirname(fullPath), { recursive: true });
       fs.writeFileSync(fullPath, content);
     }
+
     return fn(dir);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });

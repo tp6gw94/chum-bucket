@@ -54,6 +54,7 @@ export function summaryTransferFailure(transfer: SummaryTransfer, cause: unknown
   if (cause instanceof SideChatOperationError && cause.outcome === "blocked") {
     return transfer;
   }
+
   return { ...transfer, kind: isDefinitiveTransferRejection(cause) ? "draft" : "unresolved" };
 }
 
@@ -67,6 +68,7 @@ export type SideChatOrigin = Readonly<{ sideChatId: string; ordinal: number }>;
 export function originalSideTranscript(display: readonly UIMessage[], sideChatId: string) {
   return display.filter((message) => {
     const origin = message.metadata?.sideChatOrigin as SideChatOrigin | undefined;
+
     return origin?.sideChatId === sideChatId && message.metadata?.fromSummary !== true;
   });
 }
@@ -78,10 +80,12 @@ export function classifySideConversation(
 ): UIMessage[] {
   const inherited = new Set([...seed.display, ...seed.context].map((message) => message.id));
   let ordinal = 0;
+
   return messages.map((message) => {
     if (inherited.has(message.id) || message.metadata?.fromSummary === true) {
       return message;
     }
+
     return {
       ...message,
       metadata: { ...message.metadata, sideChatOrigin: { sideChatId, ordinal: ++ordinal } },

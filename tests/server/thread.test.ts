@@ -34,12 +34,14 @@ test("thread creation accepts only an empty object and stores an empty revision"
       ({
         values(value: { title: string; messages: unknown[] }) {
           stored = value;
+
           return {
             returning: async () => [{ id, ...value, revision: 0, updated_at: new Date(0) }],
           };
         },
       }) as unknown as ReturnType<typeof db.insert>,
   );
+
   try {
     const response = await app.request("/", {
       method: "POST",

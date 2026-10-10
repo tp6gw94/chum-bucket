@@ -14,8 +14,10 @@ async function until(predicate: () => boolean) {
     if (predicate()) {
       return;
     }
+
     await delay(5);
   }
+
   assert.fail("Expected client state was not observed");
 }
 
@@ -27,6 +29,7 @@ function eventStream() {
       controller = value;
     },
   });
+
   return {
     response: new Response(stream, { headers: { "Content-Type": "text/event-stream" } }),
     emit(event: StreamChunk) {
@@ -47,9 +50,11 @@ test("creation is empty and never sends chat", async () => {
     "fetch",
     async (_url: string | URL | Request, init?: RequestInit) => {
       requests.push(JSON.parse(String(init?.body)));
+
       return Response.json({ id: threadId, title: "新對話" });
     },
   );
+
   try {
     assert.deepEqual(await createThread(), { id: threadId, title: "新對話" });
     assert.deepEqual(requests, [{}]);
@@ -64,6 +69,7 @@ test("only a matching durable terminal unlocks the current run", () => {
     terminalResult({ type: "RUN_ERROR", metadata: { tanstack: { runId } } }, runId),
     "failed",
   );
+
   for (const event of [
     { type: "RUN_FINISHED", runId: "other" },
     { type: "RUN_ERROR" },
@@ -93,15 +99,19 @@ test(
       fetchClient: async (input, init) => {
         const url = new URL(String(input));
         requests.push({ url, method: init?.method ?? "GET" });
+
         if (!url.searchParams.has("runId")) {
           assert.equal(url.searchParams.get("threadId"), threadId);
+
           return Response.json({ messages: baseline, activeRun: { runId }, revision: 0 });
         }
+
         assert.equal(url.searchParams.get("runId"), runId);
         assert.equal(url.searchParams.get("offset"), "-1");
         signals.push(init!.signal!);
         const stream = eventStream();
         streams.push(stream);
+
         return stream.response;
       },
     });
@@ -115,6 +125,7 @@ test(
         .filter((part) => part.type === "text")
         .map((part) => part.content)
         .join("|");
+
     try {
       await until(() => streams.length === 1);
       const stream = streams[0]!;

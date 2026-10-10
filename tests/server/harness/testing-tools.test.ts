@@ -73,6 +73,7 @@ function testPlan(): CanonicalPlan {
       },
     ],
   };
+
   return {
     requirementsDigest: "req-digest",
     goal: intent.goal,
@@ -95,38 +96,50 @@ function modelCall(name: string, input: unknown = {}): ModelCall {
 
 function leafAnchors(value: unknown, limit = 32): string[] {
   const anchors: string[] = [];
+
   const walk = (node: unknown, path: string) => {
     if (anchors.length >= limit) {
       return;
     }
+
     if (node === null || typeof node !== "object") {
       anchors.push(path || "$");
+
       return;
     }
+
     if (Array.isArray(node)) {
       node.forEach((item, index) => walk(item, `${path}[${index}]`));
+
       return;
     }
+
     for (const key of Object.keys(node).sort()) {
       walk((node as Record<string, unknown>)[key], path ? `${path}.${key}` : key);
     }
   };
+
   walk(value, "");
+
   return anchors.length > 0 ? anchors : ["$"];
 }
 
 function designCapture(raw: unknown): DesignCaptureResult {
   const node = (raw as { nodes?: unknown[] }).nodes?.[0] as Record<string, unknown>;
   const properties: Record<string, string> = {};
+
   if (typeof node.paddingLeft === "number") {
     properties["padding-left"] = `${node.paddingLeft}px`;
   }
+
   if (typeof node.itemSpacing === "number") {
     properties.gap = `${node.itemSpacing}px`;
   }
+
   if (typeof node.opacity === "number") {
     properties.opacity = String(node.opacity);
   }
+
   return {
     properties,
     capture: {
@@ -162,15 +175,19 @@ function fixtureHost(options: {
     restoredDesign: options.restoredDesign,
     async invoke(invocation, work) {
       invocations.push(invocation);
+
       if (options.invokeDelayMs) {
         await delay(options.invokeDelayMs);
       }
+
       const output = await work();
       receipts += 1;
+
       return { output, receiptId: `receipt-${receipts}`, outputDigest: digestOf(output) };
     },
     async captureSource(input) {
       sourceInputs.push(input);
+
       return (
         options.source?.(input.raw, input.reference) ?? {
           reference: input.reference,
@@ -182,9 +199,11 @@ function fixtureHost(options: {
     },
     async captureDesign(input) {
       designInputs.push(input);
+
       return (options.design ?? designCapture)(input.raw);
     },
   };
+
   return { host, invocations, sourceInputs, designInputs };
 }
 
@@ -199,6 +218,7 @@ async function discoveryHistory(
     { id, name: "discover_atlassian_tools", arguments: argumentsText, input: { toolNames } },
     context,
   );
+
   return [
     {
       id: `${id}-message`,
@@ -242,6 +262,7 @@ test("planner keeps zero-binding codemode, rejects every native call, and never 
           assert.deepEqual(names, ["codemode"]);
           assert.doesNotMatch(turn.systemPrompt, /external_|planner_compute/);
           assert.doesNotMatch(turn.definitions[0]!.description, /external_|planner_compute/);
+
           for (const name of [
             "planner_compute",
             "jira_get_issue",
@@ -259,6 +280,7 @@ test("planner keeps zero-binding codemode, rejects every native call, and never 
               new RegExp(`not available to the planner role`),
             );
           }
+
           const sandbox = (await tools.executeTool(
             [],
             modelCall("codemode", {
@@ -279,6 +301,7 @@ test("planner keeps zero-binding codemode, rejects every native call, and never 
             context,
           )) as { success: boolean; result: unknown };
           assert.deepEqual(namesInSandbox, { success: true, result: [], logs: [] });
+
           for (const name of [
             "external_read",
             "external_write",
@@ -340,6 +363,7 @@ test("atlassian role restricts discovery and reads, then captures the raw read o
             context,
           )) as { success: boolean; result: unknown };
           assert.deepEqual(beforeDiscoveryCode.result, [16, 25, 36]);
+
           for (const name of [
             "external_jira_get_issue",
             "external_read",
@@ -353,6 +377,7 @@ test("atlassian role restricts discovery and reads, then captures the raw read o
             )) as { success: boolean };
             assert.equal(forged.success, false, `${name} is unavailable before discovery`);
           }
+
           assert.equal(harness.invocations.length, 0);
           assert.equal(fixture.requests.length, initialMcpRequests);
           const discovery = first.definitions[0]!;
@@ -479,6 +504,7 @@ test("atlassian role restricts discovery and reads, then captures the raw read o
             )) as { success: boolean };
             assert.equal(forged.success, false, `${name} is not a granted readonly binding`);
           }
+
           assert.equal(harness.invocations.length, 4);
         },
       );
@@ -498,12 +524,14 @@ test("AC role returns Host receipt envelopes and rejects foreign tools", async (
         turn.definitions.map((definition) => definition.name),
         ["use_browser", "codemode"],
       );
+
       for (const name of ["get_figma", "read", "write", "edit", "run_tests"]) {
         await assert.rejects(
           () => tools.executeTool([], modelCall(name, { checkId: "check-f" }), context),
           /Unknown tool/,
         );
       }
+
       assert.equal(harness.invocations.length, 0);
 
       const direct = (await tools.executeTool(
@@ -654,6 +682,7 @@ function figmaDocument(document: Record<string, unknown>) {
 function figmaFetch(document: Record<string, unknown>, calls: string[]): typeof fetch {
   return (async (input: string | URL | Request) => {
     calls.push(String(input));
+
     return Response.json(figmaDocument(document));
   }) as typeof fetch;
 }
@@ -667,6 +696,7 @@ test("UI captures Figma lazily from the requested node and blocks incomplete out
     { id: "1:2", name: "Frame", type: "FRAME", paddingLeft: 16 },
     calls,
   );
+
   try {
     const harness = fixtureHost({ fixture: hostFixture });
     await withTestingRoleTools(
@@ -796,6 +826,7 @@ test("UI captures Figma lazily from the requested node and blocks incomplete out
     );
   } finally {
     globalThis.fetch = originalFetch;
+
     if (originalKey === undefined) {
       delete process.env.FIGMA_API_KEY;
     } else {

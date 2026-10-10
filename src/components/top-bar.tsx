@@ -1,7 +1,4 @@
-import {
-  PanelLeftCloseIcon,
-  PanelLeftOpenIcon,
-} from "lucide-react";
+import { PanelLeftCloseIcon, PanelLeftOpenIcon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 

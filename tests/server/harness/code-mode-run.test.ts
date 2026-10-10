@@ -79,6 +79,7 @@ test("the durable loop runs codemode and persists its events before the result",
           log_bytes: 0,
         };
         runs.set(String(a), row);
+
         return [row];
       },
     },
@@ -86,6 +87,7 @@ test("the durable loop runs codemode and persists its events before the result",
       matches: (text) => text.startsWith("update chat_runs set projection"),
       execute: (_text, values) => {
         runs.get(String(values[1]))!.projection = JSON.parse(String(values[0]));
+
         return [];
       },
     },
@@ -97,6 +99,7 @@ test("the durable loop runs codemode and persists its events before the result",
         thread.messages = JSON.parse(String(values[2]));
         thread.revision = Number(thread.revision) + 1;
         thread.active_run_id = null;
+
         return [];
       },
     },
@@ -104,6 +107,7 @@ test("the durable loop runs codemode and persists its events before the result",
       matches: (text) => text.startsWith("update threads set active_run_id"),
       execute: (_text, values) => {
         threads.get(String(values[1]))!.active_run_id = values[0];
+
         return [];
       },
     },
@@ -111,6 +115,7 @@ test("the durable loop runs codemode and persists its events before the result",
       matches: (text) => text.startsWith("select sequence, payload from chat_events"),
       execute: (_text, values) => {
         const [a, b, c] = values;
+
         return events
           .filter((row) => row.run_id === a && Number(row.sequence) > Number(b))
           .sort((left, right) => Number(left.sequence) - Number(right.sequence))
@@ -122,6 +127,7 @@ test("the durable loop runs codemode and persists its events before the result",
       execute: (_text, values) => {
         const [a, b, c, d] = values;
         events.push({ run_id: a, sequence: b, event_key: c, payload: JSON.parse(String(d)) });
+
         return [];
       },
     },
@@ -131,6 +137,7 @@ test("the durable loop runs codemode and persists its events before the result",
         const run = runs.get(String(values[1]))!;
         run.next_sequence = Number(run.next_sequence) + 1;
         run.log_bytes = Number(run.log_bytes) + Number(values[0]);
+
         return [];
       },
     },
@@ -138,6 +145,7 @@ test("the durable loop runs codemode and persists its events before the result",
       matches: (text) => text.startsWith("update chat_runs set state"),
       execute: (_text, values) => {
         runs.get(String(values[1]))!.state = values[0];
+
         return [];
       },
     },
@@ -146,10 +154,12 @@ test("the durable loop runs codemode and persists its events before the result",
       execute: () => [],
     },
   ];
+
   const projectQueryRows = (config: string | { text: string }, text: string, rows: Row[]) => {
     const columns = text.startsWith("select ")
       ? text.slice(7, text.indexOf(" from "))
       : text.split(" returning ")[1];
+
     return {
       rows: structuredClone(
         typeof config !== "string" && "rowMode" in config && config.rowMode === "array" && columns
@@ -159,16 +169,20 @@ test("the durable loop runs codemode and persists its events before the result",
       rowCount: rows.length,
     };
   };
+
   const query = async (config: string | { text: string }, values: unknown[] = []) => {
     const text = (typeof config === "string" ? config : config.text)
       .replace(/"(?:threads|chat_runs|chat_events)"\./g, "")
       .replaceAll('"', "");
     const handler = sqlHandlers.find((entry) => entry.matches(text));
+
     if (!handler) {
       throw new Error(`Unsupported offline SQL: ${text}`);
     }
+
     return projectQueryRows(config, text, handler.execute(text, values));
   };
+
   const pool = Pool.prototype as unknown as {
     connect: () => Promise<{ query: typeof query; release: () => void }>;
   };
@@ -210,6 +224,7 @@ test("the durable loop runs codemode and persists its events before the result",
       assert.equal(properties?.code?.type, "string");
       assert.equal(properties !== undefined && "typescriptCode" in properties, false);
       modelCalls++;
+
       if (modelCalls === 1) {
         const id = "code-mode-source";
         yield {
@@ -228,8 +243,10 @@ test("the durable loop runs codemode and persists its events before the result",
           input: { code },
         };
         yield { type: EventType.RUN_FINISHED, threadId: "provider", runId: "provider" };
+
         return;
       }
+
       const toolMessages = options.messages.filter((message) => message.role === "tool");
       assert.equal(toolMessages.length, 1);
       assert.match(String(toolMessages[0]!.content), /durable-payload/);
@@ -239,6 +256,7 @@ test("the durable loop runs codemode and persists its events before the result",
       yield { type: EventType.RUN_FINISHED, threadId: "provider", runId: "provider" };
     },
   );
+
   try {
     await executeRun(accepted.run);
   } finally {
@@ -246,6 +264,7 @@ test("the durable loop runs codemode and persists its events before the result",
     stepped.mock.restore();
     connected.mock.restore();
   }
+
   assert.equal(modelCalls, 2);
   assert.equal(runs.get("code-mode-run")!.state, "succeeded");
   const persisted = events.map((row) => row.payload as StreamChunk);

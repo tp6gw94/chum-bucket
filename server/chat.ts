@@ -33,18 +33,23 @@ const userSchema = z.object({
 
 export function parseRunBody(body: unknown, header?: string) {
   const parsed = bodySchema.safeParse(body);
+
   if (!parsed.success) {
     throw new RunRequestError(400, "Invalid AG-UI run input");
   }
 
   const input = parsed.data;
+
   if (header !== undefined && header !== input.runId) {
     throw new RunRequestError(409, "Run header mismatch");
   }
+
   const user = userSchema.safeParse(input.messages.at(-1));
+
   if (!user.success) {
     throw new RunRequestError(400, "A single user text message is required");
   }
+
   const result = chatInputSchema.safeParse({
     threadId: input.threadId,
     runId: input.runId,
@@ -54,35 +59,45 @@ export function parseRunBody(body: unknown, header?: string) {
       text: typeof user.data.content === "string" ? user.data.content : user.data.content[0].text,
     },
   });
+
   if (!result.success) {
     throw new RunRequestError(400, "Invalid user message");
   }
+
   return result.data;
 }
 
 export function parseCompactBody(body: unknown, header?: string) {
   const result = compactInputSchema.safeParse(body);
+
   if (!result.success) {
     throw new RunRequestError(400, "Invalid compact command");
   }
+
   if (header !== undefined && header !== result.data.runId) {
     throw new RunRequestError(409, "Run header mismatch");
   }
+
   return result.data;
 }
 
 export function parseCursor(header?: string, offset?: string) {
   const value = header ?? offset;
+
   if (value === undefined || (header === undefined && value === "-1")) {
     return -1;
   }
+
   if (!/^(0|[1-9][0-9]*)$/.test(value)) {
     throw new RunRequestError(400, "Invalid event cursor");
   }
+
   const cursor = Number(value);
+
   if (!Number.isSafeInteger(cursor)) {
     throw new RunRequestError(400, "Invalid event cursor");
   }
+
   return cursor;
 }
 
@@ -98,6 +113,7 @@ export function eventResponse(
     async pull(controller) {
       try {
         const next = await iterator.next();
+
         if (next.done) {
           controller.close();
         } else {
@@ -117,6 +133,7 @@ export function eventResponse(
       await iterator.return?.();
     },
   });
+
   return new Response(stream, {
     headers: {
       "Content-Type": "text/event-stream",
@@ -130,10 +147,13 @@ function sideAccess(header?: string): SideAccess | undefined {
   if (header === undefined) {
     return undefined;
   }
+
   const scope = sideScopeSchema.safeParse(header);
+
   if (!scope.success) {
     throw new RunRequestError(400, "Invalid side chat page scope");
   }
+
   return { scope: scope.data };
 }
 
@@ -141,9 +161,12 @@ const requestError: Parameters<typeof app.onError>[0] = (error, c) => {
   if (error instanceof RunRequestError) {
     return c.json({ error: error.message }, error.status);
   }
+
   console.error("Chat request failed", error);
+
   return c.json({ error: "對話服務暫時無法使用" }, 503);
 };
+
 app.onError(requestError);
 compact.onError(requestError);
 compact.post("/", async (c) => {
@@ -152,6 +175,7 @@ compact.post("/", async (c) => {
   const access = sideAccess(c.req.header(SIDE_SCOPE_HEADER));
   await acceptRun(input, access);
   await checkCursor(input.runId, cursor, undefined, access);
+
   return eventResponse(
     (signal) => observeRun(input.runId, cursor, signal, access),
     c.req.raw.signal,
@@ -164,6 +188,7 @@ app.post("/", async (c) => {
   const access = sideAccess(c.req.header(SIDE_SCOPE_HEADER));
   await acceptRun(input, access);
   await checkCursor(input.runId, cursor, undefined, access);
+
   return eventResponse(
     (signal) => observeRun(input.runId, cursor, signal, access),
     c.req.raw.signal,
@@ -174,14 +199,18 @@ app.get("/", async (c) => {
   const access = sideAccess(c.req.header(SIDE_SCOPE_HEADER));
   const runId = c.req.query("runId");
   const threadId = c.req.query("threadId");
+
   if (runId !== undefined) {
     const cursor = parseCursor(c.req.header("Last-Event-ID"), c.req.query("offset"));
     await checkCursor(runId, cursor, threadId, access);
+
     return eventResponse((signal) => observeRun(runId, cursor, signal, access), c.req.raw.signal);
   }
+
   if (threadId === undefined) {
     throw new RunRequestError(400, "A thread or run ID is required");
   }
+
   return c.json(await hydrateThread(threadId, access));
 });
 

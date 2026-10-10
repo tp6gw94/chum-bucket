@@ -12,6 +12,7 @@ const cases: [name: string, text: string, hasRoot: boolean][] = [
 
 for (const [name, text, hasRoot] of cases) {
   const result = parseAssistantReply(text);
+
   if ((result.root !== null) !== hasRoot) {
     throw new Error(`${name}: hasRoot=${result.root !== null}, expected ${hasRoot}`);
   }
@@ -19,11 +20,14 @@ for (const [name, text, hasRoot] of cases) {
 
 for (const [name, text] of cases) {
   const result = parseAssistantReply(text);
+
   if (result.root !== null && result.meta.errors.length > 0) {
     throw new Error(`${name}: settled reply carried parse errors`);
   }
 }
+
 const unknown = parseAssistantReply('root = Stack([UnknownThing("x")])');
+
 if (unknown.root === null || unknown.meta.errors.length === 0) {
   throw new Error("unknown component did not report a parse error");
 }

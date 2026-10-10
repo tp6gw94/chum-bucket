@@ -35,6 +35,7 @@ function paneStatus(phase: ThreadPhase): RunStatus {
   if (phase === "compacting") {
     return "compacting";
   }
+
   return phase === "busy" ? "running" : "idle";
 }
 
@@ -62,6 +63,7 @@ function toSidebarSummary(
   activePaneCount: number,
 ): ThreadSummary {
   const active = thread.id === threadId;
+
   return {
     ...thread,
     agent: "main",
@@ -75,12 +77,15 @@ function ThreadEntry() {
   const claim = useRef(false);
   const [busy, setBusy] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
+
   async function enter(id: string | null) {
     if (claim.current) {
       return;
     }
+
     claim.current = true;
     setBusy(true);
+
     try {
       window.location.assign(threadUrl(await resolveEntryId(id)));
     } catch (cause) {
@@ -89,6 +94,7 @@ function ThreadEntry() {
       setCreateError(claimErrorMessage(cause));
     }
   }
+
   return (
     <main className="mx-auto flex max-w-lg flex-col gap-3 p-6">
       <h1>選擇對話</h1>
@@ -185,9 +191,12 @@ const App = () => {
         window.location.reload();
       }
     };
+
     window.addEventListener("pageshow", restore);
+
     return () => window.removeEventListener("pageshow", restore);
   }, []);
+
   if (entry.kind === "invalid") {
     return (
       <main role="alert" className="p-6">
@@ -195,6 +204,7 @@ const App = () => {
       </main>
     );
   }
+
   if (entry.kind === "choose") {
     return (
       <Provider>
@@ -202,6 +212,7 @@ const App = () => {
       </Provider>
     );
   }
+
   return <ThreadPage threadId={entry.threadId} />;
 };
 

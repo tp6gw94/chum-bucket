@@ -202,12 +202,15 @@ test("stream close waits for physical provider shutdown after a consumer rejects
   const stream: AsyncIterable<AdapterYieldChunk> = {
     [Symbol.asyncIterator]() {
       let yielded = false;
+
       return {
         async next(): Promise<IteratorResult<AdapterYieldChunk>> {
           if (yielded) {
             return { done: true, value: undefined };
           }
+
           yielded = true;
+
           return {
             done: false,
             value: {
@@ -220,6 +223,7 @@ test("stream close waits for physical provider shutdown after a consumer rejects
         async return(): Promise<IteratorResult<AdapterYieldChunk>> {
           await new Promise((resolve) => setTimeout(resolve, 25));
           returned = true;
+
           return { done: true, value: undefined };
         },
       };
@@ -239,6 +243,7 @@ test("stream close waits for physical provider shutdown after a consumer rejects
     },
     (error: unknown) => {
       returnFinishedBeforeConsumerError = returned && outcomes.join(",") === "failed";
+
       return error instanceof Error && error.message === "consumer validation failed";
     },
   );
@@ -283,14 +288,18 @@ test("scripted provider IDs are stable and do not collide with conversation hist
   const events = scriptedEvents(options);
   assert.deepEqual(events, scriptedEvents(options));
   const historyIds = new Set<string>();
+
   const collect = (value: unknown) => {
     if (Array.isArray(value)) {
       value.forEach(collect);
+
       return;
     }
+
     if (!value || typeof value !== "object") {
       return;
     }
+
     for (const [key, item] of Object.entries(value)) {
       if (
         typeof item === "string" &&
@@ -298,9 +307,11 @@ test("scripted provider IDs are stable and do not collide with conversation hist
       ) {
         historyIds.add(item);
       }
+
       collect(item);
     }
   };
+
   collect(messages);
   const generatedIds = events.flatMap((event) =>
     [event.messageId, event.toolCallId, event.threadId, event.runId].filter(

@@ -1,6 +1,6 @@
 import { setTimeout as delay } from "node:timers/promises";
 import { DBOS } from "@dbos-inc/dbos-sdk";
-import { ROLE_IDS, type RoleId } from "../../shared/testing";
+import type { RoleId } from "../../shared/testing";
 import type { ModelCall } from "./model-turn";
 import type { AcceptedRun } from "./run-store";
 import {
@@ -23,14 +23,13 @@ import {
   ensureTestingCancelDeliveries,
   listPendingTestingOperations,
   readStartCancelDeliveries,
-  TestingPersistenceError,
   type RoleFailureCode,
   type TestingAdmission,
   type TestingExecution,
 } from "./testing-store";
 import { phaseEligible, rootOutcome } from "./testing-policy";
 
-export type TestingRootInput = Readonly<{
+type TestingRootInput = Readonly<{
   parentRunId: string;
   operationId: string;
 }>;
@@ -52,9 +51,11 @@ function taskInput(execution: TestingExecution, role: RoleId): unknown {
 
 function spec(execution: TestingExecution, role: RoleId): ChildSpec | null {
   const task = execution.tasks.find((item) => item.frame.role === role);
+
   if (!task) {
     return null;
   }
+
   return {
     taskId: task.frame.taskId,
     attemptNonce: task.frame.attemptNonce,
@@ -65,28 +66,34 @@ function spec(execution: TestingExecution, role: RoleId): ChildSpec | null {
   };
 }
 
-async function frameFor(
+function sequentialRole(role: RoleId | undefined): role is "atlassian" | "planner" {
+  return role === "atlassian" || role === "planner";
+}
+
+async function startFrame(
+  execution: TestingExecution,
+  role: "atlassian" | "planner",
+): Promise<DispatchFrame> {
+  await reserveRoleTasks(execution.parentRunId, execution.operationId, [
+    { role, input: taskInput(execution, role) },
+  ]);
+  const latest = await readTestingExecution(execution.parentRunId, execution.operationId);
+  const child = spec(latest, role);
+
+  return child ? { kind: "start", child } : { kind: "idle" };
+}
+
+async function resultsFrame(
   execution: TestingExecution,
   roles: readonly RoleId[],
 ): Promise<DispatchFrame> {
-  if (execution.cancelRequested || execution.finished || roles.length === 0) {
-    return { kind: "idle" };
-  }
-  if (roles.length === 1 && (roles[0] === "atlassian" || roles[0] === "planner")) {
-    const role = roles[0];
-    await reserveRoleTasks(execution.parentRunId, execution.operationId, [
-      { role, input: taskInput(execution, role) },
-    ]);
-    const latest = await readTestingExecution(execution.parentRunId, execution.operationId);
-    const child = spec(latest, role);
-    return child ? { kind: "start", child } : { kind: "idle" };
-  }
   await reserveRoleTasks(
     execution.parentRunId,
     execution.operationId,
     roles.map((role) => ({ role, input: taskInput(execution, role) })),
   );
   const latest = await readTestingExecution(execution.parentRunId, execution.operationId);
+
   return {
     kind: "results",
     ac: roles.includes("ac") ? spec(latest, "ac") : null,
@@ -94,26 +101,39 @@ async function frameFor(
   };
 }
 
+async function frameFor(
+  execution: TestingExecution,
+  roles: readonly RoleId[],
+): Promise<DispatchFrame> {
+  if (execution.cancelRequested || execution.finished || roles.length === 0) {
+    return { kind: "idle" };
+  }
+
+  const [role] = roles;
+
+  if (roles.length === 1 && sequentialRole(role)) {
+    return startFrame(execution, role);
+  }
+
+  return resultsFrame(execution, roles);
+}
+
+const FAILURE_CODES = new Map<string, RoleFailureCode>([
+  ["cancel_requested", "cancelled"],
+  ["cancelled", "cancelled"],
+  ["deadline", "timed_out"],
+  ["timed_out", "timed_out"],
+  ["budget", "budget"],
+  ["missing", "missing"],
+  ["proposal_rejected", "proposal_rejected"],
+  ["nonce", "denied"],
+  ["scope", "denied"],
+  ["terminal", "denied"],
+  ["denied", "denied"],
+]);
+
 function failureCode(reason: string): RoleFailureCode {
-  if (reason === "cancel_requested" || reason === "cancelled") {
-    return "cancelled";
-  }
-  if (reason === "deadline" || reason === "timed_out") {
-    return "timed_out";
-  }
-  if (reason === "budget") {
-    return "budget";
-  }
-  if (reason === "missing") {
-    return "missing";
-  }
-  if (reason === "proposal_rejected") {
-    return "proposal_rejected";
-  }
-  if (reason === "nonce" || reason === "scope" || reason === "terminal" || reason === "denied") {
-    return "denied";
-  }
-  return "child_failed";
+  return FAILURE_CODES.get(reason) ?? "child_failed";
 }
 
 async function settleChild(
@@ -122,18 +142,23 @@ async function settleChild(
   result: TestingChildResult | null,
 ) {
   const execution = await readTestingExecution(ownerRunId, child.operationId);
+
   if (execution.cancelRequested) {
     await recordRoleFailure(ownerRunId, child.taskId, "cancelled").catch(() => undefined);
+
     return;
   }
+
   if (!result || result.state !== "proposed") {
     await recordRoleFailure(
       ownerRunId,
       child.taskId,
       failureCode(result?.reason ?? "child_failed"),
     );
+
     return;
   }
+
   try {
     await acceptRoleCandidate(ownerRunId, child.taskId, result.proposal);
   } catch {
@@ -145,6 +170,7 @@ async function runChild(child: ChildSpec): Promise<TestingChildResult | null> {
   const handle = await DBOS.startWorkflow(testingChildWorkflow, {
     workflowID: child.childWorkflowId,
   })(child);
+
   try {
     return await handle.getResult();
   } catch {
@@ -158,9 +184,11 @@ async function phaseFrame(
   role: RoleId,
 ): Promise<DispatchFrame> {
   const execution = await readTestingExecution(ownerRunId, operationId);
+
   if (!phaseEligible(execution, role)) {
     return { kind: "idle" };
   }
+
   return frameFor(execution, [role]);
 }
 
@@ -172,12 +200,14 @@ function markersQuiet(
     if (testingTransportState(task.frame.childWorkflowId) === "live") {
       return false;
     }
+
     const start = deliveries.find(
       (delivery) => delivery.taskId === task.frame.taskId && delivery.kind === "start",
     );
     const cancel = deliveries.find(
       (delivery) => delivery.taskId === task.frame.taskId && delivery.kind === "cancel",
     );
+
     return start?.acknowledgement === "quiet" && (!cancel || cancel.acknowledgement === "stopped");
   });
 }
@@ -188,6 +218,7 @@ async function proveQuiet(execution: TestingExecution): Promise<boolean> {
   ) {
     return false;
   }
+
   const deliveries = await readStartCancelDeliveries(execution.operationId);
 
   return markersQuiet(execution, deliveries);
@@ -225,10 +256,12 @@ async function runTestingBody(
       const execution = await readTestingExecution(admission.parentRunId, admission.operationId);
       const roles = (["ac", "ui"] as const).filter((role) => phaseEligible(execution, role));
       const frame = roles.length > 0 ? await frameFor(execution, roles) : { kind: "idle" as const };
+
       return frame.kind === "results" ? frame : { kind: "results" as const, ac: null, ui: null };
     },
     { name: `${prefix}:frame:results` },
   );
+
   if (results.ac && results.ui) {
     const acHandle = await DBOS.startWorkflow(testingChildWorkflow, {
       workflowID: results.ac.childWorkflowId,
@@ -260,16 +293,20 @@ async function runTestingBody(
       name: `${prefix}:settle:ui`,
     });
   }
+
   await DBOS.runStep(
     async () => {
       for (;;) {
         const execution = await readTestingExecution(admission.parentRunId, admission.operationId);
+
         if (execution.finished || (await proveQuiet(execution))) {
           return;
         }
+
         if (execution.cancelRequested) {
           await abortTestingTransports(execution.tasks.map((task) => task.frame.childWorkflowId));
         }
+
         await publishProjection(admission.parentRunId, admission.operationId).catch(
           () => undefined,
         );
@@ -278,9 +315,11 @@ async function runTestingBody(
     },
     { name: `${prefix}:quiet` },
   );
+
   return DBOS.runStep(
     async () => {
       const execution = await readTestingExecution(admission.parentRunId, admission.operationId);
+
       return closeTesting(
         admission.parentRunId,
         admission.operationId,
@@ -298,9 +337,11 @@ export async function orchestrateAttachedTesting(
   if (run.side) {
     throw new Error("Side chat cannot delegate testing");
   }
+
   const admission = await DBOS.runStep(() => admitAttachedTesting(run, call.id, call.input), {
     name: `testing-admit:${call.id}`,
   });
+
   return runTestingBody(admission);
 }
 
@@ -312,6 +353,7 @@ async function executeTestingRoot(input: TestingRootInput) {
   const loaded = await DBOS.runStep(
     async () => {
       const execution = await readTestingExecution(admission.parentRunId, admission.operationId);
+
       return {
         operationId: execution.operationId,
         parentRunId: execution.parentRunId,
@@ -327,15 +369,17 @@ async function executeTestingRoot(input: TestingRootInput) {
     },
     { name: "testing-root-admission" },
   );
+
   return runTestingBody(loaded);
 }
 
-export const testingRootWorkflow = DBOS.registerWorkflow(executeTestingRoot, {
+const testingRootWorkflow = DBOS.registerWorkflow(executeTestingRoot, {
   name: TESTING_ROOT_BUILD,
 });
 
 export async function ensureTestingRoot(parentRunId: string, operationId: string): Promise<void> {
   const status = await DBOS.getWorkflowStatus(parentRunId);
+
   if (!status) {
     await DBOS.startWorkflow(testingRootWorkflow, { workflowID: parentRunId })({
       parentRunId,
@@ -344,38 +388,57 @@ export async function ensureTestingRoot(parentRunId: string, operationId: string
   }
 }
 
-export async function reconcileTestingOperations(): Promise<void> {
-  const pending = await listPendingTestingOperations();
-  for (const operation of pending) {
-    if (operation.cancelRequested) {
-      await ensureTestingCancelDeliveries(operation.operationId).catch(() => undefined);
-    }
-    const status =
-      operation.mode === "standalone"
-        ? await DBOS.getWorkflowStatus(operation.parentRunId).catch(() => null)
-        : null;
-    if (operation.mode === "standalone" && !status) {
-      await ensureTestingRoot(operation.parentRunId, operation.operationId);
-    }
-    const execution = await readTestingExecution(
-      operation.parentRunId,
-      operation.operationId,
-    ).catch(() => null);
-    const quiet = execution ? await proveQuiet(execution) : false;
-    const rootEnded =
-      status !== null &&
-      ["SUCCESS", "ERROR", "CANCELLED", "MAX_RECOVERY_ATTEMPTS_EXCEEDED"].includes(status.status);
-    if (quiet && rootEnded) {
-      await closeTesting(
-        operation.parentRunId,
-        operation.operationId,
-        execution ? rootOutcome(execution, Date.now()) : "failed",
-      ).catch(() => undefined);
-    } else {
-      await publishProjection(operation.parentRunId, operation.operationId).catch(() => undefined);
-    }
+type PendingOperation = Awaited<ReturnType<typeof listPendingTestingOperations>>[number];
+
+const ROOT_ENDED_STATUSES: ReadonlySet<string> = new Set([
+  "SUCCESS",
+  "ERROR",
+  "CANCELLED",
+  "MAX_RECOVERY_ATTEMPTS_EXCEEDED",
+]);
+
+async function standaloneRootStatus(operation: PendingOperation) {
+  if (operation.mode !== "standalone") {
+    return null;
   }
+
+  const status = await DBOS.getWorkflowStatus(operation.parentRunId).catch(() => null);
+
+  if (!status) {
+    await ensureTestingRoot(operation.parentRunId, operation.operationId);
+  }
+
+  return status;
 }
 
-export const testingRoleOrder = ROLE_IDS;
-export { TestingPersistenceError };
+async function reconcileOperation(operation: PendingOperation): Promise<void> {
+  if (operation.cancelRequested) {
+    await ensureTestingCancelDeliveries(operation.operationId).catch(() => undefined);
+  }
+
+  const status = await standaloneRootStatus(operation);
+  const execution = await readTestingExecution(operation.parentRunId, operation.operationId).catch(
+    () => null,
+  );
+  const quiet = execution !== null && (await proveQuiet(execution));
+
+  if (execution && quiet && status !== null && ROOT_ENDED_STATUSES.has(status.status)) {
+    await closeTesting(
+      operation.parentRunId,
+      operation.operationId,
+      rootOutcome(execution, Date.now()),
+    ).catch(() => undefined);
+
+    return;
+  }
+
+  await publishProjection(operation.parentRunId, operation.operationId).catch(() => undefined);
+}
+
+export async function reconcileTestingOperations(): Promise<void> {
+  const pending = await listPendingTestingOperations();
+
+  for (const operation of pending) {
+    await reconcileOperation(operation);
+  }
+}

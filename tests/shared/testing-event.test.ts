@@ -225,6 +225,7 @@ test("malformed or foreign events are ignored without throwing", () => {
       report: { ...report, acceptance: { verdict: "blocked", reasons: [] } },
     }),
   ];
+
   for (const event of hostile) {
     assert.equal(parseTestingProjectionEvent(event), null);
   }

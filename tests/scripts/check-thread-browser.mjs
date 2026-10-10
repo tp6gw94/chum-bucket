@@ -17,42 +17,52 @@ let activeRun = null;
 let mode = "success";
 let probe = false;
 const gates = new Map();
+
 function hold(name) {
   const gate = Promise.withResolvers();
   gates.set(name, gate);
+
   return () => {
     gate.resolve();
     gates.delete(name);
   };
 }
+
 const posts = () =>
   requests.filter((request) => request.path === "/api/chat" && request.method === "POST");
 const ready = () => page.waitForFunction(() => window.api?.phase === "ready");
+
 function abortForeignOrigin(url, route) {
   if (url.origin !== origin) {
     return route.abort();
   }
 }
+
 function isProbeMain(url) {
   return probe && url.pathname === "/src/main.tsx";
 }
+
 function isStaticAsset(url) {
   return !url.pathname.startsWith("/api/");
 }
+
 async function fulfillProbe(route) {
   const response = await route.fetch();
   const source = await response.text();
   const react = source.match(/import __vite__cjsImport0_react from "([^"]+)"/)[1];
   const dom = source.match(/import __vite__cjsImport1_reactDom_client from "([^"]+)"/)[1];
+
   return route.fulfill({
     contentType: "text/javascript",
     body: `import React from '${react}'; import ReactDOM from '${dom}'; import {useThread} from '/src/hooks/use-threads.ts'; function Probe(){window.api=useThread('${id}');return React.createElement('pre',{},JSON.stringify({phase:window.api.phase,messages:window.api.messages}));} ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(React.StrictMode,{},React.createElement(Probe)));`,
   });
 }
+
 async function handleThreadCollection(route, method) {
   if (method === "POST") {
     await gates.get("create")?.promise;
   }
+
   return route.fulfill({
     json:
       method === "POST"
@@ -63,37 +73,50 @@ async function handleThreadCollection(route, method) {
           ],
   });
 }
+
 async function handleThreadRevision(route) {
   await gates.get("revision")?.promise;
+
   if (mode === "revision-fail") {
     return route.fulfill({ status: 503, json: { error: "fixture" } });
   }
+
   return route.fulfill({ json: { messages: [], revision: 7 } });
 }
+
 async function handleHydrate(route) {
   await gates.get("hydrate")?.promise;
+
   return route.fulfill({
     status: hydrateStatus,
     json: hydrateStatus === 200 ? { messages, activeRun } : { error: "fixture" },
   });
 }
+
 const httpErrorModes = new Map([
   ["409", 409],
   ["503", 503],
 ]);
+
 async function applyChatTransport(route) {
   await gates.get("post")?.promise;
   const status = httpErrorModes.get(mode);
+
   if (status !== undefined) {
     await route.fulfill({ status, json: { error: "fixture" } });
+
     return true;
   }
+
   if (mode === "network") {
     await route.abort();
+
     return true;
   }
+
   return false;
 }
+
 const terminalByMode = new Map([
   ["success", (runId) => ({ type: "RUN_FINISHED", threadId: id, runId })],
   [
@@ -111,6 +134,7 @@ const terminalByMode = new Map([
   ],
   ["wrong", () => ({ type: "RUN_FINISHED", threadId: id, runId: "wrong-run" })],
 ]);
+
 function chatEvents(runId) {
   const events = [
     { type: "RUN_STARTED", threadId: id, runId },
@@ -119,13 +143,17 @@ function chatEvents(runId) {
     { type: "TEXT_MESSAGE_END", messageId: "answer" },
   ];
   const extra = terminalByMode.get(mode);
+
   if (extra !== undefined) {
     events.push(extra(runId));
   }
+
   return events;
 }
+
 function handleChatStream(route, body) {
   const runId = body?.runId ?? activeRun.runId;
+
   return route.fulfill({
     contentType: "text/event-stream",
     body: chatEvents(runId)
@@ -133,6 +161,7 @@ function handleChatStream(route, body) {
       .join(""),
   });
 }
+
 const apiHandlers = [
   {
     matches: (url) => url.pathname === "/api/thread",
@@ -147,34 +176,45 @@ const apiHandlers = [
     handle: (route) => handleHydrate(route),
   },
 ];
+
 async function handleApi(route, url, method, body) {
   const handler = apiHandlers.find((entry) => entry.matches(url, method));
+
   if (handler) {
     return handler.handle(route, url, method, body);
   }
+
   if (await applyChatTransport(route)) {
     return;
   }
+
   return handleChatStream(route, body);
 }
+
 await page.route("**/*", async (route) => {
   const request = route.request();
   const url = new URL(request.url());
   const foreign = abortForeignOrigin(url, route);
+
   if (foreign) {
     return foreign;
   }
+
   if (isProbeMain(url)) {
     return fulfillProbe(route);
   }
+
   if (isStaticAsset(url)) {
     return route.continue();
   }
+
   const method = request.method();
   const body = request.postDataJSON();
   requests.push({ path: url.pathname, method, body, url });
+
   return handleApi(route, url, method, body);
 });
+
 try {
   await page.goto(origin);
   await page.getByRole("button", { name: "既有對話", exact: true }).waitFor();
@@ -278,6 +318,7 @@ try {
   const before = posts().length;
   const outcomes = await page.evaluate((next) => {
     window.sent = window.api.send("one");
+
     return Promise.all([
       window.api.send("two").then(
         () => false,
@@ -295,6 +336,7 @@ try {
   await ready();
   assert.equal(posts().length, before + 1);
   assert.equal(posts().at(-1).body.messages[0].id, "old");
+
   for (mode of ["failed", "eof", "tools", "wrong", "409", "503", "network"]) {
     await page.reload();
     await ready();
@@ -305,10 +347,12 @@ try {
       mode === "failed" ? "ready" : "uncertain",
       mode,
     );
+
     if (mode !== "failed") {
       assert.equal(await page.evaluate((next) => window.api.navigate(next), next), false);
     }
   }
+
   mode = "revision-fail";
   await page.reload();
   await ready();
@@ -354,6 +398,7 @@ try {
   assert.deepEqual(
     await page.evaluate((next) => {
       const accepted = window.api.navigate(next);
+
       return window.api.send("after navigation").then(
         () => [accepted, false],
         () => [accepted, true],

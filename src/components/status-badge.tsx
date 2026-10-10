@@ -53,6 +53,7 @@ export function StatusBadge({
     "label" in presentation
       ? presentation.label
       : { runningLabel, idleLabel }[presentation.labelKey];
+
   return (
     <Badge variant={presentation.variant}>
       <Icon data-icon="inline-start" className={presentation.className} />

@@ -27,26 +27,32 @@ export function formatActionMessage(event: ActionEvent): string | null {
   if (event.type !== "continue_conversation") {
     return null;
   }
+
   const details: {
     formState?: Record<string, unknown>;
     formName?: string;
     context?: unknown;
   } = {};
+
   if (event.formState !== undefined) {
     details.formState = event.formState;
   }
+
   if (event.formName !== undefined) {
     details.formName = event.formName;
   }
+
   if (
     Object.prototype.hasOwnProperty.call(event.params, "context") &&
     event.params.context !== undefined
   ) {
     details.context = event.params.context;
   }
+
   if (Object.keys(details).length === 0) {
     return event.humanFriendlyMessage;
   }
+
   return `${event.humanFriendlyMessage}\n\n${JSON.stringify(details, null, 2)}`;
 }
 
@@ -62,6 +68,7 @@ function isRawFallback(text: string, result: ParseResult | null): boolean {
 
 function parseErrorNames(result: ParseResult | null): readonly string[] {
   const errors = result?.meta.errors ?? [];
+
   return [...new Set(errors.map((error) => error.component))];
 }
 
@@ -69,6 +76,7 @@ function assistantPresentation(text: string, result: ParseResult | null): Assist
   if (isRawFallback(text, result)) {
     return { kind: "raw", text };
   }
+
   return { kind: "render", text, errorNames: parseErrorNames(result) };
 }
 
@@ -83,9 +91,11 @@ function messageHeader(message: ChatMessage, agent: string): string | null {
   if (message.metadata?.fromSummary) {
     return "壓縮摘要";
   }
+
   if (message.role === "assistant") {
     return agent;
   }
+
   return null;
 }
 
@@ -105,6 +115,7 @@ function AssistantMessage({
     [text, isStreaming],
   );
   const presentation = assistantPresentation(text, result);
+
   if (presentation.kind === "raw") {
     return (
       <Bubble variant="muted" align="start">
@@ -112,6 +123,7 @@ function AssistantMessage({
       </Bubble>
     );
   }
+
   return (
     <div className="flex min-w-0 flex-col gap-1">
       {presentation.errorNames.length > 0 ? (
@@ -180,6 +192,7 @@ function ChatMessageRow({
   onAction: (event: ActionEvent) => void;
 }) {
   const text = messageText(message);
+
   if (message.role === "system") {
     return (
       <Marker variant="separator">
@@ -187,8 +200,10 @@ function ChatMessageRow({
       </Marker>
     );
   }
+
   const align = message.metadata?.fromSummary ? "start" : MESSAGE_ALIGN[message.role];
   const header = messageHeader(message, agent);
+
   return (
     <Message align={align}>
       <MessageContent>
@@ -225,6 +240,26 @@ export function CompactMarker() {
   );
 }
 
+const ACTION_RESULT_ERRORS: Partial<Record<SendResult, string>> = {
+  failed: "執行失敗，原文已保留。",
+  uncertain: "結果尚未確認，請重新載入對話，原文已保留。",
+};
+
+function actionStatusFor(result: SendResult): ActionStatus {
+  const message = ACTION_RESULT_ERRORS[result];
+
+  return message ? { kind: "error", message } : { kind: "idle" };
+}
+
+function actionFailure(cause: unknown): ActionStatus {
+  const message =
+    cause instanceof Error && cause.message.trim() !== ""
+      ? `送出互動訊息失敗：${cause.message}`
+      : "送出互動訊息失敗，請確認對話狀態後再操作。";
+
+  return { kind: "error", message };
+}
+
 export function MessageList({
   messages,
   agent,
@@ -250,28 +285,15 @@ export function MessageList({
     if (event.type !== "continue_conversation" || sendBlocked || actionLock.current) {
       return;
     }
+
     actionLock.current = true;
     setActionStatus({ kind: "pending" });
+
     try {
       const text = formatActionMessage(event);
-      if (text === null) {
-        setActionStatus({ kind: "idle" });
-        return;
-      }
-      const result = await onSend(text);
-      if (result === "failed") {
-        setActionStatus({ kind: "error", message: "執行失敗，原文已保留。" });
-      } else if (result === "uncertain") {
-        setActionStatus({ kind: "error", message: "結果尚未確認，請重新載入對話，原文已保留。" });
-      } else {
-        setActionStatus({ kind: "idle" });
-      }
+      setActionStatus(text === null ? { kind: "idle" } : actionStatusFor(await onSend(text)));
     } catch (cause) {
-      const message =
-        cause instanceof Error && cause.message.trim() !== ""
-          ? `送出互動訊息失敗：${cause.message}`
-          : "送出互動訊息失敗，請確認對話狀態後再操作。";
-      setActionStatus({ kind: "error", message });
+      setActionStatus(actionFailure(cause));
     } finally {
       actionLock.current = false;
     }

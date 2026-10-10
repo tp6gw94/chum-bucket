@@ -25,6 +25,7 @@ function runProcess(source: string) {
   );
   const line = output.split("\n").find((line) => line.startsWith("EVIDENCE "));
   assert.ok(line, output);
+
   return JSON.parse(line.slice(9)) as Record<string, unknown>;
 }
 

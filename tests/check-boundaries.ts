@@ -63,6 +63,7 @@ function isTestOnly(p: string): boolean {
 
 function isProhibitedDomain(t: string): boolean {
   const n = t.replace(/\\/g, "/");
+
   return (
     /(dbos|@dbos-inc\/)/.test(n) ||
     /^(pg(\/.*)?|drizzle-orm(\/.*)?)$/.test(n) ||
@@ -75,12 +76,15 @@ function isProhibitedDomain(t: string): boolean {
 
 function loadPathsConfig(rootDir: string): Array<{ prefix: string; targetPrefix: string }> {
   const p = path.join(rootDir, "tsconfig.json");
+
   if (!fs.existsSync(p)) {
     return [];
   }
+
   try {
     const raw = JSON.parse(fs.readFileSync(p, "utf-8"));
     const paths = raw.compilerOptions?.paths || {};
+
     return Object.entries(paths).map(([k, v]) => ({
       prefix: k.replace(/\*$/, ""),
       targetPrefix: Array.isArray(v) && v[0] ? (v[0] as string).replace(/\*$/, "") : "",
@@ -99,11 +103,14 @@ function resolveFallback(
   if (spec.startsWith("node:")) {
     return spec;
   }
+
   let base = spec;
+
   if (spec.startsWith(".")) {
     base = path.resolve(path.dirname(fromFile), spec);
   } else {
     let matched = false;
+
     for (const rule of pathRules) {
       if (spec.startsWith(rule.prefix)) {
         base = path.resolve(rootDir, rule.targetPrefix + spec.slice(rule.prefix.length));
@@ -111,10 +118,12 @@ function resolveFallback(
         break;
       }
     }
+
     if (!matched) {
       return spec;
     }
   }
+
   for (const ext of [
     "",
     ".ts",
@@ -128,6 +137,7 @@ function resolveFallback(
     "/index.mjs",
   ]) {
     const cand = base + ext;
+
     if (fs.existsSync(cand) && fs.statSync(cand).isFile()) {
       return path.normalize(cand);
     }
@@ -149,6 +159,7 @@ export function checkBoundaries(options: CheckBoundariesOptions = {}): {
 
   const pathRules = loadPathsConfig(rootDir);
   const api = new API({ cwd: rootDir });
+
   try {
     const tsconfig = path.join(rootDir, "tsconfig.json");
     const snapshot = api.updateSnapshot(
@@ -163,6 +174,7 @@ export function checkBoundaries(options: CheckBoundariesOptions = {}): {
       const rel = path.relative(rootDir, f).replace(/\\/g, "/");
       const proj = snapshot.getDefaultProjectForFile(f);
       const src = proj?.program.getSourceFile(f);
+
       if (!proj || !src) {
         violations.push({
           rule: "unparseable-source",
@@ -175,6 +187,7 @@ export function checkBoundaries(options: CheckBoundariesOptions = {}): {
       const reqAliases = new Set<string>(["require"]);
       const requireFactories = new Set<string>(["createRequire"]);
       const moduleNamespaces = new Set<string>();
+
       for (const statement of src.statements) {
         if (
           !is.isImportDeclaration(statement) ||
@@ -183,7 +196,9 @@ export function checkBoundaries(options: CheckBoundariesOptions = {}): {
         ) {
           continue;
         }
+
         const bindings = statement.importClause?.namedBindings;
+
         if (bindings && is.isNamedImports(bindings)) {
           for (const binding of bindings.elements) {
             if ((binding.propertyName ?? binding.name).text === "createRequire") {
@@ -194,6 +209,7 @@ export function checkBoundaries(options: CheckBoundariesOptions = {}): {
           moduleNamespaces.add(bindings.name.text);
         }
       }
+
       function isRequireFactory(expression: ast.Expression): boolean {
         return (
           (is.isIdentifier(expression) && requireFactories.has(expression.text)) ||
@@ -203,6 +219,7 @@ export function checkBoundaries(options: CheckBoundariesOptions = {}): {
             expression.name.text === "createRequire")
         );
       }
+
       const edges: Edge[] = [];
       const inlines: string[] = [];
 
@@ -210,12 +227,15 @@ export function checkBoundaries(options: CheckBoundariesOptions = {}): {
         if (!expression) {
           return undefined;
         }
+
         if (is.isIdentifier(expression)) {
           return expression.text;
         }
+
         if (is.isPropertyAccessExpression(expression) && is.isIdentifier(expression.expression)) {
           return expression.expression.text;
         }
+
         if (
           is.isCallExpression(expression) ||
           is.isAwaitExpression(expression) ||
@@ -226,15 +246,19 @@ export function checkBoundaries(options: CheckBoundariesOptions = {}): {
         ) {
           return forwardedName(expression.expression);
         }
+
         if (is.isArrowFunction(expression) || is.isFunctionExpression(expression)) {
           return forwardedName(expression.body);
         }
+
         if (is.isBlock(expression) && expression.statements.length === 1) {
           const statement = expression.statements[0];
+
           if (is.isReturnStatement(statement) || is.isExpressionStatement(statement)) {
             return forwardedName(statement.expression);
           }
         }
+
         return undefined;
       }
 
@@ -252,13 +276,16 @@ export function checkBoundaries(options: CheckBoundariesOptions = {}): {
               : is.isTypeReferenceNode(node.type)
                 ? [node.type.typeName]
                 : [];
+
           for (const candidate of candidates) {
             const name = forwardedName(candidate);
+
             if (name) {
               inlines.push(name);
             }
           }
         }
+
         if (
           is.isVariableDeclaration(node) &&
           is.isIdentifier(node.name) &&
@@ -269,6 +296,7 @@ export function checkBoundaries(options: CheckBoundariesOptions = {}): {
             reqAliases.add(node.name.text);
           }
         }
+
         if (is.isImportDeclaration(node)) {
           const spec =
             node.moduleSpecifier && is.isStringLiteral(node.moduleSpecifier)
@@ -277,6 +305,7 @@ export function checkBoundaries(options: CheckBoundariesOptions = {}): {
           const names: { original: string; local: string }[] = [];
           let isNs = false;
           let isDef = false;
+
           if (node.importClause) {
             if (node.importClause.name) {
               isDef = true;
@@ -285,6 +314,7 @@ export function checkBoundaries(options: CheckBoundariesOptions = {}): {
                 local: node.importClause.name.text,
               });
             }
+
             if (node.importClause.namedBindings) {
               if (is.isNamespaceImport(node.importClause.namedBindings)) {
                 isNs = true;
@@ -299,6 +329,7 @@ export function checkBoundaries(options: CheckBoundariesOptions = {}): {
               }
             }
           }
+
           edges.push({
             kind: "import",
             specifier: spec,
@@ -381,11 +412,14 @@ export function checkBoundaries(options: CheckBoundariesOptions = {}): {
             });
           }
         }
+
         node.forEachChild((c: ast.Node) => {
           parse(c);
+
           return undefined;
         });
       }
+
       parse(src);
       fileEdges.set(f, edges);
       fileInlines.set(f, inlines);
@@ -406,25 +440,33 @@ export function checkBoundaries(options: CheckBoundariesOptions = {}): {
           if (!testSeparationOnly) {
             violations.push({ rule: "non-literal-module-load", file: rel, detail: rel });
           }
+
           continue;
         }
+
         const spec = e.specifier || "";
         let resolved = "";
+
         if (e.node && proj) {
           const sym = proj.checker.getSymbolAtLocation(e.node);
           const source = sym?.declarations?.[0]?.resolve(proj)?.getSourceFile();
+
           if (source) {
             resolved = source.fileName;
           }
         }
+
         if (!resolved) {
           resolved = resolveFallback(spec, f, rootDir, pathRules);
         }
+
         if (path.isAbsolute(resolved) && fs.existsSync(resolved)) {
           resolved = fs.realpathSync.native(resolved);
         }
+
         targets.add(resolved);
         const resolvedRel = path.relative(rootDir, resolved).replace(/\\/g, "/");
+
         if (
           path.isAbsolute(resolved) &&
           !resolved.includes("/node_modules/") &&
@@ -443,21 +485,25 @@ export function checkBoundaries(options: CheckBoundariesOptions = {}): {
         ) {
           violations.push({ rule: "prod-imports-test", file: rel, detail: spec });
         }
+
         if (testSeparationOnly) {
           continue;
         }
 
         const isTestingStore = resolved.includes("testing-store") || spec.includes("testing-store");
+
         if (isTestingStore) {
           for (const n of e.names) {
             aliasMap.set(n.local, n.original);
           }
+
           if (isOwner) {
             const runtimeCapability =
               !e.isTypeOnly &&
               (e.isNamespace || e.isDefault || e.kind === "dynamic" || e.kind === "require");
             const journalValue =
               e.kind === "import" ? e.names.find((n) => JOURNAL_VALUES.has(n.original)) : undefined;
+
             if (runtimeCapability || journalValue) {
               violations.push({
                 rule: "run-store-journal-reexport",
@@ -482,6 +528,7 @@ export function checkBoundaries(options: CheckBoundariesOptions = {}): {
                 detail: `${e.kind} import of testing-store in non-owner ${rel}`,
               });
             }
+
             for (const n of e.names) {
               if (n.original.includes("InTransaction") || PRIV.has(n.original)) {
                 violations.push({
@@ -502,6 +549,7 @@ export function checkBoundaries(options: CheckBoundariesOptions = {}): {
             spec === "zod" ||
             resolvedRel.startsWith("shared/") ||
             resolvedRel === "server/harness/testing-service.ts";
+
           if (!ok) {
             violations.push({ rule: "route-imports-testing-internals", file: rel, detail: spec });
           }
@@ -515,6 +563,7 @@ export function checkBoundaries(options: CheckBoundariesOptions = {}): {
       if (!testSeparationOnly && isOwner) {
         for (const local of fileInlines.get(f) || []) {
           const imported = aliasMap.get(local);
+
           if (imported || JOURNALS.has(local)) {
             violations.push({
               rule: "run-store-journal-reexport",
@@ -524,12 +573,14 @@ export function checkBoundaries(options: CheckBoundariesOptions = {}): {
           }
         }
       }
+
       graph.set(f, targets);
     }
 
     if (!testSeparationOnly) {
       for (const f of sourceFiles) {
         const rel = path.relative(rootDir, f).replace(/\\/g, "/");
+
         if (
           !rel.startsWith("shared/") &&
           !rel.endsWith("testing-domain.ts") &&
@@ -537,18 +588,24 @@ export function checkBoundaries(options: CheckBoundariesOptions = {}): {
         ) {
           continue;
         }
+
         const visited = new Set<string>();
         const queue = [f];
+
         while (queue.length > 0) {
           const curr = queue.shift()!;
+
           if (visited.has(curr)) {
             continue;
           }
+
           visited.add(curr);
+
           for (const target of graph.get(curr) || []) {
             if (isProhibitedDomain(target)) {
               violations.push({ rule: "domain-transitive-coupling", file: rel, detail: target });
             }
+
             if (fs.existsSync(target) && !visited.has(target)) {
               queue.push(target);
             }
@@ -556,6 +613,7 @@ export function checkBoundaries(options: CheckBoundariesOptions = {}): {
         }
       }
     }
+
     snapshot.dispose();
   } finally {
     api.close();
@@ -567,11 +625,14 @@ export function checkBoundaries(options: CheckBoundariesOptions = {}): {
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const testSeparationOnly = process.argv.includes("--test-separation-only");
   const res = checkBoundaries({ testSeparationOnly });
+
   if (!res.ok) {
     for (const v of res.violations) {
       console.error(`[boundary-violation] ${v.rule} in ${v.file}: ${v.detail}`);
     }
+
     process.exit(1);
   }
+
   console.log("Boundary check passed.");
 }

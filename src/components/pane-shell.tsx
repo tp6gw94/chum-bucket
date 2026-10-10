@@ -23,6 +23,7 @@ function ownTransform(key: string): WidthTransform | undefined {
   if (!Object.hasOwn(WIDTH_KEYS, key)) {
     return undefined;
   }
+
   return WIDTH_KEYS[key];
 }
 
@@ -47,6 +48,7 @@ export function PaneShell({
     if (!dragRef.current) {
       return;
     }
+
     const delta = event.clientX - dragRef.current.startX;
     setWidth(clampWidth(dragRef.current.startWidth + delta));
   }
@@ -59,9 +61,11 @@ export function PaneShell({
   function handleKeyDown(event: React.KeyboardEvent<HTMLDivElement>) {
     const step = event.shiftKey ? COARSE_KEYBOARD_STEP : KEYBOARD_STEP;
     const transform = ownTransform(event.key);
+
     if (!transform) {
       return;
     }
+
     event.preventDefault();
     setWidth((current) => transform(current, step));
   }

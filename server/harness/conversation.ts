@@ -11,6 +11,7 @@ export function readProjection(value: RunProjection | UIMessage[]): Conversation
   if (Array.isArray(value)) {
     return { display: value, context: value };
   }
+
   if (
     !value ||
     value.version !== 1 ||
@@ -19,6 +20,7 @@ export function readProjection(value: RunProjection | UIMessage[]): Conversation
   ) {
     throw new Error("Unsupported conversation projection");
   }
+
   return value;
 }
 
@@ -37,14 +39,17 @@ export function advanceConversation(
   );
   const displayIds = new Set(state.display.map((message) => message.id));
   const updates = new Map<string, UIMessage>();
+
   for (const message of context) {
     if (!previous.has(message.id) && displayIds.has(message.id)) {
       throw new Error("Generated message collides with archived history");
     }
+
     if (message.metadata?.fromSummary !== true) {
       updates.set(message.id, message);
     }
   }
+
   return {
     display: [
       ...state.display.map((message) => updates.get(message.id) ?? message),

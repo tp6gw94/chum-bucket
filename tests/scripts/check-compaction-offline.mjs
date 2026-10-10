@@ -21,7 +21,9 @@ const result = spawnSync(
     stdio: "inherit",
   },
 );
+
 if (result.error) {
   throw result.error;
 }
+
 process.exitCode = result.status ?? 1;

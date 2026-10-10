@@ -67,6 +67,7 @@ let migrationFolder: string | undefined;
 
 function hostFixture() {
   const runtime = hostTestingRuntime({ model: MODEL, build: BUILD });
+
   return {
     identity: runtime.fixture,
     adapterVersion: runtime.versions.adapter,
@@ -94,6 +95,7 @@ async function integrationMigrationsFolder() {
   if (migrationFolder) {
     return migrationFolder;
   }
+
   const source = path.resolve("drizzle");
   const journal = JSON.parse(await readFile(path.join(source, "meta/_journal.json"), "utf8")) as {
     version: string;
@@ -111,16 +113,19 @@ async function integrationMigrationsFolder() {
     .map((entry, idx) => ({ ...entry, idx }));
   migrationFolder = await mkdtemp(path.join(tmpdir(), "chum-testing-store-migrations-"));
   await mkdir(path.join(migrationFolder, "meta"));
+
   for (const entry of entries) {
     await copyFile(
       path.join(source, `${entry.tag}.sql`),
       path.join(migrationFolder, `${entry.tag}.sql`),
     );
   }
+
   await writeFile(
     path.join(migrationFolder, "meta/_journal.json"),
     JSON.stringify({ ...journal, entries }),
   );
+
   return migrationFolder;
 }
 
@@ -134,8 +139,10 @@ async function ensureDatabase() {
   if (!enabled) {
     throw new Error("missing testing database");
   }
+
   process.env.DATABASE_URL = enabled;
   const pool = new pg.Pool({ connectionString: enabled });
+
   try {
     await migrate(drizzle(pool), { migrationsFolder: await integrationMigrationsFolder() });
   } catch (error) {
@@ -153,9 +160,11 @@ async function createThread() {
     .insert(threadsTable)
     .values({ title: "新對話", messages: [] })
     .returning();
+
   if (!thread) {
     throw new Error("thread was not created");
   }
+
   return thread;
 }
 
@@ -195,6 +204,7 @@ async function linkSourceCapture(task: { taskId: string; attemptNonce: number })
     },
     bindings: { nativeName: "jira_get_issue", nativeOutputDigest: digest },
   });
+
   return capture;
 }
 
@@ -209,9 +219,11 @@ async function taskBudget(taskId: string) {
     })
     .from(testingTasksTable)
     .where(eq(testingTasksTable.id, taskId));
+
   if (!task) {
     throw new Error("testing task was not stored");
   }
+
   return task;
 }
 
@@ -225,6 +237,7 @@ async function countForThread(threadId: string) {
     .select({ count: sql<number>`count(*)::int` })
     .from(testingOperationsTable)
     .where(eq(testingOperationsTable.thread_id, threadId));
+
   return { runs: runs?.count ?? 0, operations: operations?.count ?? 0 };
 }
 
@@ -272,6 +285,7 @@ test(
           error.decisions.map((decision) => decision.kind === "rejected" && decision.reason),
           ["not_accessible", "not_accessible"],
         );
+
         return true;
       },
     );
@@ -606,6 +620,7 @@ test(
           error.decisions.some((decision) => decision.kind === "rejected"),
           true,
         );
+
         return true;
       },
     );
@@ -619,9 +634,11 @@ async function receiptIdFor(taskId: string) {
     select id from testing_receipts where task_id = ${taskId} and native_name = 'use_browser' order by id
   `);
   const id = rows.rows[0]?.id;
+
   if (!id) {
     throw new Error("browser receipt was not stored");
   }
+
   return id;
 }
 
@@ -764,6 +781,7 @@ test(
           ),
           true,
         );
+
         return true;
       },
     );
@@ -827,6 +845,7 @@ test(
       .innerJoin(testingArtifactsTable, eq(testingPinsTable.ref, testingArtifactsTable.ref))
       .where(eq(testingPinsTable.operation_id, admission.operationId));
     assert.equal(pins.length >= 2, true);
+
     for (const pin of pins) {
       const metadata = pin.metadata as {
         profiles?: { atlassian?: string };
@@ -837,6 +856,7 @@ test(
       assert.equal(typeof metadata.registration?.atlassian, "string");
       assert.equal(metadata.versions?.model, MODEL);
     }
+
     await closeTesting(admission.parentRunId, admission.operationId, "missing");
   },
 );

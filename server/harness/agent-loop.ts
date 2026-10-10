@@ -60,7 +60,7 @@ export type AgentSession = Readonly<{
   tools: RunTools;
 }>;
 
-export type ModelOutcome =
+type ModelOutcome =
   | { state: "done"; conversation: ConversationState; calls: ModelCall[] }
   | { state: "overflow"; error: string };
 
@@ -80,12 +80,12 @@ export type ChatCompaction = Readonly<{
   }) => Promise<ConversationState>;
 }>;
 
-export type BoundedCompaction = Readonly<{
+type BoundedCompaction = Readonly<{
   kind: "bounded";
   maxTurn: number;
 }>;
 
-export type AgentCompaction = ChatCompaction | BoundedCompaction;
+type AgentCompaction = ChatCompaction | BoundedCompaction;
 
 export type AgentOrchestration = (
   call: ModelCall,
@@ -96,7 +96,7 @@ export type AgentLoopResult =
   | { state: "limit"; conversation: ConversationState }
   | { state: "overflow"; conversation: ConversationState };
 
-export async function modelStep(
+async function modelStep(
   session: AgentSession,
   input: {
     conversation: ConversationState;
@@ -121,13 +121,16 @@ export async function modelStep(
     request: { signal: AbortSignal.any([signal, AbortSignal.timeout(MODEL_REQUEST_TIMEOUT_MS)]) },
   };
   let result: Awaited<ReturnType<typeof streamModelTurn>>;
+
   try {
     let stream: AsyncIterable<AdapterYieldChunk>;
+
     try {
       stream = await session.chatStream(options);
     } catch (error) {
       throwProviderError(error);
     }
+
     result = await streamModelTurn({
       messages: conversation.context,
       protectedMessages: conversation.display,
@@ -138,11 +141,14 @@ export async function modelStep(
     if (error instanceof ContextOverflowError) {
       return { state: "overflow", error: error.message };
     }
+
     throw error;
   }
+
   signal.throwIfAborted();
   const next = advanceConversation(conversation, result.messages);
   await session.emit(session.runId, snapshot(next.display), next);
+
   return { state: "done", conversation: next, calls: result.calls };
 }
 
@@ -158,9 +164,11 @@ export async function settleToolStep(
   const { conversation, call, output, error = false } = input;
   const messages = conversation.context;
   const content = JSON.stringify(output);
+
   if (typeof content !== "string") {
     throw new Error("Tool output is not JSON serializable");
   }
+
   const event: StreamChunk = {
     type: EventType.TOOL_CALL_RESULT,
     toolCallId: call.id,
@@ -179,10 +187,11 @@ export async function settleToolStep(
   );
   const updated = advanceConversation(conversation, next, owner?.id);
   await session.emit(session.runId, event, updated);
+
   return updated;
 }
 
-export async function executeToolStep(
+async function executeToolStep(
   session: AgentSession,
   input: { conversation: ConversationState; call: ModelCall; signal: AbortSignal },
 ): Promise<ConversationState> {
@@ -193,6 +202,7 @@ export async function executeToolStep(
   const events = createToolEventBuffer(call.id);
   let output: unknown;
   let error = false;
+
   try {
     const context = {
       toolCallId: call.id,
@@ -204,12 +214,14 @@ export async function executeToolStep(
     output = { error: failure instanceof Error ? failure.message.slice(0, 2000) : "Tool failed" };
     error = true;
   }
+
   signal.throwIfAborted();
   await drainToolEvents(events, (event) => session.emit(session.runId, event));
+
   return settleToolStep(session, { conversation, call, output, error });
 }
 
-export async function runAgentLoop(input: {
+type AgentLoopInput = {
   session: AgentSession;
   conversation: ConversationState;
   model: string;
@@ -218,68 +230,121 @@ export async function runAgentLoop(input: {
   checkpoint: AgentCheckpoint;
   signal: AbortSignal;
   orchestration?: AgentOrchestration;
-}): Promise<AgentLoopResult> {
-  const { session, model, prompt, compaction, checkpoint, signal } = input;
-  const maxTurn = compaction.kind === "bounded" ? compaction.maxTurn : MAIN_MAX_TURN;
-  let conversation = input.conversation;
-  let turn = 0;
-  while (turn < maxTurn) {
+};
+
+type CompletedModel = Extract<ModelOutcome, { state: "done" }>;
+
+function modelAttempt(input: AgentLoopInput, conversation: ConversationState, name: string) {
+  const { session, model, prompt, signal } = input;
+
+  return input.checkpoint({
+    name,
+    retry: MODEL_RETRY,
+    shouldRetry: () => !signal.aborted,
+    work: () => modelStep(session, { conversation, model, prompt, signal }),
+  });
+}
+
+function resetModel(input: AgentLoopInput, conversation: ConversationState, name: string) {
+  const { session } = input;
+
+  return input.checkpoint({
+    name,
+    work: () => session.emit(session.runId, snapshot(conversation.display), conversation),
+  });
+}
+
+async function recoverOverflow(
+  input: AgentLoopInput,
+  compaction: ChatCompaction,
+  conversation: ConversationState,
+  turn: number,
+): Promise<CompletedModel> {
+  await resetModel(input, conversation, `reset-model:${turn}:overflow`);
+  const compacted = await compaction.compact({ conversation, reason: "overflow", turn });
+  const result = await modelAttempt(input, compacted, `model-overflow:${turn}`);
+
+  if (result.state === "overflow") {
+    await resetModel(input, compacted, `reset-model:${turn}:exhausted`);
+    throw new ContextOverflowError();
+  }
+
+  return result;
+}
+
+async function toolTurn(
+  input: AgentLoopInput,
+  initial: ConversationState,
+  calls: readonly ModelCall[],
+  turn: number,
+): Promise<ConversationState> {
+  const { session, signal } = input;
+  let conversation = initial;
+
+  for (const [index, call] of calls.entries()) {
     signal.throwIfAborted();
     await session.assertExecution();
+    const orchestrated = input.orchestration ? await input.orchestration(call) : undefined;
+    conversation = await input.checkpoint({
+      name: `tool:${turn}:${index}`,
+      work: () =>
+        orchestrated?.state === "handled"
+          ? settleToolStep(session, {
+              conversation,
+              call,
+              output: orchestrated.output,
+              error: orchestrated.error ?? false,
+            })
+          : executeToolStep(session, { conversation, call, signal }),
+    });
+  }
+
+  return conversation;
+}
+
+async function completedModel(
+  input: AgentLoopInput,
+  attempt: ModelOutcome,
+  conversation: ConversationState,
+  turn: number,
+): Promise<CompletedModel | null> {
+  if (attempt.state === "done") {
+    return attempt;
+  }
+
+  return input.compaction.kind === "bounded"
+    ? null
+    : recoverOverflow(input, input.compaction, conversation, turn);
+}
+
+export async function runAgentLoop(input: AgentLoopInput): Promise<AgentLoopResult> {
+  const { session, compaction, signal } = input;
+  const maxTurn = compaction.kind === "bounded" ? compaction.maxTurn : MAIN_MAX_TURN;
+  let conversation = input.conversation;
+
+  for (let turn = 0; turn < maxTurn; turn++) {
+    signal.throwIfAborted();
+    await session.assertExecution();
+
     if (compaction.kind === "chat") {
       conversation = await compaction.compact({ conversation, reason: "threshold", turn });
     }
-    let result = await checkpoint({
-      name: `model:${turn}`,
-      retry: MODEL_RETRY,
-      shouldRetry: () => !signal.aborted,
-      work: () => modelStep(session, { conversation, model, prompt, signal }),
-    });
-    if (result.state === "overflow") {
-      if (compaction.kind === "bounded") {
-        return { state: "overflow", conversation };
-      }
-      await checkpoint({
-        name: `reset-model:${turn}:overflow`,
-        work: () => session.emit(session.runId, snapshot(conversation.display), conversation),
-      });
-      conversation = await compaction.compact({ conversation, reason: "overflow", turn });
-      result = await checkpoint({
-        name: `model-overflow:${turn}`,
-        retry: MODEL_RETRY,
-        shouldRetry: () => !signal.aborted,
-        work: () => modelStep(session, { conversation, model, prompt, signal }),
-      });
-      if (result.state === "overflow") {
-        await checkpoint({
-          name: `reset-model:${turn}:exhausted`,
-          work: () => session.emit(session.runId, snapshot(conversation.display), conversation),
-        });
-        throw new ContextOverflowError();
-      }
+
+    const attempt = await modelAttempt(input, conversation, `model:${turn}`);
+    const result = await completedModel(input, attempt, conversation, turn);
+
+    if (!result) {
+      return { state: "overflow", conversation };
     }
+
     conversation = result.conversation;
+
     if (!result.calls.length) {
       return { state: "done", conversation };
     }
-    for (const [index, call] of result.calls.entries()) {
-      signal.throwIfAborted();
-      await session.assertExecution();
-      const orchestrated = input.orchestration ? await input.orchestration(call) : undefined;
-      conversation = await checkpoint({
-        name: `tool:${turn}:${index}`,
-        work: () =>
-          orchestrated?.state === "handled"
-            ? settleToolStep(session, {
-                conversation,
-                call,
-                output: orchestrated.output,
-                error: orchestrated.error ?? false,
-              })
-            : executeToolStep(session, { conversation, call, signal }),
-      });
-    }
-    turn++;
+
+    conversation = await toolTurn(input, conversation, result.calls, turn);
   }
+
   return { state: "limit", conversation };
 }

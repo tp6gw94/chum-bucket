@@ -4,9 +4,11 @@ type Oklch = { l: number; c: number; h: number; a: number };
 
 const parse = (value: string): Oklch => {
   const m = value.match(/^oklch\(\s*([\d.]+)\s+([\d.]+)\s+([\d.]+)(?:\s*\/\s*([\d.]+))?\s*\)$/);
+
   if (!m) {
     throw new Error(`not an oklch() value: ${value}`);
   }
+
   return { l: +m[1], c: +m[2], h: +m[3], a: m[4] === undefined ? 1 : +m[4] };
 };
 
@@ -20,6 +22,7 @@ const luminance = (value: string): number => {
   const sp = l - 0.0894841775 * a - 1.291485548 * b;
   const [L, M, S] = [lp ** 3, mp ** 3, sp ** 3];
   const clamp = (x: number) => Math.min(1, Math.max(0, x));
+
   return (
     0.2126 * clamp(4.0767416621 * L - 3.3077115913 * M + 0.2309699292 * S) +
     0.7152 * clamp(-1.2684380046 * L + 2.6097574011 * M - 0.3413193965 * S) +
@@ -30,6 +33,7 @@ const luminance = (value: string): number => {
 const flatten = (value: string, surface: string): string => {
   const f = parse(value);
   const b = parse(surface);
+
   return `oklch(${f.l * f.a + b.l * (1 - f.a)} ${f.c * f.a + b.c * (1 - f.a)} ${f.h})`;
 };
 
@@ -37,6 +41,7 @@ const contrast = (fg: string, bg: string): number => {
   const surface = flatten(bg, "oklch(0 0 0)");
   const front = flatten(fg, surface);
   const [a, b] = [luminance(front), luminance(surface)];
+
   return (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
 };
 
@@ -46,9 +51,11 @@ const failures: string[] = [];
 const check = (label: string, fg: string, bg: string) => {
   const ratio = contrast(fg, bg);
   const pass = ratio >= AA;
+
   if (!pass) {
     failures.push(`${label}: ${ratio.toFixed(2)}:1 (need ${AA})`);
   }
+
   console.log(`${pass ? "ok  " : "FAIL"} ${label.padEnd(34)} ${ratio.toFixed(2)}:1`);
 };
 
@@ -68,9 +75,12 @@ for (const [mode, t] of [
 
 if (failures.length > 0) {
   console.error(`\n${failures.length} contrast failure(s):`);
+
   for (const f of failures) {
     console.error(`  ${f}`);
   }
+
   process.exit(1);
 }
+
 console.log("\nall pairs meet WCAG AA");

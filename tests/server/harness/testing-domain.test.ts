@@ -31,6 +31,7 @@ function accept<T>(validation: Validation<T>): T {
   if (validation.kind !== "accepted") {
     throw new Error(`setup failed: ${validation.issues.join(", ")}`);
   }
+
   return validation.value;
 }
 
@@ -476,9 +477,11 @@ test("selected plans retain the frozen universe but cover only selected criteria
     context,
   );
   assert.equal(selected.kind, "accepted");
+
   if (selected.kind === "accepted") {
     assert.deepEqual(selected.value.assignments, { ac: ["check-1"], ui: [] });
   }
+
   const nonselected = canonicalizePlan(
     {
       cases: [
@@ -1241,6 +1244,7 @@ test("terminal cancellation, timeout, missing and incompatibility facts block ac
     { outcome: "missing", expectedReason: "role_ac_missing" },
     { outcome: "incompatible", expectedReason: "role_ac_incompatible" },
   ] as const;
+
   for (const item of cases) {
     const report = deriveReport({
       runId: runOne,

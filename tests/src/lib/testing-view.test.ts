@@ -76,6 +76,7 @@ test("role rows project in the fixed atlassian, planner, ac, ui order", () => {
     projected.map(([role]) => role),
     [...ROLE_ORDER],
   );
+
   for (const [role, row] of projected) {
     assert.equal(row, card.rows[role]);
   }

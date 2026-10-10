@@ -141,42 +141,52 @@ export function mcpFixture(options: FixtureOptions = {}) {
     rule.method === message.method &&
     (!rule.name || rule.name === message.params?.name) &&
     argumentsMatch(rule, message);
+
   const matchingRule = (message: McpRequest["message"]): [number, FixtureRule] | undefined => {
     const rules = options.rules ?? [];
     const index = rules.findIndex(
       (rule, index) => !usedRules.has(index) && ruleMatches(rule, message),
     );
+
     if (index < 0) {
       return undefined;
     }
+
     return [index, rules[index]!];
   };
+
   const trackRequest = (record: McpRequest, res: ServerResponse) => {
     records.push(record);
     pending++;
     let settled = false;
+
     const settle = () => {
       if (!settled) {
         settled = true;
         pending--;
       }
     };
+
     res.on("close", () => {
       if (!settled) {
         record.aborted = true;
         settle();
       }
     });
+
     return settle;
   };
+
   const listToolsResult = (message: McpRequest["message"]) => {
     const pages = options.pages ?? [allTools.slice(0, 2), allTools.slice(2)];
     const page = Number(message.params?.cursor ?? 0);
+
     return {
       tools: pages[page],
       ...(page + 1 < pages.length ? { nextCursor: String(page + 1) } : {}),
     };
   };
+
   const toolsCallResult = (message: McpRequest["message"]) => {
     if (message.params?.name === "jira_get_issue") {
       return {
@@ -184,8 +194,10 @@ export function mcpFixture(options: FixtureOptions = {}) {
         structuredContent: { issue: message.params.arguments?.issue_key },
       };
     }
+
     return { content: [{ type: "text", text: "Native tool result" }] };
   };
+
   const rpcResults = new Map<string, (message: McpRequest["message"]) => unknown>([
     [
       "initialize",
@@ -198,36 +210,48 @@ export function mcpFixture(options: FixtureOptions = {}) {
     ["tools/list", listToolsResult],
     ["tools/call", toolsCallResult],
   ]);
+
   const applyMatchedRule = (
     message: McpRequest["message"],
     res: ServerResponse,
     settle: () => void,
   ) => {
     const match = matchingRule(message);
+
     if (!match) {
       return false;
     }
+
     const [index, rule] = match;
+
     if (rule.once) {
       usedRules.add(index);
     }
+
     if (rule.hang) {
       return true;
     }
+
     if (rule.destroy) {
       res.destroy();
+
       return true;
     }
+
     if (rule.error) {
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ jsonrpc: "2.0", id: message.id, error: rule.error }));
       settle();
+
       return true;
     }
+
     finish(res, message, rule.result);
     settle();
+
     return true;
   };
+
   const handleGet = (req: IncomingMessage, res: ServerResponse) => {
     const stream: McpRequest = {
       session: String(req.headers["mcp-session-id"] ?? ""),
@@ -238,11 +262,14 @@ export function mcpFixture(options: FixtureOptions = {}) {
     trackRequest(stream, res);
     res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
   };
+
   const handlePost = async (req: IncomingMessage, res: ServerResponse) => {
     const chunks: Buffer[] = [];
+
     for await (const chunk of req) {
       chunks.push(chunk as Buffer);
     }
+
     const message = JSON.parse(Buffer.concat(chunks).toString("utf8")) as McpRequest["message"];
     const record: McpRequest = {
       session: String(req.headers["mcp-session-id"] ?? ""),
@@ -251,42 +278,55 @@ export function mcpFixture(options: FixtureOptions = {}) {
       aborted: false,
     };
     const settle = trackRequest(record, res);
+
     for (const waiter of waiters.filter((waiter) => waiter.method === message.method)) {
       waiter.resolve();
     }
+
     waiters = waiters.filter((waiter) => waiter.method !== message.method);
+
     if (message.id === undefined) {
       res.writeHead(202).end();
       settle();
+
       return;
     }
+
     if (message.method === "initialize") {
       const session = randomUUID();
       sessions.push(session);
       res.setHeader("mcp-session-id", session);
     }
+
     if (applyMatchedRule(message, res, settle)) {
       return;
     }
+
     const result = rpcResults.get(message.method)?.(message) ?? {};
     finish(res, message, result);
     settle();
   };
+
   const handle = async (req: IncomingMessage, res: ServerResponse) => {
     if (req.method === "GET") {
       handleGet(req, res);
+
       return;
     }
+
     if (req.method !== "POST") {
       res.writeHead(404).end();
+
       return;
     }
+
     await handlePost(req, res);
   };
 
   return {
     get url() {
       assert.ok(url, "Fixture is not started");
+
       return url;
     },
     get requests() {
@@ -313,16 +353,19 @@ export function mcpFixture(options: FixtureOptions = {}) {
       pending = 0;
       usedRules.clear();
       waiters = [];
+
       return url;
     },
     async stop() {
       const active = server;
       server = undefined;
       url = undefined;
+
       if (active) {
         active.closeAllConnections();
         await new Promise<void>((resolve) => active.close(() => resolve()));
       }
+
       pending = 0;
       waiters = [];
     },
@@ -330,6 +373,7 @@ export function mcpFixture(options: FixtureOptions = {}) {
       if (records.some((record) => record.message.method === method)) {
         return;
       }
+
       await new Promise<void>((resolve) => waiters.push({ method, resolve }));
     },
     async assertClosed() {
@@ -337,8 +381,10 @@ export function mcpFixture(options: FixtureOptions = {}) {
         if (pending === 0) {
           return;
         }
+
         await delay(10);
       }
+
       assert.fail("Fixture still has open MCP requests");
     },
   };
@@ -374,6 +420,7 @@ export async function withMcpEnvironment<T>(
   process.env.JIRA_API_TOKEN = configured ? fakeToken : "";
   process.env.ATLASSIAN_MCP_URL = configured ? url : "";
   delete process.env.UV_PYTHON;
+
   try {
     return await use();
   } finally {
@@ -384,6 +431,7 @@ export async function withMcpEnvironment<T>(
         process.env[key] = value;
       }
     }
+
     try {
       await fixture.assertClosed();
     } finally {

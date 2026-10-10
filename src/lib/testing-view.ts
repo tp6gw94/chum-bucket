@@ -10,9 +10,11 @@ export function mergeTestView(current: TestView | null, incoming: TestView): Tes
   if (!current || current.runId !== incoming.runId) {
     return incoming;
   }
+
   if (current.state === "finished") {
     return current;
   }
+
   return incoming.progress.version > current.progress.version ? incoming : current;
 }
 
@@ -36,6 +38,7 @@ export function beginCancelRequest(
   if (tracker && tracker.generation >= generation) {
     return tracker;
   }
+
   return { runId, generation, request: { status: "requesting" } };
 }
 
@@ -48,6 +51,7 @@ export function settleCancelRequest(
   if (!tracker || tracker.runId !== runId || tracker.generation !== generation) {
     return tracker;
   }
+
   return { ...tracker, request };
 }
 

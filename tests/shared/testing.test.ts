@@ -104,9 +104,11 @@ test("unknown, empty and malformed request fields are rejected", () => {
     { ...base, targetUrl: "not-a-url" },
     { ...base, goal: "   " },
   ];
+
   for (const input of cases) {
     assert.equal(testingRequestInputSchema.safeParse(input).success, false);
   }
+
   assert.equal(testingRequestSchema.safeParse(base).success, false);
   assert.equal(
     testingRequestSchema.safeParse({

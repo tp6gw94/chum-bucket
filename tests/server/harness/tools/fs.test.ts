@@ -17,6 +17,7 @@ const context = {
 async function temporaryDirectory(t: TestContext) {
   const directory = await mkdtemp(join(tmpdir(), "chum-bucket-fs-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
+
   return directory;
 }
 
@@ -94,6 +95,7 @@ test("edit rejects invalid, ambiguous, overlapping, and partially unmatched edit
   const path = join(directory, "unchanged.txt");
   const original = "alpha\nrepeat\nrepeat\nomega\n";
   await writeFile(path, original);
+
   for (const { edits, error } of [
     { edits: [], error: /at least one replacement/ },
     { edits: [{ oldText: "", newText: "insert" }], error: /must not be empty/ },
@@ -136,6 +138,7 @@ test("filesystem input validation rejects malformed calls before any write", asy
   const path = join(directory, "existing.txt");
   const newPath = join(directory, "uncreated", "new.txt");
   await writeFile(path, "unchanged");
+
   for (const input of [
     null,
     [],
@@ -149,6 +152,7 @@ test("filesystem input validation rejects malformed calls before any write", asy
     await assert.rejects(async () => write.execute!(input, context), z.ZodError);
     assert.equal(await readFile(path, "utf8"), "unchanged");
   }
+
   for (const input of [
     null,
     {},
@@ -162,9 +166,11 @@ test("filesystem input validation rejects malformed calls before any write", asy
     await assert.rejects(async () => edit.execute!(input, context), z.ZodError);
     assert.equal(await readFile(path, "utf8"), "unchanged");
   }
+
   for (const input of [{ path: 1 }, { path, offset: "2" }, { path, limit: null }]) {
     await assert.rejects(async () => read.execute!(input, context), z.ZodError);
   }
+
   await assert.rejects(access(dirname(newPath)), { code: "ENOENT" });
 });
 
@@ -181,6 +187,7 @@ test("filesystem tools forward cancellation and leave files and directories unch
     (error) => {
       assert.equal(error, controller.signal.reason);
       assert.equal((error as DOMException).name, "AbortError");
+
       return true;
     },
   );

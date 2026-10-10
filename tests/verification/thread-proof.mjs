@@ -16,11 +16,14 @@ export async function verifyThreads({ taskSpace, evidenceDir, existingSpaceId })
   const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   const editable = 'loc=css:section[aria-label="主對話"] [role="textbox"][contenteditable="true"]';
   const threadId = async () => new URL(await page.url()).searchParams.get("threadId");
+
   const get = async (path) => {
     const response = await page.fetch(path);
     assert.equal(response.status, 200);
+
     return typeof response.body === "string" ? JSON.parse(response.body) : response.body;
   };
+
   async function capture(name) {
     await writeFile(
       resolve(directory, `${name}.aria.txt`),
@@ -28,6 +31,7 @@ export async function verifyThreads({ taskSpace, evidenceDir, existingSpaceId })
     );
     await page.screenshot({ path: resolve(directory, `${name}.png`) });
   }
+
   async function step(id, command, act, verify) {
     await appendFile(
       resolve(directory, "actions.jsonl"),
@@ -42,6 +46,7 @@ export async function verifyThreads({ taskSpace, evidenceDir, existingSpaceId })
         "\n",
     );
   }
+
   async function ready() {
     await page.waitForSelector(editable, { state: "visible", timeout: 20_000 });
     assert(uuid.test(await threadId()));
@@ -52,6 +57,7 @@ export async function verifyThreads({ taskSpace, evidenceDir, existingSpaceId })
       true,
     );
   }
+
   async function persisted(id, count) {
     const detail = await get(`/api/thread/${id}`);
     assert.equal(detail.id, id);
@@ -60,6 +66,7 @@ export async function verifyThreads({ taskSpace, evidenceDir, existingSpaceId })
     assert.equal((await get("/api/thread")).length, count);
     await writeFile(resolve(directory, `thread-${count}.json`), JSON.stringify(detail, null, 2));
   }
+
   try {
     await page.goto(state.origin);
     await page.waitForSelector("loc=role:button[name='建立新對話']", { state: "visible" });

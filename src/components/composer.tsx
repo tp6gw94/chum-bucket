@@ -1,6 +1,13 @@
-import { useEffect, useRef, useState } from "react";
+import {
+  useEffect,
+  useRef,
+  useState,
+  type Dispatch,
+  type RefObject,
+  type SetStateAction,
+} from "react";
 import { useFormStatus } from "react-dom";
-import { EditorContent, useEditor } from "@tiptap/react";
+import { EditorContent, useEditor, type Editor } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
 import { SendIcon } from "lucide-react";
 import { cn } from "cn";
@@ -48,6 +55,7 @@ function errorAria(
   if (!error) {
     return {};
   }
+
   return {
     "aria-invalid": "true",
     "aria-describedby": errorId,
@@ -79,9 +87,11 @@ function handleCommandKeyDown(
     composing,
     hasSuggestions: current.suggestions.length > 0,
   });
+
   if (action === "none") {
     return false;
   }
+
   event.preventDefault();
   const move = (offset: number) =>
     control.move(
@@ -98,6 +108,7 @@ function handleCommandKeyDown(
     submit: () => control.form?.requestSubmit(),
   };
   handlers[action]();
+
   return true;
 }
 
@@ -120,6 +131,7 @@ function commandAria(
   if (suggestions.length === 0) {
     return {};
   }
+
   return {
     "aria-controls": listId,
     "aria-haspopup": "listbox",
@@ -141,14 +153,19 @@ async function submitComposerText(
   if (!control.send || !value.trim() || control.disabled || control.busy) {
     return;
   }
+
   control.error(null);
   control.dismiss();
+
   try {
     const result = await control.send(value.trim());
+
     if (result === "succeeded") {
       control.clear();
+
       return;
     }
+
     control.error(SEND_ERROR[result]);
   } catch (cause) {
     control.error(thrownMessage(cause, "送出失敗，請稍後再試"));
@@ -169,6 +186,7 @@ function CommandMenu({
   if (suggestions.length === 0) {
     return null;
   }
+
   return (
     <Card size="sm" className="absolute bottom-full mb-2 w-full">
       <CardHeader>
@@ -203,6 +221,7 @@ function ComposerError({ message, id }: { message: string | null; id: string }) 
   if (!message) {
     return null;
   }
+
   return (
     <p id={id} role="alert" className="text-xs text-destructive">
       {message}
@@ -214,6 +233,7 @@ function ComposerPlaceholder({ visible, placeholder }: { visible: boolean; place
   if (!visible) {
     return null;
   }
+
   return (
     <span
       aria-hidden="true"
@@ -224,6 +244,109 @@ function ComposerPlaceholder({ visible, placeholder }: { visible: boolean; place
   );
 }
 
+type Caret = { cursor: number; selected: boolean };
+
+function caretOf(editor: Editor): Caret {
+  return {
+    cursor: editor.state.doc.textBetween(0, editor.state.selection.from, "\n").length,
+    selected: !editor.state.selection.empty,
+  };
+}
+
+function useComposerEditor(options: {
+  disabled: boolean;
+  attributes: Record<string, string>;
+  interaction: RefObject<CommandInteraction>;
+  formRef: RefObject<HTMLFormElement | null>;
+  setComposing(composing: boolean): void;
+  setDismissed(dismissed: boolean): void;
+  setActiveIndex: Dispatch<SetStateAction<number>>;
+  setText(text: string): void;
+  setSelection(caret: Caret): void;
+  setFocused(focused: boolean): void;
+}) {
+  const { disabled } = options;
+  const editor = useEditor({
+    extensions: [StarterKit.configure({ link: false })],
+    content: "",
+    editable: !disabled,
+    editorProps: {
+      attributes: options.attributes,
+      handleDOMEvents: {
+        compositionstart: () => {
+          options.setComposing(true);
+
+          return false;
+        },
+        compositionend: () => {
+          options.setComposing(false);
+
+          return false;
+        },
+      },
+      handleKeyDown: (view, event) =>
+        handleCommandKeyDown(view.composing, event, {
+          interaction: options.interaction.current,
+          form: options.formRef.current,
+          dismiss: () => options.setDismissed(true),
+          move: options.setActiveIndex,
+        }),
+    },
+    onUpdate: ({ editor: current }) => {
+      options.setText(current.getText({ blockSeparator: "\n" }));
+      options.setSelection(caretOf(current));
+      options.setDismissed(false);
+      options.setActiveIndex(0);
+    },
+    onSelectionUpdate: ({ editor: current }) => {
+      options.setSelection(caretOf(current));
+    },
+    onFocus: () => options.setFocused(true),
+    onBlur: () => options.setFocused(false),
+  });
+
+  useEffect(() => {
+    editor.setEditable(!disabled);
+    editor.view.dom.toggleAttribute("data-disabled", disabled);
+  }, [editor, disabled]);
+
+  return editor;
+}
+
+function useComposerFields() {
+  const [text, setText] = useState("");
+  const [focused, setFocused] = useState(false);
+  const [composing, setComposing] = useState(false);
+  const [dismissed, setDismissed] = useState(false);
+  const [selection, setSelection] = useState<Caret>({ cursor: 0, selected: false });
+  const [activeIndex, setActiveIndex] = useState(0);
+
+  return {
+    text,
+    setText,
+    focused,
+    setFocused,
+    composing,
+    setComposing,
+    dismissed,
+    setDismissed,
+    selection,
+    setSelection,
+    activeIndex,
+    setActiveIndex,
+  };
+}
+
+type ComposerProps = Readonly<{
+  label: string;
+  placeholder: string;
+  hint: string;
+  onSend?: (text: string) => Promise<SendResult>;
+  disabled?: boolean;
+  busy?: boolean;
+  className?: string;
+}>;
+
 export function Composer({
   label,
   placeholder,
@@ -232,90 +355,40 @@ export function Composer({
   disabled = false,
   busy = false,
   className,
-}: {
-  label: string;
-  placeholder: string;
-  hint: string;
-  onSend?: (text: string) => Promise<SendResult>;
-  disabled?: boolean;
-  busy?: boolean;
-  className?: string;
-}) {
-  const [text, setText] = useState("");
+}: ComposerProps) {
   const [error, setError] = useState<string | null>(null);
   const formRef = useRef<HTMLFormElement>(null);
-  const [focused, setFocused] = useState(false);
-  const [composing, setComposing] = useState(false);
-  const [dismissed, setDismissed] = useState(false);
-  const [selection, setSelection] = useState({ cursor: 0, selected: false });
-  const [activeIndex, setActiveIndex] = useState(0);
+  const fields = useComposerFields();
+  const { text, activeIndex, setDismissed } = fields;
   const suggestions = commandSuggestions({
     text,
-    ...selection,
-    focused: focused && composerAvailable(disabled, busy, Boolean(onSend)),
-    composing,
-    dismissed,
+    ...fields.selection,
+    focused: fields.focused && composerAvailable(disabled, busy, Boolean(onSend)),
+    composing: fields.composing,
+    dismissed: fields.dismissed,
   });
   const listId = `${label}-commands`;
-  const interaction = useRef({ suggestions, activeIndex, submitText: async (_text: string) => {} });
-
+  const interaction = useRef<CommandInteraction>({
+    suggestions,
+    activeIndex,
+    submitText: async (_text: string) => {},
+  });
   const canSubmit = composerCanSubmit(text, disabled, busy, Boolean(onSend));
   const errorId = `${label}-error`;
-
-  const editor = useEditor({
-    extensions: [StarterKit.configure({ link: false })],
-    content: "",
-    editable: !disabled,
-    editorProps: {
-      attributes: {
-        class: EDITOR_CLASS,
-        role: "textbox",
-        "aria-multiline": "true",
-        "aria-label": label,
-        ...errorAria(error, errorId),
-        ...commandAria(suggestions, activeIndex, listId),
-      },
-      handleDOMEvents: {
-        compositionstart: () => {
-          setComposing(true);
-          return false;
-        },
-        compositionend: () => {
-          setComposing(false);
-          return false;
-        },
-      },
-      handleKeyDown: (view, event) =>
-        handleCommandKeyDown(view.composing, event, {
-          interaction: interaction.current,
-          form: formRef.current,
-          dismiss: () => setDismissed(true),
-          move: setActiveIndex,
-        }),
+  const editor = useComposerEditor({
+    disabled,
+    attributes: {
+      class: EDITOR_CLASS,
+      role: "textbox",
+      "aria-multiline": "true",
+      "aria-label": label,
+      ...errorAria(error, errorId),
+      ...commandAria(suggestions, activeIndex, listId),
     },
-    onUpdate: ({ editor }) => {
-      setText(editor.getText({ blockSeparator: "\n" }));
-      setSelection({
-        cursor: editor.state.doc.textBetween(0, editor.state.selection.from, "\n").length,
-        selected: !editor.state.selection.empty,
-      });
-      setDismissed(false);
-      setActiveIndex(0);
-    },
-    onSelectionUpdate: ({ editor }) => {
-      setSelection({
-        cursor: editor.state.doc.textBetween(0, editor.state.selection.from, "\n").length,
-        selected: !editor.state.selection.empty,
-      });
-    },
-    onFocus: () => setFocused(true),
-    onBlur: () => setFocused(false),
+    interaction,
+    formRef,
+    ...fields,
   });
-
-  useEffect(() => {
-    editor.setEditable(!disabled);
-    editor.view.dom.toggleAttribute("data-disabled", disabled);
-  }, [editor, disabled]);
 
   const submitText = (value: string) =>
     submitComposerText(value, {

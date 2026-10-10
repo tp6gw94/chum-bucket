@@ -49,11 +49,10 @@ import {
   prepareStandaloneClosure,
   publishProjectionInTransaction,
   readTestingExecutionInTransaction,
-  readPublishedTesting as readPublishedTestingRow,
-  readPublishedThreadViews as readPublishedThreadViewsRow,
+  readPublishedTestingRow,
+  readPublishedThreadViewsRow,
   readPublishedThreadViewsInTransaction,
   selectTestingCancellation,
-  readTestingAdmissionInTransaction,
   recordRoleFailureInTransaction,
   reserveRoleTasksInTransaction,
   testingFinishOutcome,
@@ -120,9 +119,11 @@ async function lockRun(tx: Transaction, id: string): Promise<{ run: RunRow; thre
     .select({ thread_id: chatRunsTable.thread_id })
     .from(chatRunsTable)
     .where(eq(chatRunsTable.id, id));
+
   if (!found) {
     throw new RunRequestError(404, "Unknown run");
   }
+
   const side = await lockSide(tx, found.thread_id);
   const [thread] = await tx
     .select()
@@ -130,12 +131,15 @@ async function lockRun(tx: Transaction, id: string): Promise<{ run: RunRow; thre
     .where(eq(threadsTable.id, found.thread_id))
     .for("update");
   const [run] = await tx.select().from(chatRunsTable).where(eq(chatRunsTable.id, id)).for("update");
+
   if (side) {
     assertSideOpen(side, { scope: run?.accepted.side?.scope ?? "" });
+
     if (run?.accepted.side?.epoch !== side.epoch) {
       throw new RunRequestError(409, "Side chat execution expired");
     }
   }
+
   return { run: run!, thread: thread! };
 }
 
@@ -149,6 +153,7 @@ async function appendEvent(tx: Transaction, run: RunRow, key: string, event: Str
   if (run.state !== "pending") {
     throw new Error("Run is terminal");
   }
+
   const bytes = Buffer.byteLength(JSON.stringify(event));
   await tx.insert(chatEventsTable).values({
     run_id: run.id,
@@ -167,14 +172,17 @@ async function appendEvent(tx: Transaction, run: RunRow, key: string, event: Str
   run.log_bytes += bytes;
 }
 
-async function committedModelContext(tx: Transaction, thread: ThreadRow): Promise<UIMessage[]> {
-  if (thread.revision === 0 && thread.parent_thread_id) {
-    const [side] = await tx.select().from(sideChatsTable).where(eq(sideChatsTable.id, thread.id));
-    if (!side?.seed || !isDeepStrictEqual(side.seed.display, thread.messages)) {
-      throw new RunRequestError(409, "Invalid side chat seed anchor");
-    }
-    return side.seed.context;
+async function sideSeedContext(tx: Transaction, thread: ThreadRow): Promise<UIMessage[]> {
+  const [side] = await tx.select().from(sideChatsTable).where(eq(sideChatsTable.id, thread.id));
+
+  if (!side?.seed || !isDeepStrictEqual(side.seed.display, thread.messages)) {
+    throw new RunRequestError(409, "Invalid side chat seed anchor");
   }
+
+  return side.seed.context;
+}
+
+async function contextAnchors(tx: Transaction, thread: ThreadRow): Promise<RunRow[]> {
   const marked = await tx
     .select()
     .from(chatRunsTable)
@@ -184,71 +192,169 @@ async function committedModelContext(tx: Transaction, thread: ThreadRow): Promis
         sql`${chatRunsTable.projection}->>'committedRevision' = ${String(thread.revision)}`,
       ),
     );
-  const anchors = marked.length
-    ? marked
-    : await tx
-        .select()
-        .from(chatRunsTable)
-        .where(
-          and(
-            eq(chatRunsTable.thread_id, thread.id),
-            eq(chatRunsTable.state, "succeeded"),
-            sql`${chatRunsTable.request}->>'baseRevision' = ${String(thread.revision - 1)}`,
-          ),
-        );
-  if (anchors.length > 1) {
-    throw new RunRequestError(409, "Ambiguous conversation context anchor");
+
+  if (marked.length) {
+    return marked;
   }
-  const anchor = anchors[0];
-  if (!anchor || Array.isArray(anchor.projection)) {
-    if (thread.messages.some((message) => message.metadata?.fromSummary === true)) {
-      throw new RunRequestError(409, "Archived summaries require a conversation context anchor");
-    }
-    return thread.messages;
+
+  return tx
+    .select()
+    .from(chatRunsTable)
+    .where(
+      and(
+        eq(chatRunsTable.thread_id, thread.id),
+        eq(chatRunsTable.state, "succeeded"),
+        sql`${chatRunsTable.request}->>'baseRevision' = ${String(thread.revision - 1)}`,
+      ),
+    );
+}
+
+function unanchoredContext(thread: ThreadRow): UIMessage[] {
+  if (thread.messages.some((message) => message.metadata?.fromSummary === true)) {
+    throw new RunRequestError(409, "Archived summaries require a conversation context anchor");
   }
+
+  return thread.messages;
+}
+
+function anchoredContext(anchor: RunRow, thread: ThreadRow): UIMessage[] {
   if (anchor.state === "pending" || anchor.request.baseRevision !== thread.revision - 1) {
     throw new RunRequestError(409, "Invalid conversation context anchor");
   }
+
   const prior = readProjection(anchor.projection);
+
   if (!isDeepStrictEqual(prior.display, thread.messages)) {
     throw new RunRequestError(409, "Conversation context anchor does not match saved history");
   }
+
   return prior.context;
+}
+
+async function committedModelContext(tx: Transaction, thread: ThreadRow): Promise<UIMessage[]> {
+  if (thread.revision === 0 && thread.parent_thread_id) {
+    return sideSeedContext(tx, thread);
+  }
+
+  const anchors = await contextAnchors(tx, thread);
+
+  if (anchors.length > 1) {
+    throw new RunRequestError(409, "Ambiguous conversation context anchor");
+  }
+
+  const [anchor] = anchors;
+
+  return !anchor || Array.isArray(anchor.projection)
+    ? unanchoredContext(thread)
+    : anchoredContext(anchor, thread);
 }
 
 export async function persistRun(value: RunInput, access?: SideAccess) {
   const parsed = runInputSchema.safeParse(value);
+
   if (!parsed.success) {
     throw new RunRequestError(400, "Invalid run input");
   }
+
   const input = parsed.data;
   const db = await database();
   const accepted = await db.transaction(async (tx) => {
     const side = await lockSide(tx, input.threadId);
+
     if (side) {
       assertSideOpen(side, access);
     }
+
     const [thread] = await tx
       .select()
       .from(threadsTable)
       .where(eq(threadsTable.id, input.threadId))
       .for("update");
+
     if (!thread) {
       throw new RunRequestError(404, "Unknown thread");
     }
+
     const [existing] = await tx
       .select()
       .from(chatRunsTable)
       .where(eq(chatRunsTable.id, input.runId));
+
     if (existing) {
       if (!isDeepStrictEqual(runInputSchema.parse(existing.request), input)) {
         throw new RunRequestError(409, "Run input collision");
       }
+
       return { run: existing.accepted, pending: existing.state === "pending" };
     }
+
     return acceptInTransaction(tx, thread, input, side);
   });
+
   return accepted;
+}
+
+function chatAdditions(
+  input: z.output<typeof runInputSchema>,
+  metadata?: Record<string, unknown>,
+): UIMessage[] {
+  if (input.kind !== "chat") {
+    return [];
+  }
+
+  return [
+    {
+      id: input.message.id,
+      role: "user",
+      parts: [{ type: "text", content: input.message.text }],
+      ...(metadata ? { metadata } : {}),
+    },
+  ];
+}
+
+function withSideSeed(run: AcceptedRun, side: SideRow | undefined, threadId: string): void {
+  if (!side?.seed) {
+    return;
+  }
+
+  run.messages = classifySideConversation(run.messages, side.seed, threadId);
+  const byId = new Map(run.messages.map((message) => [message.id, message]));
+  run.context = run.context.map((message) => ({
+    ...message,
+    metadata: byId.get(message.id)?.metadata ?? message.metadata,
+  }));
+}
+
+async function insertAcceptedRun(
+  tx: Transaction,
+  run: AcceptedRun,
+  input: z.output<typeof runInputSchema>,
+): Promise<void> {
+  const [inserted] = await tx
+    .insert(chatRunsTable)
+    .values({
+      id: run.runId,
+      thread_id: run.threadId,
+      request: input,
+      accepted: run,
+      projection: projectConversation({ display: run.messages, context: run.context }),
+    })
+    .onConflictDoNothing({ target: chatRunsTable.id })
+    .returning();
+
+  if (!inserted) {
+    throw new RunRequestError(409, "Run ID collision");
+  }
+
+  await tx
+    .update(threadsTable)
+    .set({ active_run_id: run.runId })
+    .where(eq(threadsTable.id, run.threadId));
+  await appendEvent(tx, inserted, "started", {
+    type: EventType.RUN_STARTED,
+    threadId: run.threadId,
+    runId: run.runId,
+  });
 }
 
 async function acceptInTransaction(
@@ -261,25 +367,15 @@ async function acceptInTransaction(
   if (thread.revision !== input.baseRevision || thread.active_run_id) {
     throw new RunRequestError(409, "Thread revision or claim conflict");
   }
+
   const priorContext = await committedModelContext(tx, thread);
-  const additions: UIMessage[] =
-    input.kind === "chat"
-      ? [
-          {
-            id: input.message.id,
-            role: "user",
-            parts: [{ type: "text", content: input.message.text }],
-            ...(metadata ? { metadata } : {}),
-          },
-        ]
-      : [];
-  if (
-    additions.some((message) =>
-      [...thread.messages, ...priorContext].some((entry) => entry.id === message.id),
-    )
-  ) {
+  const additions = chatAdditions(input, metadata);
+  const known = new Set([...thread.messages, ...priorContext].map((entry) => entry.id));
+
+  if (additions.some((message) => known.has(message.id))) {
     throw new RunRequestError(409, "Message ID already exists in history or context");
   }
+
   const run: AcceptedRun = {
     ...input,
     messages: [...thread.messages, ...additions],
@@ -289,37 +385,9 @@ async function acceptInTransaction(
     build: BUILD,
     ...(side ? { side: { epoch: side.epoch, scope: side.page_scope } } : {}),
   };
-  if (side?.seed) {
-    run.messages = classifySideConversation(run.messages, side.seed, thread.id);
-    const byId = new Map(run.messages.map((message) => [message.id, message]));
-    run.context = run.context.map((message) => ({
-      ...message,
-      metadata: byId.get(message.id)?.metadata ?? message.metadata,
-    }));
-  }
-  const [inserted] = await tx
-    .insert(chatRunsTable)
-    .values({
-      id: run.runId,
-      thread_id: run.threadId,
-      request: input,
-      accepted: run,
-      projection: projectConversation({ display: run.messages, context: run.context }),
-    })
-    .onConflictDoNothing({ target: chatRunsTable.id })
-    .returning();
-  if (!inserted) {
-    throw new RunRequestError(409, "Run ID collision");
-  }
-  await tx
-    .update(threadsTable)
-    .set({ active_run_id: run.runId })
-    .where(eq(threadsTable.id, run.threadId));
-  await appendEvent(tx, inserted, "started", {
-    type: EventType.RUN_STARTED,
-    threadId: run.threadId,
-    runId: run.runId,
-  });
+  withSideSeed(run, side, thread.id);
+  await insertAcceptedRun(tx, run, input);
+
   return { run, pending: true };
 }
 
@@ -327,13 +395,17 @@ export async function emit(runId: string, event: StreamChunk, conversation?: Con
   const db = await database();
   await db.transaction(async (tx) => {
     const { run } = await lockRun(tx, runId);
+
     if (conversation) {
       conversation = await classifyProjection(tx, run, conversation);
+
       if (event.type === EventType.MESSAGES_SNAPSHOT) {
         event = snapshot(conversation.display);
       }
     }
+
     await appendEvent(tx, run, randomUUID(), event);
+
     if (conversation) {
       await tx
         .update(chatRunsTable)
@@ -358,15 +430,19 @@ export async function checkpointCompaction(
       .select()
       .from(chatEventsTable)
       .where(and(eq(chatEventsTable.run_id, runId), eq(chatEventsTable.event_key, key)));
+
     if (receipt) {
       if (
         !isDeepStrictEqual(parseCompactionEvent(receipt.payload), { runId, operationId, state })
       ) {
         throw new Error("Compaction receipt outcome mismatch");
       }
+
       return;
     }
+
     assertThreadClaim(run, thread);
+
     if (state === "done") {
       await tx
         .update(chatRunsTable)
@@ -374,6 +450,7 @@ export async function checkpointCompaction(
         .where(eq(chatRunsTable.id, runId));
       await appendEvent(tx, run, `${key}:snapshot`, snapshot(conversation.display));
     }
+
     await appendEvent(tx, run, key, compactionEvent({ runId, operationId, state }));
   });
 }
@@ -386,6 +463,7 @@ export function nextThreadTitle(input: {
   if (input.current !== "" && input.history.length > 0) {
     return input.current;
   }
+
   return threadTitle(input.accepted);
 }
 
@@ -394,14 +472,17 @@ function threadTitle(messages: readonly UIMessage[]): string {
     if (message.role !== "user" || message.metadata?.fromSummary === true) {
       continue;
     }
+
     const text = message.parts
       .filter((part) => part.type === "text")
       .map((part) => part.content)
       .join("");
+
     if (text !== "") {
       return text.slice(0, 10);
     }
   }
+
   return "新對話";
 }
 
@@ -415,12 +496,14 @@ async function failedConversation(
     .where(eq(chatEventsTable.run_id, run.id));
   const committed = receipts.some((receipt) => {
     const event = parseCompactionEvent(receipt.payload);
+
     return (
       receipt.event_key === `compact:${event?.operationId}` &&
       event?.runId === run.id &&
       event.state === "done"
     );
   });
+
   return committed ? readProjection(run.projection) : undefined;
 }
 
@@ -428,8 +511,74 @@ function testingEventAppend(tx: Transaction, run: RunRow): AppendTestingEvent {
   return async (key, event) => {
     const sequence = run.next_sequence;
     await appendEvent(tx, run, key, event);
+
     return sequence;
   };
+}
+
+function transferConversation(run: RunRow): ConversationState | undefined {
+  return run.accepted.messages.at(-1)?.metadata?.sideChatTransfer
+    ? { display: run.accepted.messages, context: run.accepted.context }
+    : undefined;
+}
+
+async function committedConversation(
+  tx: Transaction,
+  run: RunRow,
+  conversation: ConversationState | undefined,
+): Promise<ConversationState | undefined> {
+  const committed =
+    conversation ?? (await failedConversation(tx, run)) ?? transferConversation(run);
+
+  return committed ? classifyProjection(tx, run, committed) : undefined;
+}
+
+async function commitThreadSnapshot(
+  tx: Transaction,
+  run: RunRow,
+  thread: ThreadRow,
+  messages: UIMessage[],
+): Promise<void> {
+  const title =
+    run.request.kind === "compact"
+      ? thread.title
+      : nextThreadTitle({
+          current: thread.title,
+          history: thread.messages,
+          accepted: run.accepted.messages,
+        });
+  await appendEvent(tx, run, "finished:snapshot", snapshot(messages));
+  await tx
+    .update(threadsTable)
+    .set({
+      messages,
+      title,
+      revision: sql`${threadsTable.revision} + 1`,
+      active_run_id: null,
+      updated_at: sql`now()`,
+    })
+    .where(eq(threadsTable.id, thread.id));
+}
+
+async function releaseFailedThread(tx: Transaction, run: RunRow, thread: ThreadRow) {
+  await appendEvent(tx, run, "failed:snapshot", snapshot(readProjection(run.projection).display));
+  await tx.update(threadsTable).set({ active_run_id: null }).where(eq(threadsTable.id, thread.id));
+}
+
+function terminalEvent(
+  succeeded: boolean,
+  threadId: string,
+  runId: string,
+  code: string,
+): StreamChunk {
+  return succeeded
+    ? { type: EventType.RUN_FINISHED, threadId, runId }
+    : {
+        type: EventType.RUN_ERROR,
+        message: "執行失敗，請重新連線查看已儲存的內容。",
+        code,
+        metadata: { tanstack: { runId, threadId } },
+      };
 }
 
 export async function finishRun(
@@ -441,9 +590,11 @@ export async function finishRun(
   const db = await database();
   await db.transaction(async (tx) => {
     const { run, thread } = await lockRun(tx, runId);
+
     if (run.state !== "pending") {
       return;
     }
+
     assertThreadClaim(run, thread);
     await closeUnfinishedTesting(
       tx,
@@ -451,61 +602,16 @@ export async function finishRun(
       testingFinishOutcome(code, succeeded),
       testingEventAppend(tx, run),
     );
-    let committed =
-      conversation ??
-      (await failedConversation(tx, run)) ??
-      (run.accepted.messages.at(-1)?.metadata?.sideChatTransfer
-        ? { display: run.accepted.messages, context: run.accepted.context }
-        : undefined);
+    const committed = await committedConversation(tx, run, conversation);
+
     if (committed) {
-      committed = await classifyProjection(tx, run, committed);
-    }
-    const messages = committed?.display;
-    if (messages) {
-      const title =
-        run.request.kind === "compact"
-          ? thread.title
-          : nextThreadTitle({
-              current: thread.title,
-              history: thread.messages,
-              accepted: run.accepted.messages,
-            });
-      await appendEvent(tx, run, "finished:snapshot", snapshot(messages));
-      await tx
-        .update(threadsTable)
-        .set({
-          messages,
-          title,
-          revision: sql`${threadsTable.revision} + 1`,
-          active_run_id: null,
-          updated_at: sql`now()`,
-        })
-        .where(eq(threadsTable.id, thread.id));
+      await commitThreadSnapshot(tx, run, thread, committed.display);
     } else {
-      await appendEvent(
-        tx,
-        run,
-        "failed:snapshot",
-        snapshot(readProjection(run.projection).display),
-      );
-      await tx
-        .update(threadsTable)
-        .set({ active_run_id: null })
-        .where(eq(threadsTable.id, thread.id));
+      await releaseFailedThread(tx, run, thread);
     }
-    await appendEvent(
-      tx,
-      run,
-      "terminal",
-      succeeded
-        ? { type: EventType.RUN_FINISHED, threadId: thread.id, runId }
-        : {
-            type: EventType.RUN_ERROR,
-            message: "執行失敗，請重新連線查看已儲存的內容。",
-            code,
-            metadata: { tanstack: { runId, threadId: thread.id } },
-          },
-    );
+
+    await appendEvent(tx, run, "terminal", terminalEvent(succeeded, thread.id, runId, code));
+
     if (committed) {
       await tx
         .update(chatRunsTable)
@@ -514,6 +620,7 @@ export async function finishRun(
         })
         .where(eq(chatRunsTable.id, runId));
     }
+
     await tx
       .update(chatRunsTable)
       .set({ state: succeeded ? "succeeded" : "failed" })
@@ -523,6 +630,7 @@ export async function finishRun(
 
 export async function listPendingRuns() {
   const db = await database();
+
   return db
     .select()
     .from(chatRunsTable)
@@ -540,32 +648,43 @@ export async function hydrateThread(threadId: string, access?: SideAccess) {
   if (!z.uuid().safeParse(threadId).success) {
     throw new RunRequestError(400, "Invalid thread ID");
   }
+
   const db = await database();
+
   return db.transaction(async (tx) => {
     const side = await lockSide(tx, threadId);
+
     if (side) {
       assertSideOpen(side, access);
     }
+
     const [thread] = await tx
       .select()
       .from(threadsTable)
       .where(eq(threadsTable.id, threadId))
       .for("share");
+
     if (!thread) {
       throw new RunRequestError(404, "Unknown thread");
     }
+
     let messages = thread.messages;
+
     if (thread.active_run_id) {
       const [run] = await tx
         .select()
         .from(chatRunsTable)
         .where(eq(chatRunsTable.id, thread.active_run_id));
+
       if (!run) {
         throw new Error("Missing active run");
       }
+
       messages = readProjection(run.projection).display;
     }
+
     const published = await readPublishedThreadViewsInTransaction(tx, threadId);
+
     return {
       messages,
       revision: thread.revision,
@@ -584,18 +703,24 @@ export async function checkCursor(
   if (!runIdSchema.safeParse(runId).success || !Number.isSafeInteger(cursor) || cursor < -1) {
     throw new RunRequestError(400, "Invalid run cursor");
   }
+
   const db = await database();
   const [run] = await db.select().from(chatRunsTable).where(eq(chatRunsTable.id, runId));
+
   if (!run) {
     throw new RunRequestError(404, "Unknown run");
   }
+
   const [side] = await db.select().from(sideChatsTable).where(eq(sideChatsTable.id, run.thread_id));
+
   if (side) {
     assertSideOpen(side, access);
   }
+
   if (threadId !== undefined && run.thread_id !== threadId) {
     throw new RunRequestError(409, "Run thread mismatch");
   }
+
   if (cursor >= run.next_sequence) {
     throw new RunRequestError(400, "Cursor is ahead of run");
   }
@@ -607,6 +732,7 @@ async function lockSide(tx: Transaction, id: string): Promise<SideRow | undefine
     .from(sideChatsTable)
     .where(eq(sideChatsTable.id, id))
     .for("update");
+
   return side;
 }
 
@@ -614,6 +740,7 @@ function assertSideOpen(side: SideRow, access?: SideAccess) {
   if (access?.scope !== side.page_scope) {
     throw new RunRequestError(404, "Unknown side chat scope");
   }
+
   if (side.state !== "open" || side.lease_until.getTime() <= Date.now() || !side.seed) {
     throw new RunRequestError(409, "Side chat is closed or expired");
   }
@@ -623,12 +750,16 @@ async function classifyProjection(tx: Transaction, run: RunRow, state: Conversat
   if (!run.accepted.side) {
     return state;
   }
+
   const [side] = await tx.select().from(sideChatsTable).where(eq(sideChatsTable.id, run.thread_id));
+
   if (!side?.seed) {
     throw new RunRequestError(409, "Side chat seed is discarded");
   }
+
   const display = classifySideConversation(state.display, side.seed, run.thread_id);
   const originals = new Map(display.map((message) => [message.id, message]));
+
   return {
     display,
     context: state.context.map((message) => ({
@@ -642,16 +773,20 @@ export async function assertExecution(run: AcceptedRun) {
   if (!run.side) {
     return;
   }
+
   const db = await database();
   const [side] = await db.select().from(sideChatsTable).where(eq(sideChatsTable.id, run.threadId));
+
   if (!side || side.epoch !== run.side.epoch) {
     throw new RunRequestError(409, "Side chat execution expired");
   }
+
   assertSideOpen(side, { scope: run.side.scope });
 }
 
 export async function openSideChat(parentThreadId: string, openKey: string, access: SideAccess) {
   const db = await database();
+
   return db.transaction(async (tx) => {
     await tx.execute(
       sql`select pg_advisory_xact_lock(hashtext(${access.scope}), hashtext(${openKey}))`,
@@ -661,27 +796,35 @@ export async function openSideChat(parentThreadId: string, openKey: string, acce
       .from(sideChatsTable)
       .where(and(eq(sideChatsTable.page_scope, access.scope), eq(sideChatsTable.open_key, openKey)))
       .for("update");
+
     if (prior) {
       if (prior.parent_thread_id !== parentThreadId) {
         throw new RunRequestError(409, "Open key collision");
       }
+
       assertSideOpen(prior, access);
+
       return { id: prior.id, parentRevision: prior.seed!.parentRevision };
     }
+
     if (await lockSide(tx, parentThreadId)) {
       throw new RunRequestError(409, "Nested side chats are not supported");
     }
+
     const [parent] = await tx
       .select()
       .from(threadsTable)
       .where(eq(threadsTable.id, parentThreadId))
       .for("update");
+
     if (!parent) {
       throw new RunRequestError(404, "Unknown parent thread");
     }
+
     if (parent.parent_thread_id || parent.active_run_id) {
       throw new RunRequestError(409, "Parent thread must be ready");
     }
+
     const seed: SideChatSeed = {
       parentRevision: parent.revision,
       display: parent.messages,
@@ -703,30 +846,38 @@ export async function openSideChat(parentThreadId: string, openKey: string, acce
       agent: parent.agent,
       messages: seed.display,
     });
+
     return { id, parentRevision: seed.parentRevision };
   });
 }
 
 export async function readSideSummaryRange(id: string, access: SideAccess) {
   const db = await database();
+
   return db.transaction(async (tx) => {
     const side = await lockSide(tx, id);
+
     if (!side) {
       throw new RunRequestError(404, "Unknown side chat");
     }
+
     assertSideOpen(side, access);
     const [thread] = await tx
       .select()
       .from(threadsTable)
       .where(eq(threadsTable.id, id))
       .for("update");
+
     if (!thread || thread.active_run_id) {
       throw new RunRequestError(409, "Side chat must be idle");
     }
+
     const transcript = originalSideTranscript(thread.messages, id);
+
     if (!transcript.length) {
       throw new RunRequestError(409, "Side chat has no original discussion");
     }
+
     return {
       epoch: side.epoch,
       sideRevision: thread.revision,
@@ -743,17 +894,21 @@ export async function saveSideDraft(
   draft: SummaryDraft,
 ) {
   const db = await database();
+
   return db.transaction(async (tx) => {
     const side = await lockSide(tx, id);
+
     if (!side) {
       throw new RunRequestError(404, "Unknown side chat");
     }
+
     assertSideOpen(side, access);
     const [thread] = await tx
       .select()
       .from(threadsTable)
       .where(eq(threadsTable.id, id))
       .for("update");
+
     if (
       side.epoch !== epoch ||
       !thread ||
@@ -762,9 +917,89 @@ export async function saveSideDraft(
     ) {
       throw new RunRequestError(409, "Summary draft is stale");
     }
+
     await tx.update(sideChatsTable).set({ draft }).where(eq(sideChatsTable.id, id));
+
     return draft;
   });
+}
+
+type SideTransferRow = typeof sideTransfersTable.$inferSelect;
+type SideDraft = NonNullable<SideRow["draft"]>;
+
+async function replayTransfer(
+  tx: Transaction,
+  prior: SideTransferRow,
+  access: SideAccess,
+  digest: string,
+) {
+  if (prior.page_scope !== access.scope || prior.digest !== digest) {
+    throw new RunRequestError(409, "Transfer key collision");
+  }
+
+  const [run] = await tx
+    .select()
+    .from(chatRunsTable)
+    .where(eq(chatRunsTable.id, prior.receipt.mainRunId));
+
+  if (!run) {
+    throw new RunRequestError(409, "Accepted main run is unavailable");
+  }
+
+  return { receipt: prior.receipt, run: run.accepted, pending: run.state === "pending" };
+}
+
+function draftCurrent(
+  child: ThreadRow | undefined,
+  draft: SideRow["draft"],
+  draftId: string,
+  id: string,
+): draft is SideDraft {
+  return Boolean(
+    child &&
+    !child.active_run_id &&
+    draft &&
+    draft.id === draftId &&
+    draft.sideRevision === child.revision &&
+    draft.through === originalSideTranscript(child.messages, id).length,
+  );
+}
+
+async function lockTransferSide(
+  tx: Transaction,
+  id: string,
+  access: SideAccess,
+  draftId: string,
+): Promise<{ side: SideRow; draft: SideDraft }> {
+  const side = await lockSide(tx, id);
+
+  if (!side) {
+    throw new RunRequestError(404, "Unknown side chat");
+  }
+
+  assertSideOpen(side, access);
+  const [child] = await tx.select().from(threadsTable).where(eq(threadsTable.id, id)).for("update");
+  const draft = side.draft;
+
+  if (!draftCurrent(child, draft, draftId, id)) {
+    throw new RunRequestError(409, "Summary draft is stale or side chat is busy");
+  }
+
+  return { side, draft };
+}
+
+async function lockIdleParent(tx: Transaction, parentId: string): Promise<ThreadRow> {
+  const [parent] = await tx
+    .select()
+    .from(threadsTable)
+    .where(eq(threadsTable.id, parentId))
+    .for("update");
+
+  if (!parent || parent.active_run_id) {
+    throw new RunRequestError(409, "Main thread is busy");
+  }
+
+  return parent;
 }
 
 export async function transferSideSummary(
@@ -776,54 +1011,20 @@ export async function transferSideSummary(
   const digest = createHash("sha256")
     .update(JSON.stringify({ id, draftId: input.draftId, text: input.text }))
     .digest("hex");
+
   return db.transaction(async (tx) => {
     await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${input.transferKey}))`);
     const [prior] = await tx
       .select()
       .from(sideTransfersTable)
       .where(eq(sideTransfersTable.transfer_key, input.transferKey));
+
     if (prior) {
-      if (prior.page_scope !== access.scope || prior.digest !== digest) {
-        throw new RunRequestError(409, "Transfer key collision");
-      }
-      const [run] = await tx
-        .select()
-        .from(chatRunsTable)
-        .where(eq(chatRunsTable.id, prior.receipt.mainRunId));
-      if (!run) {
-        throw new RunRequestError(409, "Accepted main run is unavailable");
-      }
-      return { receipt: prior.receipt, run: run.accepted, pending: run.state === "pending" };
+      return replayTransfer(tx, prior, access, digest);
     }
-    const side = await lockSide(tx, id);
-    if (!side) {
-      throw new RunRequestError(404, "Unknown side chat");
-    }
-    assertSideOpen(side, access);
-    const [child] = await tx
-      .select()
-      .from(threadsTable)
-      .where(eq(threadsTable.id, id))
-      .for("update");
-    const draft = side.draft;
-    if (
-      !child ||
-      child.active_run_id ||
-      !draft ||
-      draft.id !== input.draftId ||
-      draft.sideRevision !== child.revision ||
-      draft.through !== originalSideTranscript(child.messages, id).length
-    ) {
-      throw new RunRequestError(409, "Summary draft is stale or side chat is busy");
-    }
-    const [parent] = await tx
-      .select()
-      .from(threadsTable)
-      .where(eq(threadsTable.id, side.parent_thread_id))
-      .for("update");
-    if (!parent || parent.active_run_id) {
-      throw new RunRequestError(409, "Main thread is busy");
-    }
+
+    const { side, draft } = await lockTransferSide(tx, id, access, input.draftId);
+    const parent = await lockIdleParent(tx, side.parent_thread_id);
     const receipt: TransferReceipt = {
       transferKey: input.transferKey,
       parentThreadId: parent.id,
@@ -858,6 +1059,7 @@ export async function transferSideSummary(
       .update(sideChatsTable)
       .set({ state: "closing", epoch: side.epoch + 1 })
       .where(eq(sideChatsTable.id, id));
+
     return { ...accepted, receipt };
   });
 }
@@ -878,24 +1080,30 @@ export async function heartbeatSideScope(access: SideAccess) {
 
 export async function beginSideDiscard(id: string, access?: SideAccess) {
   const db = await database();
+
   return db.transaction(async (tx) => {
     const side = await lockSide(tx, id);
+
     if (!side || (access && side.page_scope !== access.scope)) {
       throw new RunRequestError(404, "Unknown side chat");
     }
+
     if (side.state === "closed") {
       return [];
     }
+
     if (side.state === "open") {
       await tx
         .update(sideChatsTable)
         .set({ state: "closing", epoch: side.epoch + 1 })
         .where(eq(sideChatsTable.id, id));
     }
+
     const runs = await tx
       .select({ id: chatRunsTable.id })
       .from(chatRunsTable)
       .where(eq(chatRunsTable.thread_id, id));
+
     return runs.map((run) => run.id);
   });
 }
@@ -904,22 +1112,27 @@ export async function purgeSideChat(id: string) {
   const db = await database();
   await db.transaction(async (tx) => {
     const side = await lockSide(tx, id);
+
     if (!side || side.state === "closed") {
       return;
     }
+
     if (side.state !== "closing") {
       throw new RunRequestError(409, "Side chat must be stopped before purge");
     }
+
     const runs = await tx
       .select({ id: chatRunsTable.id })
       .from(chatRunsTable)
       .where(eq(chatRunsTable.thread_id, id));
     const ids = runs.map((run) => run.id);
+
     if (ids.length) {
       await tx.delete(chatEventsTable).where(inArray(chatEventsTable.run_id, ids));
       await tx.delete(chatModelSlotsTable).where(inArray(chatModelSlotsTable.run_id, ids));
       await tx.delete(chatRunsTable).where(inArray(chatRunsTable.id, ids));
     }
+
     await tx.delete(threadsTable).where(eq(threadsTable.id, id));
     await tx
       .update(sideChatsTable)
@@ -930,6 +1143,7 @@ export async function purgeSideChat(id: string) {
 
 export async function listDiscardableSides(all = false) {
   const db = await database();
+
   return db
     .select({ id: sideChatsTable.id })
     .from(sideChatsTable)
@@ -959,9 +1173,11 @@ async function runExhausted(
   cursor: number,
 ): Promise<boolean> {
   const [run] = await db.select().from(chatRunsTable).where(eq(chatRunsTable.id, runId));
+
   if (!run) {
     throw new Error("Observed run disappeared");
   }
+
   return run.state !== "pending" && cursor === run.next_sequence - 1;
 }
 
@@ -973,6 +1189,7 @@ export async function* observeRun(
 ): AsyncGenerator<{ sequence: number; event: StreamChunk }> {
   await checkCursor(runId, cursor, undefined, access);
   const db = await database();
+
   while (!signal.aborted) {
     const rows = await db
       .select({ sequence: chatEventsTable.sequence, payload: chatEventsTable.payload })
@@ -980,22 +1197,28 @@ export async function* observeRun(
       .where(and(eq(chatEventsTable.run_id, runId), gt(chatEventsTable.sequence, cursor)))
       .orderBy(chatEventsTable.sequence)
       .limit(100);
+
     for (const row of rows) {
       if (signal.aborted) {
         return;
       }
+
       cursor = row.sequence;
       yield { sequence: cursor, event: row.payload };
+
       if (TERMINAL_RUN_EVENTS.has(row.payload.type)) {
         return;
       }
     }
+
     if (rows.length) {
       continue;
     }
+
     if (await runExhausted(db, runId, cursor)) {
       return;
     }
+
     await pollWhileOpen(signal);
   }
 }
@@ -1005,43 +1228,55 @@ async function withTestingRoot<T>(
   work: (tx: Transaction, run: RunRow, thread: ThreadRow, append: AppendTestingEvent) => Promise<T>,
 ): Promise<T> {
   const db = await database();
+
   return db.transaction(async (tx) => {
     const locked = await lockRun(tx, ownerRunId);
+
     if (locked.run.state !== "pending") {
       throw new TestingPersistenceError(409, "Run is terminal");
     }
+
     assertThreadClaim(locked.run, locked.thread);
+
     return work(tx, locked.run, locked.thread, testingEventAppend(tx, locked.run));
   });
 }
 
 async function claimStandaloneRoot(tx: Transaction, request: TestingRequest) {
   const side = await lockSide(tx, request.threadId);
+
   if (side) {
     throw new TestingPersistenceError(409, "Standalone testing cannot claim a side chat");
   }
+
   const [thread] = await tx
     .select()
     .from(threadsTable)
     .where(eq(threadsTable.id, request.threadId))
     .for("update");
+
   if (!thread) {
     throw new TestingPersistenceError(404, "Unknown thread");
   }
+
   const [existingRun] = await tx
     .select()
     .from(chatRunsTable)
     .where(eq(chatRunsTable.id, request.requestId))
     .for("update");
+
   if (existingRun) {
     if (existingRun.thread_id !== request.threadId || thread.active_run_id !== request.requestId) {
       throw new TestingPersistenceError(409, "Testing request identity collision");
     }
+
     return;
   }
+
   if (thread.active_run_id || thread.revision !== request.expectedRevision) {
     throw new TestingPersistenceError(409, "Thread revision or claim conflict");
   }
+
   const priorContext = await committedModelContext(tx, thread);
   const claimInput = compactInputSchema.parse({
     kind: "compact",
@@ -1068,9 +1303,11 @@ async function claimStandaloneRoot(tx: Transaction, request: TestingRequest) {
     })
     .onConflictDoNothing({ target: chatRunsTable.id })
     .returning();
+
   if (!inserted) {
     throw new TestingPersistenceError(409, "Testing request identity collision");
   }
+
   await tx
     .update(threadsTable)
     .set({ active_run_id: request.requestId })
@@ -1094,6 +1331,7 @@ async function releaseStandaloneClaim(
       .set({ active_run_id: null })
       .where(eq(threadsTable.id, thread.id));
   }
+
   if (run.state === "pending") {
     const state = outcome === "completed" ? "succeeded" : "failed";
     await tx.update(chatRunsTable).set({ state }).where(eq(chatRunsTable.id, run.id));
@@ -1109,12 +1347,16 @@ export async function admitAttachedTesting(
 ): Promise<TestingAdmission> {
   const runtime = hostTestingRuntime({ model: parent.model, build: parent.build }, now);
   const db = await database();
+
   return db.transaction(async (tx) => {
     const locked = await lockRun(tx, parent.runId);
+
     if (locked.run.thread_id !== parent.threadId || locked.run.state !== "pending") {
       throw new TestingPersistenceError(409, "Attached testing requires the active parent run");
     }
+
     assertThreadClaim(locked.run, locked.thread);
+
     return admitAttachedInTransaction(tx, parent.runId, parent.threadId, callId, intent, runtime);
   });
 }
@@ -1124,21 +1366,28 @@ export async function admitStandaloneTesting(
   now = new Date(),
 ): Promise<TestingAdmission> {
   const parsed = testingRequestSchema.safeParse(request);
+
   if (!parsed.success || !runIdSchema.safeParse(parsed.data.requestId).success) {
     throw new TestingPersistenceError(400, "Invalid testing request");
   }
+
   if (!z.uuid().safeParse(parsed.data.threadId).success) {
     throw new TestingPersistenceError(400, "Invalid testing request");
   }
+
   const runtime = hostTestingRuntime({ model: MODEL, build: BUILD }, now);
   const db = await database();
+
   return db.transaction(async (tx) => {
     const existing = await findStandaloneAdmission(tx, parsed.data);
+
     if (existing) {
       return existing;
     }
+
     const prepared = await prepareStandaloneClosure(tx, parsed.data, runtime);
     await claimStandaloneRoot(tx, parsed.data);
+
     return insertStandaloneOperation(tx, parsed.data, runtime, prepared);
   });
 }
@@ -1155,25 +1404,31 @@ export async function reserveRoleTasks(
 
 export async function guardActualIO(input: ActualIoInput): Promise<ActualIoGuard> {
   const db = await database();
+
   return db.transaction(async (tx) => {
     let owner: { run: RunRow; thread: ThreadRow };
+
     try {
       owner = await lockRun(tx, input.parentRunId);
     } catch (error) {
       if (error instanceof RunRequestError) {
         return { state: "denied", reason: "scope" };
       }
+
       throw error;
     }
+
     if (owner.run.state !== "pending") {
       return { state: "denied", reason: "terminal" };
     }
+
     if (
       owner.thread.active_run_id !== owner.run.id ||
       owner.thread.revision !== owner.run.request.baseRevision
     ) {
       return { state: "denied", reason: "scope" };
     }
+
     return guardActualIOInTransaction(tx, input, owner.thread.id);
   });
 }
@@ -1227,6 +1482,7 @@ export async function closeTesting(
       .from(testingOperationsTable)
       .where(eq(testingOperationsTable.id, operationId));
     const runtime = operation?.runtime as { mode?: string } | undefined;
+
     if (runtime?.mode === "standalone" && operation?.terminal_outcome) {
       await releaseStandaloneClaim(tx, run, thread, operation.terminal_outcome as RootRunOutcome);
     }
@@ -1254,15 +1510,6 @@ export async function readPublishedThreadViews(threadId: string): Promise<readon
   requireThreadId(threadId);
 
   return readPublishedThreadViewsRow(threadId);
-}
-
-export async function readTestingAdmission(
-  ownerRunId: string,
-  operationId: string,
-): Promise<TestingAdmission> {
-  return withTestingRoot(ownerRunId, (tx) =>
-    readTestingAdmissionInTransaction(tx, ownerRunId, operationId),
-  );
 }
 
 export async function recordRoleFailure(

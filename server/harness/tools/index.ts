@@ -53,9 +53,11 @@ function registration(
   handler: Registration["handler"],
 ): Registration {
   const inputSchema = convertSchemaToJsonSchema(tool.inputSchema);
+
   if (!inputSchema) {
     throw new ToolBoundaryError("Tool schema is unavailable");
   }
+
   return {
     definition: { name: tool.name, description: tool.description, inputSchema },
     handler,
@@ -75,12 +77,15 @@ const localCatalog: Catalog = new Map(
 
 function mergeLocalDefinitions(remote: AtlassianCatalog): ModelTool[] {
   const definitions = new Map([...localCatalog].map(([name, entry]) => [name, entry.definition]));
+
   for (const [name, definition] of remote) {
     if (definitions.has(name)) {
       throw new ToolBoundaryError("Atlassian MCP catalog is invalid");
     }
+
     definitions.set(name, definition);
   }
+
   return [...definitions.values()];
 }
 
@@ -91,13 +96,16 @@ export async function withRunTools<T>(
 ): Promise<T> {
   return withAtlassianScope(async (scope) => {
     const pending = new Set<Promise<unknown>>();
+
     const dispatchFor =
       (messages: readonly UIMessage[]) => (call: ModelCall, context: ToolExecutionContext) => {
         context.abortSignal?.throwIfAborted();
         signal?.throwIfAborted();
+
         if (call.name === RUN_TESTS_TOOL) {
           throw new ToolBoundaryError("run_tests is direct-only on the main run");
         }
+
         const work = scope.executeTool(
           messages,
           call,
@@ -109,8 +117,10 @@ export async function withRunTools<T>(
           () => pending.delete(work),
           () => pending.delete(work),
         );
+
         return work;
       };
+
     const buildTurn = async (messages: readonly UIMessage[]) => {
       const definitions = await scope.getModelTools(messages, mergeLocalDefinitions);
       const bindable = definitions.filter((definition) => definition.name !== RUN_TESTS_TOOL);
@@ -128,12 +138,15 @@ export async function withRunTools<T>(
               }).definition,
             ]
           : [];
+
       return { definitions: [...bindable, ...direct], turn };
     };
+
     try {
       return await use({
         async getModelTools(messages) {
           const { definitions, turn } = await buildTurn(messages);
+
           return {
             definitions: [...definitions, turn.definition],
             systemPrompt: turn.systemPrompt,
@@ -143,10 +156,13 @@ export async function withRunTools<T>(
           if (call.name === RUN_TESTS_TOOL) {
             throw new ToolBoundaryError("run_tests is direct-only on the main run");
           }
+
           if (call.name !== codeModeToolName) {
             return dispatchFor(messages)(call, context);
           }
+
           const { turn } = await buildTurn(messages);
+
           return turn.execute(call.input, context);
         },
       });

@@ -43,9 +43,9 @@ import {
   type ToolActivityView,
 } from "../../shared/testing";
 
-export type Capability = "atlassian_read" | "browser_mock" | "figma_read";
+type Capability = "atlassian_read" | "browser_mock" | "figma_read";
 
-export type RoleDefinition = Readonly<{
+type RoleDefinition = Readonly<{
   artifact: ArtifactKind;
   capabilities: readonly Capability[];
   codeMode: "enabled";
@@ -85,10 +85,6 @@ export const capabilityToolNames = {
   figma_read: "get_figma",
 } as const satisfies Record<Capability, string | null>;
 
-export function browserRole(role: RoleId): "ac" | "ui" | null {
-  return role === "ac" || role === "ui" ? role : null;
-}
-
 const isFunctionalCheck = (check: PlanCheck): check is FunctionalCheck =>
   check.kind === "functional";
 const isStyleCheck = (check: PlanCheck): check is StyleCheck => check.kind === "style";
@@ -109,16 +105,17 @@ export type Validation<T> =
   | Readonly<{ kind: "accepted"; value: T }>
   | Readonly<{ kind: "rejected"; issues: NonEmpty<string> }>;
 
-export function accepted<T>(value: T): Validation<T> {
+function accepted<T>(value: T): Validation<T> {
   return { kind: "accepted", value };
 }
 
-export function rejected(issue: string, ...rest: readonly string[]): Validation<never> {
+function rejected(issue: string, ...rest: readonly string[]): Validation<never> {
   return { kind: "rejected", issues: [issue, ...rest] };
 }
 
 function nonEmpty(values: readonly string[]): NonEmpty<string> | null {
   const [first, ...rest] = values;
+
   return first === undefined ? null : [first, ...rest];
 }
 
@@ -126,11 +123,14 @@ function canonicalJson(value: unknown): string {
   if (value === null || typeof value !== "object") {
     return JSON.stringify(value) ?? "null";
   }
+
   if (Array.isArray(value)) {
     return `[${value.map(canonicalJson).join(",")}]`;
   }
+
   const record = value as Readonly<Record<string, unknown>>;
   const keys = Object.keys(record).sort();
+
   return `{${keys.map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`).join(",")}}`;
 }
 
@@ -194,17 +194,21 @@ function selectedCriteria(
   if (selection.kind === "all") {
     return { criteria, missingKeys: [] };
   }
+
   const criteriaByKey = new Map(criteria.map((criterion) => [criterion.key, criterion]));
   const selected: RequirementCriterion[] = [];
   const missingKeys: string[] = [];
+
   for (const key of selection.keys) {
     const criterion = criteriaByKey.get(key);
+
     if (criterion) {
       selected.push(criterion);
     } else {
       missingKeys.push(key);
     }
   }
+
   return { criteria: selected, missingKeys };
 }
 
@@ -228,13 +232,15 @@ export type RequirementsContext = Readonly<{
   captures: readonly SourceCapture[];
 }>;
 
-function sameSource(left: Source, right: Source): boolean {
+export function sameSource(left: Source, right: Source): boolean {
   if (left.kind === "jira" && right.kind === "jira") {
     return left.issueKey === right.issueKey;
   }
+
   if (left.kind === "confluence" && right.kind === "confluence") {
     return left.pageId === right.pageId;
   }
+
   return false;
 }
 
@@ -245,28 +251,36 @@ export function validateRequirements(
   if (context.captures.length === 0) {
     return rejected("requirements need at least one source capture");
   }
+
   const parsed = requirementsProposalSchema.safeParse(raw);
+
   if (!parsed.success) {
     return rejected(parsed.error.issues.map((issue) => issue.message).join("; "));
   }
+
   const issues: string[] = [];
   const keys = new Set<string>();
   const criteria: RequirementCriterion[] = [];
+
   for (const proposal of parsed.data.criteria) {
     if (keys.has(proposal.key)) {
       issues.push(`duplicate criterion key ${proposal.key}`);
       continue;
     }
+
     keys.add(proposal.key);
     const capture = context.captures.find((item) => sameSource(item.reference, proposal.source));
+
     if (!capture) {
       issues.push(`criterion ${proposal.key} references an uncaptured source`);
       continue;
     }
+
     if (!capture.anchors.includes(proposal.anchor)) {
       issues.push(`criterion ${proposal.key} references an unknown anchor`);
       continue;
     }
+
     criteria.push({
       id: `crit:${proposal.key}`,
       key: proposal.key,
@@ -275,14 +289,19 @@ export function validateRequirements(
       anchor: proposal.anchor,
     });
   }
+
   const selected = selectedCriteria(criteria, context.selection);
+
   for (const key of selected.missingKeys) {
     issues.push(`selected criterion ${key} is missing from the extraction`);
   }
+
   if (issues.length > 0) {
     const [first, ...rest] = issues;
+
     return first === undefined ? rejected("requirements rejected") : rejected(first, ...rest);
   }
+
   return accepted({
     goal: context.goal,
     selection: context.selection,
@@ -325,87 +344,150 @@ const planProposalSchema = z.strictObject({
     .min(1),
 });
 
-export function canonicalizePlan(raw: unknown, context: PlanContext): Validation<CanonicalPlan> {
-  const parsed = planProposalSchema.safeParse(raw);
-  if (!parsed.success) {
-    return rejected(parsed.error.issues.map((issue) => issue.message).join("; "));
+type PlanProposal = z.infer<typeof planProposalSchema>;
+
+type PlanScope = Readonly<{
+  universeIds: ReadonlySet<string>;
+  selectedIds: ReadonlySet<string>;
+  design: DesignReference | null;
+}>;
+
+type PlanScan = {
+  issues: string[];
+  checkIds: Set<string>;
+  functionalByCriterion: Map<string, number>;
+  totalChecks: number;
+};
+
+export function sameDesign(left: DesignReference, right: DesignReference | null): boolean {
+  return right !== null && left.fileKey === right.fileKey && left.nodeId === right.nodeId;
+}
+
+function planCheckIssue(check: PlanCheck, scope: PlanScope): string | null {
+  if (!scope.selectedIds.has(check.criterionId)) {
+    return scope.universeIds.has(check.criterionId)
+      ? `check ${check.id} references an unselected criterion`
+      : `check ${check.id} references an unknown criterion`;
   }
-  const issues: string[] = [];
-  const { maxCases, maxChecks, maxChecksPerCase } = context.bounds;
-  const selection = selectedCriteria(context.requirements.criteria, context.requirements.selection);
-  const universeIds = new Set(context.requirements.criteria.map((criterion) => criterion.id));
-  const selectedIds = new Set(selection.criteria.map((criterion) => criterion.id));
-  for (const key of selection.missingKeys) {
-    issues.push(`selected criterion ${key} is missing from the extraction`);
+
+  if (check.kind === "style" && !sameDesign(check.design, scope.design)) {
+    return `style check ${check.id} does not reference the requested design`;
   }
-  if (parsed.data.cases.length > maxCases) {
-    issues.push("plan exceeds the case bound");
-  }
-  const caseIds = new Set<string>();
-  const checkIds = new Set<string>();
-  const functionalByCriterion = new Map<string, number>();
-  let totalChecks = 0;
-  const cases: PlanCase[] = [];
-  for (const proposed of parsed.data.cases) {
-    if (caseIds.has(proposed.id)) {
-      issues.push(`duplicate case id ${proposed.id}`);
+
+  return null;
+}
+
+function acceptedPlanChecks(
+  proposed: readonly PlanCheck[],
+  scope: PlanScope,
+  scan: PlanScan,
+): PlanCheck[] {
+  const checks: PlanCheck[] = [];
+
+  for (const check of proposed) {
+    if (scan.checkIds.has(check.id)) {
+      scan.issues.push(`duplicate check id ${check.id}`);
       continue;
     }
+
+    scan.checkIds.add(check.id);
+    const issue = planCheckIssue(check, scope);
+
+    if (issue) {
+      scan.issues.push(issue);
+      continue;
+    }
+
+    if (check.kind === "functional") {
+      scan.functionalByCriterion.set(
+        check.criterionId,
+        (scan.functionalByCriterion.get(check.criterionId) ?? 0) + 1,
+      );
+    }
+
+    checks.push(check);
+  }
+
+  return checks;
+}
+
+function canonicalCases(
+  proposals: PlanProposal["cases"],
+  scope: PlanScope,
+  maxChecksPerCase: number,
+  scan: PlanScan,
+): PlanCase[] {
+  const caseIds = new Set<string>();
+  const cases: PlanCase[] = [];
+
+  for (const proposed of proposals) {
+    if (caseIds.has(proposed.id)) {
+      scan.issues.push(`duplicate case id ${proposed.id}`);
+      continue;
+    }
+
     caseIds.add(proposed.id);
+
     if (proposed.checks.length > maxChecksPerCase) {
-      issues.push(`case ${proposed.id} exceeds the check bound`);
+      scan.issues.push(`case ${proposed.id} exceeds the check bound`);
     }
-    totalChecks += proposed.checks.length;
-    const checks: PlanCheck[] = [];
-    for (const check of proposed.checks) {
-      if (checkIds.has(check.id)) {
-        issues.push(`duplicate check id ${check.id}`);
-        continue;
-      }
-      checkIds.add(check.id);
-      if (!selectedIds.has(check.criterionId)) {
-        issues.push(
-          universeIds.has(check.criterionId)
-            ? `check ${check.id} references an unselected criterion`
-            : `check ${check.id} references an unknown criterion`,
-        );
-        continue;
-      }
-      if (check.kind === "functional") {
-        functionalByCriterion.set(
-          check.criterionId,
-          (functionalByCriterion.get(check.criterionId) ?? 0) + 1,
-        );
-      } else if (
-        context.design === null ||
-        check.design.fileKey !== context.design.fileKey ||
-        check.design.nodeId !== context.design.nodeId
-      ) {
-        issues.push(`style check ${check.id} does not reference the requested design`);
-        continue;
-      }
-      checks.push(check);
-    }
+
+    scan.totalChecks += proposed.checks.length;
     cases.push({
       id: proposed.id,
       title: proposed.title,
       preconditions: proposed.preconditions,
       actions: proposed.actions,
-      checks,
+      checks: acceptedPlanChecks(proposed.checks, scope, scan),
     });
   }
-  if (totalChecks > maxChecks) {
-    issues.push("plan exceeds the check bound");
+
+  return cases;
+}
+
+export function canonicalizePlan(raw: unknown, context: PlanContext): Validation<CanonicalPlan> {
+  const parsed = planProposalSchema.safeParse(raw);
+
+  if (!parsed.success) {
+    return rejected(parsed.error.issues.map((issue) => issue.message).join("; "));
   }
+
+  const { maxCases, maxChecks, maxChecksPerCase } = context.bounds;
+  const selection = selectedCriteria(context.requirements.criteria, context.requirements.selection);
+  const scope: PlanScope = {
+    universeIds: new Set(context.requirements.criteria.map((criterion) => criterion.id)),
+    selectedIds: new Set(selection.criteria.map((criterion) => criterion.id)),
+    design: context.design,
+  };
+  const scan: PlanScan = {
+    issues: selection.missingKeys.map(
+      (key) => `selected criterion ${key} is missing from the extraction`,
+    ),
+    checkIds: new Set(),
+    functionalByCriterion: new Map(),
+    totalChecks: 0,
+  };
+
+  if (parsed.data.cases.length > maxCases) {
+    scan.issues.push("plan exceeds the case bound");
+  }
+
+  const cases = canonicalCases(parsed.data.cases, scope, maxChecksPerCase, scan);
+
+  if (scan.totalChecks > maxChecks) {
+    scan.issues.push("plan exceeds the check bound");
+  }
+
   for (const criterion of selection.criteria) {
-    if ((functionalByCriterion.get(criterion.id) ?? 0) === 0) {
-      issues.push(`criterion ${criterion.id} has no functional check`);
+    if (!scan.functionalByCriterion.has(criterion.id)) {
+      scan.issues.push(`criterion ${criterion.id} has no functional check`);
     }
   }
-  if (issues.length > 0) {
-    const [first, ...rest] = issues;
 
-    return first === undefined ? rejected("plan rejected") : rejected(first, ...rest);
+  const failure = nonEmpty(scan.issues);
+
+  if (failure) {
+    return rejected(...failure);
   }
 
   const functional = checksForRole(cases, "ac");
@@ -486,10 +568,13 @@ function numericValue(value: string, unit: "px" | "ratio"): number | null {
     unit === "px" ? new RegExp(`^${numberPattern}px$`) : new RegExp(`^${numberPattern}$`);
   const match = pattern.exec(value);
   const numericText = match?.[1];
+
   if (numericText === undefined) {
     return null;
   }
+
   const numeric = Number(numericText);
+
   return Number.isFinite(numeric) ? numeric : null;
 }
 
@@ -497,9 +582,11 @@ export function withinTolerance(tolerance: Tolerance, expected: string, observed
   switch (tolerance.kind) {
     case "exact":
       return expected === observed;
+
     case "numeric": {
       const left = numericValue(expected, tolerance.unit);
       const right = numericValue(observed, tolerance.unit);
+
       return left !== null && right !== null && Math.abs(left - right) <= tolerance.maxDelta;
     }
   }
@@ -507,127 +594,233 @@ export function withinTolerance(tolerance: Tolerance, expected: string, observed
 
 function evidenceList(values: readonly PublicEvidence[]): NonEmpty<PublicEvidence> | null {
   const [first, ...rest] = values;
+
   return first === undefined ? null : [first, ...rest];
+}
+
+type Checked<T> = Readonly<{ ok: true; value: T }> | Readonly<{ ok: false; issue: string }>;
+
+function pass<T>(value: T): Checked<T> {
+  return { ok: true, value };
+}
+
+function fail(issue: string): Checked<never> {
+  return { ok: false, issue };
+}
+
+type ResultClaim = z.infer<typeof resultClaimSchema>;
+type EvidenceClaim = ResultClaim["evidence"][number];
+type BrowserEvidence = z.infer<typeof browserOutputSchema>["evidence"];
+
+type ClaimScope = Readonly<{
+  claim: ResultClaim;
+  planCheck: PlanCheck;
+  role: "ac" | "ui";
+  cases: readonly PlanCase[];
+  receiptById: ReadonlyMap<string, TrustedToolReceipt>;
+}>;
+
+function trustedReceipt(item: EvidenceClaim, scope: ClaimScope): Checked<TrustedToolReceipt> {
+  const receipt = scope.receiptById.get(item.receiptId);
+
+  if (!receipt) {
+    return fail(`unknown receipt ${item.receiptId}`);
+  }
+
+  if (receipt.role !== scope.role || receipt.checkId !== scope.claim.checkId) {
+    return fail(`receipt ${receipt.id} is not bound to ${scope.claim.checkId}`);
+  }
+
+  const outputDigest = digestOf(receipt.output);
+
+  if (receipt.outputDigest !== outputDigest || item.digest !== outputDigest) {
+    return fail(`evidence digest mismatch for ${receipt.id}`);
+  }
+
+  return pass(receipt);
+}
+
+function framedEvidence(
+  evidence: BrowserEvidence,
+  planCase: PlanCase,
+  planCheck: PlanCheck,
+  receiptId: string,
+): Checked<PublicEvidence> {
+  if (evidence.kind === "functional" && evidence.actionIndex !== planCase.actions.length - 1) {
+    return fail(`receipt ${receiptId} evidence action index does not match the case frame`);
+  }
+
+  if (
+    evidence.kind === "style" &&
+    planCheck.kind === "style" &&
+    !sameDesign(evidence.capturedDesign.reference, planCheck.design)
+  ) {
+    return fail(`receipt ${receiptId} evidence design does not match the check`);
+  }
+
+  return pass(evidence);
+}
+
+function receiptEvidence(receipt: TrustedToolReceipt, scope: ClaimScope): Checked<PublicEvidence> {
+  const { claim } = scope;
+  const output = browserOutputSchema.safeParse(receipt.output);
+
+  if (!output.success || output.data.checkId !== claim.checkId) {
+    return fail(`receipt ${receipt.id} does not carry a matching check result`);
+  }
+
+  const evidence = output.data.evidence;
+
+  if (evidence.kind !== scope.planCheck.kind) {
+    return fail(`receipt ${receipt.id} evidence kind does not match the check`);
+  }
+
+  const planCase = scope.cases.find((item) => item.id === claim.caseId);
+
+  if (!planCase) {
+    return fail(`unknown case ${claim.caseId}`);
+  }
+
+  if (evidence.caseId !== claim.caseId || evidence.checkId !== claim.checkId) {
+    return fail(`receipt ${receipt.id} evidence is not bound to ${claim.caseId}/${claim.checkId}`);
+  }
+
+  return framedEvidence(evidence, planCase, scope.planCheck, receipt.id);
+}
+
+function claimEvidence(scope: ClaimScope, issues: string[]): PublicEvidence[] {
+  const evidence: PublicEvidence[] = [];
+  const digests = new Set<string>();
+
+  for (const item of scope.claim.evidence) {
+    const receipt = trustedReceipt(item, scope);
+
+    if (!receipt.ok) {
+      issues.push(receipt.issue);
+      continue;
+    }
+
+    if (digests.has(receipt.value.outputDigest)) {
+      issues.push(`duplicate evidence for ${receipt.value.id}`);
+      continue;
+    }
+
+    digests.add(receipt.value.outputDigest);
+    const checked = receiptEvidence(receipt.value, scope);
+
+    if (!checked.ok) {
+      issues.push(checked.issue);
+      continue;
+    }
+
+    evidence.push(checked.value);
+  }
+
+  return evidence;
+}
+
+function claimResult(scope: ClaimScope, issues: string[]): CheckResult | null {
+  const { claim } = scope;
+  const trustedEvidence = evidenceList(claimEvidence(scope, issues));
+
+  if (!trustedEvidence) {
+    issues.push(`check ${claim.checkId} has no trusted evidence`);
+
+    return null;
+  }
+
+  const judgment = judgmentOf(trustedEvidence[0]);
+
+  if (claim.judgment !== judgment) {
+    issues.push(`judgment for ${claim.checkId} is not supported by trusted evidence`);
+
+    return null;
+  }
+
+  return {
+    caseId: claim.caseId,
+    checkId: claim.checkId,
+    judgment,
+    evidence: trustedEvidence,
+  };
+}
+
+type ClaimLedger = Readonly<{
+  assigned: ReadonlyMap<string, PlanCheck>;
+  caseByCheck: ReadonlyMap<string, string>;
+  seen: Set<string>;
+}>;
+
+function claimedCheck(claim: ResultClaim, ledger: ClaimLedger): Checked<PlanCheck> {
+  const planCheck = ledger.assigned.get(claim.checkId);
+
+  if (!planCheck) {
+    return fail(`unknown check ${claim.checkId}`);
+  }
+
+  if (ledger.seen.has(claim.checkId)) {
+    return fail(`duplicate check ${claim.checkId}`);
+  }
+
+  ledger.seen.add(claim.checkId);
+
+  if (ledger.caseByCheck.get(claim.checkId) !== claim.caseId) {
+    return fail(`case mismatch for ${claim.checkId}`);
+  }
+
+  return pass(planCheck);
 }
 
 export function validateResults(raw: unknown, context: ResultsContext): Validation<Results> {
   const parsed = resultsProposalSchema.safeParse(raw);
+
   if (!parsed.success) {
     return rejected(parsed.error.issues.map((issue) => issue.message).join("; "));
   }
+
   const issues: string[] = [];
-  const caseByCheck = new Map<string, string>();
-  for (const planCase of context.cases) {
-    for (const check of planCase.checks) {
-      caseByCheck.set(check.id, planCase.id);
-    }
-  }
-  const assigned = new Map(context.checks.map((check) => [check.id, check]));
+  const ledger: ClaimLedger = {
+    assigned: new Map(context.checks.map((check) => [check.id, check])),
+    caseByCheck: new Map(
+      context.cases.flatMap((planCase) =>
+        planCase.checks.map((check) => [check.id, planCase.id] as const),
+      ),
+    ),
+    seen: new Set(),
+  };
   const receiptById = new Map(context.receipts.map((receipt) => [receipt.id, receipt]));
-  const seen = new Set<string>();
   const checks: CheckResult[] = [];
+
   for (const claim of parsed.data.checks) {
-    const planCheck = assigned.get(claim.checkId);
-    if (!planCheck) {
-      issues.push(`unknown check ${claim.checkId}`);
+    const planCheck = claimedCheck(claim, ledger);
+
+    if (!planCheck.ok) {
+      issues.push(planCheck.issue);
       continue;
     }
-    if (seen.has(claim.checkId)) {
-      issues.push(`duplicate check ${claim.checkId}`);
-      continue;
+
+    const result = claimResult(
+      { claim, planCheck: planCheck.value, role: context.role, cases: context.cases, receiptById },
+      issues,
+    );
+
+    if (result) {
+      checks.push(result);
     }
-    seen.add(claim.checkId);
-    if (caseByCheck.get(claim.checkId) !== claim.caseId) {
-      issues.push(`case mismatch for ${claim.checkId}`);
-      continue;
-    }
-    const evidence: PublicEvidence[] = [];
-    const digests = new Set<string>();
-    for (const item of claim.evidence) {
-      const receipt = receiptById.get(item.receiptId);
-      if (!receipt) {
-        issues.push(`unknown receipt ${item.receiptId}`);
-        continue;
-      }
-      if (receipt.role !== context.role || receipt.checkId !== claim.checkId) {
-        issues.push(`receipt ${receipt.id} is not bound to ${claim.checkId}`);
-        continue;
-      }
-      const outputDigest = digestOf(receipt.output);
-      if (receipt.outputDigest !== outputDigest || item.digest !== outputDigest) {
-        issues.push(`evidence digest mismatch for ${receipt.id}`);
-        continue;
-      }
-      if (digests.has(outputDigest)) {
-        issues.push(`duplicate evidence for ${receipt.id}`);
-        continue;
-      }
-      digests.add(outputDigest);
-      const output = browserOutputSchema.safeParse(receipt.output);
-      if (!output.success || output.data.checkId !== claim.checkId) {
-        issues.push(`receipt ${receipt.id} does not carry a matching check result`);
-        continue;
-      }
-      if (output.data.evidence.kind !== planCheck.kind) {
-        issues.push(`receipt ${receipt.id} evidence kind does not match the check`);
-        continue;
-      }
-      const outputEvidence = output.data.evidence;
-      const planCase = context.cases.find((item) => item.id === claim.caseId);
-      if (!planCase) {
-        issues.push(`unknown case ${claim.caseId}`);
-        continue;
-      }
-      if (outputEvidence.caseId !== claim.caseId || outputEvidence.checkId !== claim.checkId) {
-        issues.push(
-          `receipt ${receipt.id} evidence is not bound to ${claim.caseId}/${claim.checkId}`,
-        );
-        continue;
-      }
-      if (
-        outputEvidence.kind === "functional" &&
-        outputEvidence.actionIndex !== planCase.actions.length - 1
-      ) {
-        issues.push(`receipt ${receipt.id} evidence action index does not match the case frame`);
-        continue;
-      }
-      if (
-        outputEvidence.kind === "style" &&
-        planCheck.kind === "style" &&
-        (outputEvidence.capturedDesign.reference.fileKey !== planCheck.design.fileKey ||
-          outputEvidence.capturedDesign.reference.nodeId !== planCheck.design.nodeId)
-      ) {
-        issues.push(`receipt ${receipt.id} evidence design does not match the check`);
-        continue;
-      }
-      evidence.push(outputEvidence);
-    }
-    const trustedEvidence = evidenceList(evidence);
-    if (!trustedEvidence) {
-      issues.push(`check ${claim.checkId} has no trusted evidence`);
-      continue;
-    }
-    const judgment = judgmentOf(trustedEvidence[0]);
-    if (claim.judgment !== judgment) {
-      issues.push(`judgment for ${claim.checkId} is not supported by trusted evidence`);
-      continue;
-    }
-    checks.push({
-      caseId: claim.caseId,
-      checkId: claim.checkId,
-      judgment,
-      evidence: trustedEvidence,
-    });
   }
+
   for (const check of context.checks) {
-    if (!seen.has(check.id)) {
+    if (!ledger.seen.has(check.id)) {
       issues.push(`missing check ${check.id}`);
     }
   }
-  if (issues.length > 0) {
-    const [first, ...rest] = issues;
-    return first === undefined ? rejected("results rejected") : rejected(first, ...rest);
+
+  const failure = nonEmpty(issues);
+
+  if (failure) {
+    return rejected(...failure);
   }
+
   return accepted({ role: context.role, checks });
 }
 
@@ -770,91 +963,131 @@ function boundPlan(
   };
 }
 
-export function validateReuse(raw: unknown, context: ReuseContext): Validation<BoundArtifact> {
-  const parsed = storedArtifactSchema.safeParse(raw);
-  if (!parsed.success) {
-    return rejected(parsed.error.issues.map((issue) => issue.message).join("; "));
-  }
-  const artifact = parsed.data;
+type StoredArtifact = z.infer<typeof storedArtifactSchema>;
+
+function reuseAccessIssue(artifact: StoredArtifact, context: ReuseContext): string | null {
   if (artifact.kind === "ac-result" || artifact.kind === "ui-result") {
-    return rejected("cross_run_result_forbidden");
+    return "cross_run_result_forbidden";
   }
+
   if (artifact.kind !== context.requested) {
-    return rejected("wrong_kind");
+    return "wrong_kind";
   }
+
   if (artifact.threadId !== context.threadId || artifact.origin.threadId !== context.threadId) {
-    return rejected("not_accessible");
+    return "not_accessible";
   }
+
   const producer = artifact.kind === "requirements" ? "atlassian" : "planner";
+
   if (artifact.origin.role !== producer) {
-    return rejected("untrusted_producer");
+    return "untrusted_producer";
   }
-  if (artifact.scopeDigest !== context.expectedScopeDigest) {
-    return rejected("scope_mismatch");
-  }
-  if (artifact.kind === "requirements") {
-    const payload = requirementsPayloadSchema.safeParse(artifact.payload);
-    if (!payload.success) {
-      return rejected("incomplete");
-    }
-    if (digestOf(payload.data) !== artifact.digest) {
-      return rejected("invalid_evidence");
-    }
-    const selected = selectedCriteria(payload.data.criteria, payload.data.selection);
-    if (selected.missingKeys.length > 0) {
-      const [key] = selected.missingKeys;
-      return key === undefined
-        ? rejected("incomplete")
-        : rejected(`selected criterion ${key} is missing from the extraction`);
-    }
-    const scope = requirementsScopeDigest({
-      goal: payload.data.goal,
-      sources: payload.data.captures.map((capture) => capture.reference),
-      selection: payload.data.selection,
-    });
-    if (scope !== artifact.scopeDigest) {
-      return rejected("scope_mismatch");
-    }
-    return accepted(boundRequirements(artifact, payload.data));
-  }
-  const payload = planPayloadSchema.safeParse(artifact.payload);
+
+  return artifact.scopeDigest === context.expectedScopeDigest ? null : "scope_mismatch";
+}
+
+function reuseRequirements(artifact: StoredArtifact): Validation<BoundArtifact> {
+  const payload = requirementsPayloadSchema.safeParse(artifact.payload);
+
   if (!payload.success) {
     return rejected("incomplete");
   }
+
   if (digestOf(payload.data) !== artifact.digest) {
     return rejected("invalid_evidence");
   }
+
+  const [missingKey] = selectedCriteria(payload.data.criteria, payload.data.selection).missingKeys;
+
+  if (missingKey !== undefined) {
+    return rejected(`selected criterion ${missingKey} is missing from the extraction`);
+  }
+
+  const scope = requirementsScopeDigest({
+    goal: payload.data.goal,
+    sources: payload.data.captures.map((capture) => capture.reference),
+    selection: payload.data.selection,
+  });
+
+  if (scope !== artifact.scopeDigest) {
+    return rejected("scope_mismatch");
+  }
+
+  return accepted(boundRequirements(artifact, payload.data));
+}
+
+type PlanPayload = z.infer<typeof planPayloadSchema>;
+
+function planDependenciesMatch(payload: PlanPayload, planContext: PlanContext): boolean {
+  return (
+    digestOf(planContext.requirements) === planContext.requirementsDigest &&
+    payload.requirementsDigest === planContext.requirementsDigest &&
+    payload.goal === planContext.goal &&
+    payload.targetUrl === planContext.targetUrl &&
+    digestOf(payload.design) === digestOf(planContext.design)
+  );
+}
+
+function reusePlan(artifact: StoredArtifact, context: ReuseContext): Validation<BoundArtifact> {
+  const payload = planPayloadSchema.safeParse(artifact.payload);
+
+  if (!payload.success) {
+    return rejected("incomplete");
+  }
+
+  if (digestOf(payload.data) !== artifact.digest) {
+    return rejected("invalid_evidence");
+  }
+
   const scope = planScopeDigest({
     goal: payload.data.goal,
     targetUrl: payload.data.targetUrl,
     design: payload.data.design,
     requirementsDigest: payload.data.requirementsDigest,
   });
+
   if (scope !== artifact.scopeDigest) {
     return rejected("scope_mismatch");
   }
+
   if (context.requested !== "plan") {
     return rejected("wrong_kind");
   }
-  const planContext = context.planContext;
-  if (
-    digestOf(planContext.requirements) !== planContext.requirementsDigest ||
-    payload.data.requirementsDigest !== planContext.requirementsDigest ||
-    payload.data.goal !== planContext.goal ||
-    payload.data.targetUrl !== planContext.targetUrl ||
-    digestOf(payload.data.design) !== digestOf(planContext.design)
-  ) {
+
+  if (!planDependenciesMatch(payload.data, context.planContext)) {
     return rejected("dependency_rejected");
   }
-  const canonical = canonicalizePlan({ cases: payload.data.cases }, planContext);
+
+  const canonical = canonicalizePlan({ cases: payload.data.cases }, context.planContext);
+
   if (canonical.kind === "rejected") {
-    const [first, ...rest] = canonical.issues;
-    return first === undefined ? rejected("plan rejected") : rejected(first, ...rest);
+    return rejected(...canonical.issues);
   }
+
   if (digestOf(canonical.value) !== digestOf(payload.data)) {
     return rejected("invalid_evidence");
   }
+
   return accepted(boundPlan(artifact, canonical.value));
+}
+
+export function validateReuse(raw: unknown, context: ReuseContext): Validation<BoundArtifact> {
+  const parsed = storedArtifactSchema.safeParse(raw);
+
+  if (!parsed.success) {
+    return rejected(parsed.error.issues.map((issue) => issue.message).join("; "));
+  }
+
+  const issue = reuseAccessIssue(parsed.data, context);
+
+  if (issue) {
+    return rejected(issue);
+  }
+
+  return parsed.data.kind === "requirements"
+    ? reuseRequirements(parsed.data)
+    : reusePlan(parsed.data, context);
 }
 
 export type RoleOutcome =
@@ -874,6 +1107,10 @@ export type RoleOutcome =
   | Readonly<{ kind: "cancelling"; active: readonly ToolActivityView[] }>
   | Readonly<{ kind: "terminal"; outcome: TaskOutcome; reasonCode: string }>;
 
+function withChecks(checks: CheckProgress | undefined): Readonly<{ checks?: CheckProgress }> {
+  return checks ? { checks } : {};
+}
+
 function rowOf(outcome: RoleOutcome): ProgressRow {
   switch (outcome.kind) {
     case "reused":
@@ -885,13 +1122,9 @@ function rowOf(outcome: RoleOutcome): ProgressRow {
     case "undispatched":
       return { status: "undispatched", reason: outcome.reason };
     case "running":
-      return outcome.checks
-        ? { status: "running", activity: outcome.activity, checks: outcome.checks }
-        : { status: "running", activity: outcome.activity };
+      return { status: "running", activity: outcome.activity, ...withChecks(outcome.checks) };
     case "tool_activity":
-      return outcome.checks
-        ? { status: "tool_activity", active: outcome.active, checks: outcome.checks }
-        : { status: "tool_activity", active: outcome.active };
+      return { status: "tool_activity", active: outcome.active, ...withChecks(outcome.checks) };
     case "cancelling":
       return { status: "cancelling", active: outcome.active };
     case "terminal":
@@ -906,14 +1139,18 @@ export function projectProgress(
 ): ProgressCard {
   const rowFor = (role: RoleId): ProgressRow => {
     const outcome = outcomes[role];
+
     if (outcome) {
       return rowOf(outcome);
     }
+
     if (role === "ui" && plan && plan.assignments.ui.length === 0) {
       return { status: "not_required", reason: "no_style_checks" };
     }
+
     return { status: "waiting", reason: "dispatch" };
   };
+
   return {
     version,
     rows: {
@@ -938,128 +1175,143 @@ export type ReportInput = Readonly<{
   outcomes: Partial<Record<RoleId, RoleOutcome>>;
 }>;
 
-export function deriveReport(input: ReportInput): PublicTestReport {
-  const plan: PublicPlan | null = input.plan
+function publicPlan(plan: CanonicalPlan | null): PublicPlan | null {
+  return plan
+    ? { cases: plan.cases, assignments: { ac: plan.assignments.ac, ui: plan.assignments.ui } }
+    : null;
+}
+
+function publicResults(results: Results | null): readonly PublicCheckResult[] {
+  return (results?.checks ?? []).map((check) => ({
+    caseId: check.caseId,
+    checkId: check.checkId,
+    judgment: check.judgment,
+    evidence: check.evidence,
+  }));
+}
+
+function judgmentsByCheck(input: ReportInput): ReadonlyMap<string, Judgment> {
+  return new Map(
+    [...(input.acResults?.checks ?? []), ...(input.uiResults?.checks ?? [])].map((check) => [
+      check.checkId,
+      check.judgment,
+    ]),
+  );
+}
+
+function uncoveredCriteria(
+  requirements: Requirements | null,
+  covered: ReadonlySet<string>,
+): Coverage[] {
+  if (!requirements) {
+    return [];
+  }
+
+  return selectedCriteria(requirements.criteria, requirements.selection)
+    .criteria.filter((criterion) => !covered.has(criterion.id))
+    .map((criterion): Coverage => ({
+      criterionId: criterion.id,
+      caseId: null,
+      checkId: null,
+      state: "uncovered",
+    }));
+}
+
+function reportCoverage(input: ReportInput, plan: PublicPlan | null): Coverage[] {
+  const byCheck = judgmentsByCheck(input);
+  const planned = (plan?.cases ?? []).flatMap((planCase) =>
+    planCase.checks.map((check): Coverage => ({
+      criterionId: check.criterionId,
+      caseId: planCase.id,
+      checkId: check.id,
+      state: byCheck.get(check.id) ?? "uncovered",
+    })),
+  );
+  const covered = new Set(planned.map((row) => row.criterionId));
+
+  return [...planned, ...uncoveredCriteria(input.requirements, covered)];
+}
+
+function resultsMissing(assigned: readonly string[] | undefined, results: Results | null): boolean {
+  return (assigned?.length ?? 0) > 0 && !results;
+}
+
+function reportIssues(
+  input: ReportInput,
+  plan: PublicPlan | null,
+  coverage: readonly Coverage[],
+): string[] {
+  const conditions: ReadonlyArray<readonly [boolean, string]> = [
+    [!input.requirements, "requirements_missing"],
+    [!plan, "plan_missing"],
+    [resultsMissing(plan?.assignments.ac, input.acResults), "ac_results_missing"],
+    [resultsMissing(plan?.assignments.ui, input.uiResults), "ui_results_missing"],
+    [(input.requirements?.unresolved.length ?? 0) > 0, "requirements_unresolved"],
+    [input.unresolvedSources.length > 0, "sources_unresolved"],
+    [coverage.some((row) => row.state === "uncovered"), "coverage_incomplete"],
+    [coverage.some((row) => row.state === "simulated_blocked"), "blocked_evidence"],
+    [input.rootOutcome !== "completed", `root_${input.rootOutcome}`],
+  ];
+
+  return conditions.filter(([failed]) => failed).map(([, issue]) => issue);
+}
+
+function notRequiredIssue(role: RoleId, plan: PublicPlan | null): string | null {
+  return role === "ui" && plan?.assignments.ui.length === 0
+    ? null
+    : `role_${role}_unexpected_not_required`;
+}
+
+function roleIssue(role: RoleId, outcome: RoleOutcome, plan: PublicPlan | null): string | null {
+  switch (outcome.kind) {
+    case "reused":
+      return null;
+    case "not_required":
+      return notRequiredIssue(role, plan);
+    case "terminal":
+      return outcome.outcome === "completed" ? null : `role_${role}_${outcome.outcome}`;
+    case "undispatched":
+      return `role_${role}_undispatched_${outcome.reason}`;
+    case "waiting":
+      return `role_${role}_waiting`;
+    default:
+      return `role_${role}_${outcome.kind}`;
+  }
+}
+
+function roleIssues(input: ReportInput, plan: PublicPlan | null): string[] {
+  return ROLE_IDS.flatMap((role) => {
+    const outcome = input.outcomes[role];
+    const issue = outcome ? roleIssue(role, outcome, plan) : null;
+
+    return issue ? [issue] : [];
+  });
+}
+
+function publicRequirements(requirements: Requirements | null): PublicTestReport["requirements"] {
+  return requirements
     ? {
-        cases: input.plan.cases,
-        assignments: { ac: input.plan.assignments.ac, ui: input.plan.assignments.ui },
+        goal: requirements.goal,
+        criteria: requirements.criteria,
+        selection: requirements.selection,
+        unresolved: requirements.unresolved,
       }
     : null;
-  const toPublic = (results: Results | null): readonly PublicCheckResult[] =>
-    (results?.checks ?? []).map((check) => ({
-      caseId: check.caseId,
-      checkId: check.checkId,
-      judgment: check.judgment,
-      evidence: check.evidence,
-    }));
-  const coverage: Coverage[] = [];
-  const byCheck = new Map<string, Judgment>();
-  for (const check of input.acResults?.checks ?? []) {
-    byCheck.set(check.checkId, check.judgment);
-  }
-  for (const check of input.uiResults?.checks ?? []) {
-    byCheck.set(check.checkId, check.judgment);
-  }
-  const coveredCriteria = new Set<string>();
-  for (const planCase of plan?.cases ?? []) {
-    for (const check of planCase.checks) {
-      coveredCriteria.add(check.criterionId);
-      coverage.push({
-        criterionId: check.criterionId,
-        caseId: planCase.id,
-        checkId: check.id,
-        state: byCheck.get(check.id) ?? "uncovered",
-      });
-    }
-  }
-  if (input.requirements) {
-    const selected = selectedCriteria(input.requirements.criteria, input.requirements.selection);
-    for (const criterion of selected.criteria) {
-      if (!coveredCriteria.has(criterion.id)) {
-        coverage.push({
-          criterionId: criterion.id,
-          caseId: null,
-          checkId: null,
-          state: "uncovered",
-        });
-      }
-    }
-  }
-  const issues: string[] = [];
-  if (!input.requirements) {
-    issues.push("requirements_missing");
-  }
-  if (!plan) {
-    issues.push("plan_missing");
-  }
-  if (plan && plan.assignments.ac.length > 0 && !input.acResults) {
-    issues.push("ac_results_missing");
-  }
-  if (plan && plan.assignments.ui.length > 0 && !input.uiResults) {
-    issues.push("ui_results_missing");
-  }
-  if (input.requirements && input.requirements.unresolved.length > 0) {
-    issues.push("requirements_unresolved");
-  }
-  if (input.unresolvedSources.length > 0) {
-    issues.push("sources_unresolved");
-  }
-  if (coverage.some((row) => row.state === "uncovered")) {
-    issues.push("coverage_incomplete");
-  }
-  if (coverage.some((row) => row.state === "simulated_blocked")) {
-    issues.push("blocked_evidence");
-  }
-  if (input.rootOutcome !== "completed") {
-    issues.push(`root_${input.rootOutcome}`);
-  }
-  for (const role of ROLE_IDS) {
-    const outcome = input.outcomes[role];
-    if (!outcome) {
-      continue;
-    }
-    switch (outcome.kind) {
-      case "reused":
-        break;
-      case "not_required":
-        if (role !== "ui" || plan?.assignments.ui.length !== 0) {
-          issues.push(`role_${role}_unexpected_not_required`);
-        }
-        break;
-      case "terminal":
-        if (outcome.outcome !== "completed") {
-          issues.push(`role_${role}_${outcome.outcome}`);
-        }
-        break;
-      case "undispatched":
-        issues.push(`role_${role}_undispatched_${outcome.reason}`);
-        break;
-      case "waiting":
-        issues.push(`role_${role}_waiting`);
-        break;
-      case "running":
-      case "tool_activity":
-      case "cancelling":
-        issues.push(`role_${role}_${outcome.kind}`);
-        break;
-    }
-  }
-  const blocked = nonEmpty(issues);
+}
+
+export function deriveReport(input: ReportInput): PublicTestReport {
+  const plan = publicPlan(input.plan);
+  const coverage = reportCoverage(input, plan);
+  const blocked = nonEmpty([...reportIssues(input, plan, coverage), ...roleIssues(input, plan)]);
   const acceptance: Acceptance = blocked
     ? { verdict: "blocked", reasons: blocked }
     : { verdict: "not_verified", reason: "mock_only" };
+
   return {
     runId: input.runId,
-    requirements: input.requirements
-      ? {
-          goal: input.requirements.goal,
-          criteria: input.requirements.criteria,
-          selection: input.requirements.selection,
-          unresolved: input.requirements.unresolved,
-        }
-      : null,
+    requirements: publicRequirements(input.requirements),
     plan,
-    results: { ac: toPublic(input.acResults), ui: toPublic(input.uiResults) },
+    results: { ac: publicResults(input.acResults), ui: publicResults(input.uiResults) },
     coverage,
     unresolvedSources: input.unresolvedSources,
     artifacts: input.artifacts,

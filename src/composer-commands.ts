@@ -27,7 +27,9 @@ export function commandSuggestions(input: {
   ) {
     return [];
   }
+
   const query = input.text.slice(1, input.cursor);
+
   return COMPOSER_COMMANDS.filter((command) => command.name.startsWith(query));
 }
 
@@ -42,17 +44,21 @@ export function composerKeyAction(input: {
   if (input.isComposing || input.composing || input.keyCode === 229) {
     return "none";
   }
+
   if (input.hasSuggestions) {
     if (input.key === "Escape") {
       return "dismiss";
     }
+
     if (input.key === "ArrowUp") {
       return "previous";
     }
+
     if (input.key === "ArrowDown") {
       return "next";
     }
   }
+
   return input.key === "Enter" && !input.shiftKey
     ? input.hasSuggestions
       ? "select"

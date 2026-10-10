@@ -46,9 +46,11 @@ test("closed tool event buffers ignore late callbacks", () => {
 
 test("tool event overflow rejects the callback and stops buffering", () => {
   const buffer = createToolEventBuffer("call-9");
+
   for (let index = 0; index < maxToolEvents; index++) {
     buffer.emit("code_mode:console", { level: "log", byteLength: index });
   }
+
   assert.throws(
     () => buffer.emit("code_mode:console", { level: "log", byteLength: 0 }),
     /exceeded their bound/,

@@ -308,10 +308,12 @@ test("numeric style observations reject foreign units, trailing junk and non-fin
     },
   });
   const outcomes = [];
+
   for (const check of checks) {
     const output = browserOutputSchema.parse(await tool.execute!({ checkId: check.id }));
     outcomes.push(output.evidence.outcome);
   }
+
   assert.deepEqual(outcomes, [
     "outside_tolerance",
     "outside_tolerance",

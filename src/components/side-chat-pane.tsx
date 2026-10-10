@@ -89,41 +89,95 @@ export function SummaryPreview({
   );
 }
 
-export function SideChatPane({
+type ConfirmingSummary = Extract<SummaryState, { kind: "confirming" }>;
+type ActiveDraft = SummaryTransfer | ConfirmingSummary;
+type AcceptIntoMain = (
+  accept: () => Promise<TransferReceipt>,
+  transferKey: string,
+) => Promise<TransferReceipt>;
+
+function activeDraftOf(summary: SummaryState): ActiveDraft | null {
+  return summary.kind === "draft" || summary.kind === "confirming" || summary.kind === "unresolved"
+    ? summary
+    : null;
+}
+
+function confirmableDraft(
+  draft: ActiveDraft | null,
+  commandActive: boolean,
+  ready: boolean,
+): draft is SummaryTransfer {
+  return (
+    draft !== null &&
+    draft.kind !== "confirming" &&
+    !commandActive &&
+    ready &&
+    draft.text.trim().length > 0
+  );
+}
+
+function paneStatus(phase: ReturnType<typeof useThread>["phase"]) {
+  if (phase === "compacting") {
+    return "compacting" as const;
+  }
+
+  return phase === "busy" ? ("running" as const) : ("idle" as const);
+}
+
+async function transferSummary(
+  entryId: string,
+  scope: string,
+  draft: SummaryTransfer,
+): Promise<TransferReceipt> {
+  const accepted = transferReceiptSchema.parse(
+    await sideRequest(`/${entryId}/transfer`, scope, {
+      method: "POST",
+      body: JSON.stringify({
+        draftId: draft.draft.id,
+        transferKey: draft.key,
+        text: draft.text,
+      }),
+    }),
+  );
+
+  if (accepted.sideChatId !== entryId) {
+    throw new Error("摘要回填收據不符");
+  }
+
+  return accepted;
+}
+
+function useSummaryTransfer({
   entry,
   scope,
+  ready,
   mainBusy,
   acceptIntoMain,
   onClose,
 }: {
   entry: SideChatEntry;
   scope: string;
+  ready: boolean;
   mainBusy: boolean;
-  acceptIntoMain: (
-    accept: () => Promise<TransferReceipt>,
-    transferKey: string,
-  ) => Promise<TransferReceipt>;
+  acceptIntoMain: AcceptIntoMain;
   onClose: () => void;
 }) {
-  const thread = useThread(entry.id, scope);
   const [summary, setSummary] = useState<SummaryState>({ kind: "empty" });
   const [error, setError] = useState<string | null>(null);
   const command = useRef(false);
-  const activeDraft =
-    summary.kind === "draft" || summary.kind === "confirming" || summary.kind === "unresolved"
-      ? summary
-      : null;
+  const activeDraft = activeDraftOf(summary);
   const summaryLocked = summary.kind === "confirming" || summary.kind === "unresolved";
-  const ready = thread.phase === "ready";
 
   async function preview() {
     if (!ready || command.current || summaryLocked) {
       return;
     }
+
     command.current = true;
     setError(null);
     const previous = summary;
     setSummary({ kind: "previewing" });
+
     try {
       const draft = summaryDraftSchema.parse(
         await sideRequest(`/${entry.id}/summary`, scope, { method: "POST" }),
@@ -138,39 +192,25 @@ export function SideChatPane({
   }
 
   async function confirm() {
-    if (
-      !activeDraft ||
-      activeDraft.kind === "confirming" ||
-      command.current ||
-      !ready ||
-      !activeDraft.text.trim()
-    ) {
+    if (!confirmableDraft(activeDraft, command.current, ready)) {
       return;
     }
+
     if (mainBusy && activeDraft.kind !== "unresolved") {
       setError("主對話忙碌中，摘要草稿已保留。請稍後再確認。");
+
       return;
     }
+
     command.current = true;
     setError(null);
     setSummary({ ...activeDraft, kind: "confirming" });
+
     try {
-      const receipt = await acceptIntoMain(async () => {
-        const accepted = transferReceiptSchema.parse(
-          await sideRequest(`/${entry.id}/transfer`, scope, {
-            method: "POST",
-            body: JSON.stringify({
-              draftId: activeDraft.draft.id,
-              transferKey: activeDraft.key,
-              text: activeDraft.text,
-            }),
-          }),
-        );
-        if (accepted.sideChatId !== entry.id) {
-          throw new Error("摘要回填收據不符");
-        }
-        return accepted;
-      }, activeDraft.key);
+      const receipt = await acceptIntoMain(
+        () => transferSummary(entry.id, scope, activeDraft),
+        activeDraft.key,
+      );
       setSummary({ kind: "accepted", receipt });
       onClose();
     } catch (cause) {
@@ -181,6 +221,100 @@ export function SideChatPane({
     }
   }
 
+  function edit(text: string) {
+    setSummary((current) =>
+      current.kind === "draft" && !command.current
+        ? { ...current, text, key: crypto.randomUUID() }
+        : current,
+    );
+  }
+
+  function assertSendable() {
+    if (command.current || summaryLocked) {
+      throw new SideChatOperationError("blocked", "請先確認同一筆摘要回填的結果。");
+    }
+  }
+
+  return { summary, error, activeDraft, summaryLocked, preview, confirm, edit, assertSendable };
+}
+
+type SummaryTransferFlow = ReturnType<typeof useSummaryTransfer>;
+
+function SummaryButton({ flow, ready }: { flow: SummaryTransferFlow; ready: boolean }) {
+  const previewing = flow.summary.kind === "previewing";
+
+  return (
+    <Button
+      variant="outline"
+      size="sm"
+      disabled={!ready || previewing || flow.summaryLocked}
+      onClick={() => void flow.preview()}
+    >
+      <FileTextIcon data-icon="inline-start" />
+      {previewing ? "產生摘要中" : "預覽摘要"}
+    </Button>
+  );
+}
+
+function SideChatFooter({
+  flow,
+  entry,
+  ready,
+  mainBusy,
+}: {
+  flow: SummaryTransferFlow;
+  entry: SideChatEntry;
+  ready: boolean;
+  mainBusy: boolean;
+}) {
+  const { activeDraft, summary, error } = flow;
+
+  return (
+    <>
+      {activeDraft ? (
+        <SummaryPreview
+          id={entry.id}
+          title={entry.title}
+          text={activeDraft.text}
+          confirming={summary.kind === "confirming"}
+          unresolved={summary.kind === "unresolved"}
+          ready={ready}
+          mainBusy={mainBusy}
+          onEdit={flow.edit}
+          onConfirm={() => void flow.confirm()}
+        />
+      ) : null}
+      {summary.kind === "accepted" ? (
+        <p role="status" className="px-4 py-2 text-sm">
+          摘要已送入主對話，主模型已開始回應。
+        </p>
+      ) : null}
+      {error ? (
+        <p role="alert" className="px-4 py-2 text-sm text-destructive">
+          {error}
+        </p>
+      ) : null}
+    </>
+  );
+}
+
+export function SideChatPane({
+  entry,
+  scope,
+  mainBusy,
+  acceptIntoMain,
+  onClose,
+}: {
+  entry: SideChatEntry;
+  scope: string;
+  mainBusy: boolean;
+  acceptIntoMain: AcceptIntoMain;
+  onClose: () => void;
+}) {
+  const thread = useThread(entry.id, scope);
+  const ready = thread.phase === "ready";
+  const flow = useSummaryTransfer({ entry, scope, ready, mainBusy, acceptIntoMain, onClose });
+
   return (
     <Pane
       pane={{
@@ -188,70 +322,22 @@ export function SideChatPane({
         title: entry.title,
         agent: "獨立討論",
         kind: "agent",
-        status:
-          thread.phase === "compacting"
-            ? "compacting"
-            : thread.phase === "busy"
-              ? "running"
-              : "idle",
+        status: paneStatus(thread.phase),
         progress: [],
         messages: thread.messages,
       }}
       onSend={(text) => {
-        if (command.current || summaryLocked) {
-          throw new SideChatOperationError("blocked", "請先確認同一筆摘要回填的結果。");
-        }
+        flow.assertSendable();
+
         return thread.send(text);
       }}
-      sendDisabled={!ready || summaryLocked}
+      sendDisabled={!ready || flow.summaryLocked}
       onClose={onClose}
       isHydrating={thread.phase === "loading"}
       hydrationError={thread.error}
       compactNotice={thread.compactNotice}
-      headerAction={
-        <Button
-          variant="outline"
-          size="sm"
-          disabled={!ready || summary.kind === "previewing" || summaryLocked}
-          onClick={() => void preview()}
-        >
-          <FileTextIcon data-icon="inline-start" />
-          {summary.kind === "previewing" ? "產生摘要中" : "預覽摘要"}
-        </Button>
-      }
-      footer={
-        <>
-          {activeDraft ? (
-            <SummaryPreview
-              id={entry.id}
-              title={entry.title}
-              text={activeDraft.text}
-              confirming={summary.kind === "confirming"}
-              unresolved={summary.kind === "unresolved"}
-              ready={ready}
-              mainBusy={mainBusy}
-              onEdit={(text) =>
-                setSummary((current) =>
-                  current.kind === "draft" && !command.current
-                    ? { ...current, text, key: crypto.randomUUID() }
-                    : current,
-                )
-              }
-              onConfirm={() => void confirm()}
-            />
-          ) : null}
-          {summary.kind === "accepted" ? (
-            <p role="status" className="px-4 py-2 text-sm">
-              摘要已送入主對話，主模型已開始回應。
-            </p>
-          ) : null}
-          {error ? (
-            <p role="alert" className="px-4 py-2 text-sm text-destructive">
-              {error}
-            </p>
-          ) : null}
-        </>
-      }
+      headerAction={<SummaryButton flow={flow} ready={ready} />}
+      footer={<SideChatFooter flow={flow} entry={entry} ready={ready} mainBusy={mainBusy} />}
     />
   );
 }

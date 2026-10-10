@@ -1,7 +1,12 @@
 import { setTimeout as delay } from "node:timers/promises";
 import { DBOS, DBOSClient } from "@dbos-inc/dbos-sdk";
 import type { SideAccess } from "../../shared/side-chat";
-import { runAgentLoop, type AgentCheckpoint, type AgentSession } from "./agent-loop";
+import {
+  runAgentLoop,
+  type AgentCheckpoint,
+  type AgentOrchestration,
+  type AgentSession,
+} from "./agent-loop";
 import { ContextOverflowError } from "./model-turn";
 import { RUN_TESTS_TOOL, withRunTools, type RunTools } from "./tools";
 import { drainTestingTransports } from "./testing-child";
@@ -28,9 +33,11 @@ import {
 
 export async function acceptRun(value: RunInput, access?: SideAccess): Promise<AcceptedRun> {
   const accepted = await persistRun(value, access);
+
   if (accepted.pending) {
     await ensureStarted(accepted.run);
   }
+
   return accepted.run;
 }
 
@@ -69,10 +76,101 @@ async function compactConversation(
           { name: `publish-${name}:${turn}` },
         )
       : conversation;
+
   if (reason === "overflow" && outcome.state !== "done") {
     throw new ContextOverflowError();
   }
+
   return { conversation: next, state: outcome.state };
+}
+
+async function finishCompactRun(
+  run: AcceptedRun,
+  conversation: ConversationState,
+  tools: RunTools,
+  signal: AbortSignal,
+) {
+  const result = await compactConversation(run, conversation, tools, 0, "manual", signal);
+  await DBOS.runStep(
+    () =>
+      finishRun(
+        run.runId,
+        result.state === "failed" ? undefined : result.conversation,
+        "compaction_failed",
+      ),
+    { name: "finish" },
+  );
+}
+
+function testingOrchestration(run: AcceptedRun): AgentOrchestration | undefined {
+  if (run.side) {
+    return undefined;
+  }
+
+  return async (call) => {
+    if (call.name !== RUN_TESTS_TOOL) {
+      return { state: "unhandled" };
+    }
+
+    try {
+      return { state: "handled", output: await orchestrateAttachedTesting(run, call) };
+    } catch (error) {
+      return {
+        state: "handled",
+        error: true,
+        output: {
+          error: error instanceof Error ? error.message : "Testing delegation failed",
+        },
+      };
+    }
+  };
+}
+
+function runSession(run: AcceptedRun, tools: RunTools): AgentSession {
+  return {
+    runId: run.runId,
+    assertExecution: () => assertExecution(run),
+    emit,
+    chatStream: async (options) => {
+      const { deepinfra } = await import("./provider");
+
+      return deepinfra(run.model).chatStream(options);
+    },
+    tools,
+  };
+}
+
+const runCheckpoint: AgentCheckpoint = ({ name, retry, shouldRetry, work }) =>
+  retry ? DBOS.runStep(work, { name, ...retry, shouldRetry }) : DBOS.runStep(work, { name });
+
+async function finishChatRun(
+  run: AcceptedRun,
+  conversation: ConversationState,
+  tools: RunTools,
+  signal: AbortSignal,
+) {
+  const result = await runAgentLoop({
+    session: runSession(run, tools),
+    conversation,
+    model: run.model,
+    prompt: run.prompt,
+    signal,
+    checkpoint: runCheckpoint,
+    orchestration: testingOrchestration(run),
+    compaction: {
+      kind: "chat",
+      compact: ({ conversation: current, reason, turn: step }) =>
+        compactConversation(run, current, tools, step, reason, signal).then(
+          (outcome) => outcome.conversation,
+        ),
+    },
+  });
+
+  if (result.state !== "done") {
+    throw new Error("Model iteration limit exceeded");
+  }
+
+  await DBOS.runStep(() => finishRun(run.runId, result.conversation), { name: "finish" });
 }
 
 export async function executeRun(run: AcceptedRun) {
@@ -83,74 +181,20 @@ export async function executeRun(run: AcceptedRun) {
   ) {
     throw new Error("Incompatible run build");
   }
+
   await assertExecution(run);
   const signal = executions.get(run.runId)?.controller.signal ?? new AbortController().signal;
   signal.throwIfAborted();
+
   return withRunTools(
     async (tools) => {
-      let conversation: ConversationState = { display: run.messages, context: run.context };
+      const conversation: ConversationState = { display: run.messages, context: run.context };
+
       if (run.kind === "compact") {
-        const result = await compactConversation(run, conversation, tools, 0, "manual", signal);
-        await DBOS.runStep(
-          () =>
-            finishRun(
-              run.runId,
-              result.state === "failed" ? undefined : result.conversation,
-              "compaction_failed",
-            ),
-          { name: "finish" },
-        );
-        return;
+        await finishCompactRun(run, conversation, tools, signal);
+      } else {
+        await finishChatRun(run, conversation, tools, signal);
       }
-      const session: AgentSession = {
-        runId: run.runId,
-        assertExecution: () => assertExecution(run),
-        emit,
-        chatStream: async (options) => {
-          const { deepinfra } = await import("./provider");
-          return deepinfra(run.model).chatStream(options);
-        },
-        tools,
-      };
-      const checkpoint: AgentCheckpoint = ({ name, retry, shouldRetry, work }) =>
-        retry ? DBOS.runStep(work, { name, ...retry, shouldRetry }) : DBOS.runStep(work, { name });
-      const result = await runAgentLoop({
-        session,
-        conversation,
-        model: run.model,
-        prompt: run.prompt,
-        signal,
-        checkpoint,
-        orchestration: run.side
-          ? undefined
-          : async (call) => {
-              if (call.name !== RUN_TESTS_TOOL) {
-                return { state: "unhandled" };
-              }
-              try {
-                return { state: "handled", output: await orchestrateAttachedTesting(run, call) };
-              } catch (error) {
-                return {
-                  state: "handled",
-                  error: true,
-                  output: {
-                    error: error instanceof Error ? error.message : "Testing delegation failed",
-                  },
-                };
-              }
-            },
-        compaction: {
-          kind: "chat",
-          compact: ({ conversation: current, reason, turn: step }) =>
-            compactConversation(run, current, tools, step, reason, signal).then(
-              (outcome) => outcome.conversation,
-            ),
-        },
-      });
-      if (result.state !== "done") {
-        throw new Error("Model iteration limit exceeded");
-      }
-      await DBOS.runStep(() => finishRun(run.runId, result.conversation), { name: "finish" });
     },
     signal,
     run.side ? "ordinary" : "main",
@@ -169,16 +213,20 @@ export async function ensureStarted(run: AcceptedRun) {
   if (![BUILD, PREVIOUS_BUILD].includes(run.build) || run.model !== MODEL) {
     throw new RunRequestError(409, "Incompatible run build");
   }
+
   const prior = executions.get(run.runId);
+
   if (prior) {
     return prior.starting;
   }
+
   const entry: Execution = { controller: new AbortController(), starting: Promise.resolve() };
   executions.set(run.runId, entry);
   entry.starting = (async () => {
     await assertExecution(run);
     entry.controller.signal.throwIfAborted();
     const status = await DBOS.getWorkflowStatus(run.runId);
+
     if (!status) {
       entry.controller.signal.throwIfAborted();
       const handle = await DBOS.startWorkflow(run.build === BUILD ? workflow : previousWorkflow, {
@@ -188,6 +236,7 @@ export async function ensureStarted(run: AcceptedRun) {
         () => undefined,
         () => undefined,
       );
+
       if (!run.side) {
         void entry.quiet.finally(() => executions.delete(run.runId));
       }
@@ -195,12 +244,14 @@ export async function ensureStarted(run: AcceptedRun) {
       throw new Error("Missing original side chat invocation handle");
     }
   })();
+
   try {
     await entry.starting;
   } catch (error) {
     if (!entry.quiet) {
       executions.delete(run.runId);
     }
+
     throw error;
   }
 }
@@ -221,48 +272,77 @@ export function trackSideSummary<T>(
   const quiet = Promise.resolve().then(() => use(controller.signal));
   const entry = { controller, quiet };
   entries.add(entry);
+
   return quiet.finally(() => {
     entries.delete(entry);
+
     if (!entries.size) {
       summaryExecutions.delete(id);
     }
   });
 }
 
+async function quietSideSummaries(id: string) {
+  const summaries = [...(summaryExecutions.get(id) ?? [])];
+
+  for (const entry of summaries) {
+    entry.controller.abort();
+  }
+
+  await Promise.allSettled(summaries.map((entry) => entry.quiet));
+}
+
+async function awaitRunQuiet(entry: Execution | undefined, hasStatus: boolean, runId: string) {
+  if (entry?.quiet) {
+    await entry.quiet;
+
+    return;
+  }
+
+  if (hasStatus && !priorProcessQuiet.has(runId)) {
+    throw new Error("Cannot prove SDK side chat workflow is quiet");
+  }
+}
+
+async function discardRunWorkflow(runId: string) {
+  const entry = executions.get(runId);
+  entry?.controller.abort();
+  await entry?.starting.catch(() => undefined);
+  const status = await DBOS.getWorkflowStatus(runId);
+
+  if (status) {
+    await DBOS.cancelWorkflow(runId);
+  }
+
+  await awaitRunQuiet(entry, Boolean(status), runId);
+
+  if (status || entry?.quiet) {
+    await DBOS.deleteWorkflow(runId);
+  }
+
+  executions.delete(runId);
+  priorProcessQuiet.delete(runId);
+}
+
 export async function discardSideChat(id: string, access?: SideAccess) {
   const ids = await beginSideDiscard(id, access);
   const prior = discards.get(id);
+
   if (prior) {
     return prior;
   }
+
   const work = (async () => {
-    const summaries = [...(summaryExecutions.get(id) ?? [])];
-    for (const entry of summaries) {
-      entry.controller.abort();
-    }
-    await Promise.allSettled(summaries.map((entry) => entry.quiet));
+    await quietSideSummaries(id);
+
     for (const runId of ids) {
-      const entry = executions.get(runId);
-      entry?.controller.abort();
-      await entry?.starting.catch(() => undefined);
-      const status = await DBOS.getWorkflowStatus(runId);
-      if (status) {
-        await DBOS.cancelWorkflow(runId);
-      }
-      if (entry?.quiet) {
-        await entry.quiet;
-      } else if (status && !priorProcessQuiet.has(runId)) {
-        throw new Error("Cannot prove SDK side chat workflow is quiet");
-      }
-      if (status || entry?.quiet) {
-        await DBOS.deleteWorkflow(runId);
-      }
-      executions.delete(runId);
-      priorProcessQuiet.delete(runId);
+      await discardRunWorkflow(runId);
     }
+
     await purgeSideChat(id);
   })();
   discards.set(id, work);
+
   try {
     await work;
   } finally {
@@ -273,16 +353,20 @@ export async function discardSideChat(id: string, access?: SideAccess) {
 async function abandonPriorProcessSides() {
   const sides = await listDiscardableSides(true);
   const ids: string[] = [];
+
   for (const side of sides) {
     ids.push(...(await beginSideDiscard(side.id)));
   }
+
   if (!ids.length) {
     return;
   }
+
   const client = await DBOSClient.create({
     systemDatabaseUrl: process.env.DATABASE_URL!,
     applicationName: "chum-bucket-chat",
   });
+
   try {
     for (const id of ids) {
       await client.cancelWorkflow(id);
@@ -295,11 +379,14 @@ async function abandonPriorProcessSides() {
 
 export async function reconcileRuns() {
   const pending = await listPendingRuns();
+
   for (const run of pending) {
     if (![BUILD, PREVIOUS_BUILD].includes(run.accepted.build) || run.accepted.model !== MODEL) {
       continue;
     }
+
     const status = await DBOS.getWorkflowStatus(run.id);
+
     if (!status) {
       await ensureStarted(run.accepted);
     } else if (
@@ -312,18 +399,22 @@ export async function reconcileRuns() {
 
 let reconciliation: Promise<void> | undefined;
 let stopReconciliation: AbortController | undefined;
+
 export async function launchChatRuntime() {
   DBOS.setConfig({
     name: "chum-bucket-chat",
     applicationVersion: PREVIOUS_BUILD,
     systemDatabaseUrl: process.env.DATABASE_URL,
   });
+
   try {
     await abandonPriorProcessSides();
     await DBOS.launch();
+
     for (const side of await listDiscardableSides(true)) {
       await discardSideChat(side.id);
     }
+
     await reconcileRuns();
     await reconcileTestingOperations();
   } catch (error) {
@@ -332,18 +423,22 @@ export async function launchChatRuntime() {
     await db.$client.end();
     throw error;
   }
+
   stopReconciliation = new AbortController();
   const signal = stopReconciliation.signal;
   reconciliation = (async () => {
     while (!signal.aborted) {
       await delay(1000, undefined, { signal }).catch(() => undefined);
+
       if (signal.aborted) {
         break;
       }
+
       try {
         for (const side of await listDiscardableSides()) {
           await discardSideChat(side.id);
         }
+
         await reconcileRuns();
         await reconcileTestingOperations();
       } catch (error) {
@@ -356,9 +451,11 @@ export async function launchChatRuntime() {
 export async function shutdownChatRuntime() {
   stopReconciliation?.abort();
   await reconciliation;
+
   for (const side of await listDiscardableSides(true)) {
     await discardSideChat(side.id);
   }
+
   await drainTestingTransports();
   await DBOS.shutdown();
   const db = await database();

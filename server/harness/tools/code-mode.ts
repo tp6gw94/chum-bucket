@@ -75,6 +75,7 @@ function codeModeDescription(bindings: Record<string, ToolBinding>): string {
       ? `The code can call these async external functions: ${names.join(", ")}.`
       : "No external functions are available in this execution.";
   const asyncNote = names.length > 0 ? " All external_* calls must be awaited." : "";
+
   return `Execute TypeScript in a secure sandbox. Pass the program as JSON \`{"code": "<typescript>"}\`. ${available}${asyncNote} Return a value to pass results back. Use console.log() for debugging.`;
 }
 
@@ -89,6 +90,7 @@ function codeModeSystemPrompt(bindings: Record<string, ToolBinding>): string {
       : "No external functions are available in this execution.";
   const asyncNote =
     entries.length > 0 ? "- All `external_*` calls are async and must be awaited.\n" : "";
+
   return `## Code Execution Tool
 
 Call \`${codeModeToolName}\` with JSON \`{ "code": "<typescript>" }\`. The \`code\` field runs in a sandboxed environment.
@@ -103,15 +105,88 @@ ${asyncNote}- Return a value to pass results back.
 - Each execution is independent.`;
 }
 
-async function executeWithoutBindings(
+type Finish = (result: CodeModeToolResult, phase: string) => CodeModeToolResult;
+type Attempt<T> =
+  | Readonly<{ ok: true; value: T }>
+  | Readonly<{ ok: false; result: CodeModeToolResult }>;
+type ExecutionResult = Awaited<ReturnType<IsolateContext["execute"]>>;
+
+const consoleLevels = [
+  ["ERROR: ", "error"],
+  ["WARN: ", "warn"],
+  ["INFO: ", "info"],
+] as const;
+
+function failureResult(failure: unknown, name: string, useFailureName = false): CodeModeToolResult {
+  return {
+    success: false,
+    error: {
+      message: failure instanceof Error ? failure.message : String(failure),
+      name: useFailureName && failure instanceof Error ? failure.name : name,
+      ...(failure instanceof Error && failure.stack !== undefined ? { stack: failure.stack } : {}),
+    },
+  };
+}
+
+async function attempt<T>(
+  work: () => Promise<T>,
+  name: string,
+  useFailureName: boolean,
+): Promise<Attempt<T>> {
+  try {
+    return { ok: true, value: await work() };
+  } catch (failure) {
+    return { ok: false, result: failureResult(failure, name, useFailureName) };
+  }
+}
+
+function consoleEntry(log: string): Readonly<{ level: string; message: string }> {
+  const match = consoleLevels.find(([prefix]) => log.startsWith(prefix));
+
+  return match
+    ? { level: match[1], message: log.slice(match[0].length) }
+    : { level: "log", message: log };
+}
+
+function executionOutcome(executionResult: ExecutionResult): CodeModeToolResult {
+  if (executionResult.success) {
+    return { success: true, result: executionResult.value, logs: executionResult.logs };
+  }
+
+  const error = executionResult.error;
+
+  return {
+    success: false,
+    error: error
+      ? {
+          message: error.message,
+          name: error.name,
+          ...(error.stack !== undefined ? { stack: error.stack } : {}),
+        }
+      : { message: "Unknown execution error", name: "UnknownError" },
+    logs: executionResult.logs,
+  };
+}
+
+async function executeIsolated(
+  isolateContext: IsolateContext,
   code: string,
-  policy: CodeModePolicy,
-  transpile: (code: string) => string | Promise<string>,
   emit: (name: string, payload: Record<string, unknown>) => void,
 ): Promise<CodeModeToolResult> {
-  const startedAt = Date.now();
-  let isolateContext: IsolateContext | null = null;
-  const finish = (result: CodeModeToolResult, phase: string): CodeModeToolResult => {
+  const executionResult = await isolateContext.execute(code);
+
+  for (const log of executionResult.logs ?? []) {
+    emit("code_mode:console", { ...consoleEntry(log), timestamp: Date.now() });
+  }
+
+  return executionOutcome(executionResult);
+}
+
+function finisher(
+  emit: (name: string, payload: Record<string, unknown>) => void,
+  startedAt: number,
+): Finish {
+  return (result, phase) => {
     emit("code_mode:execution_finished", {
       timestamp: Date.now(),
       durationMs: Date.now() - startedAt,
@@ -120,20 +195,19 @@ async function executeWithoutBindings(
       logCount: result.logs?.length ?? 0,
       error: result.error,
     });
+
     return result;
   };
-  const errorResult = (
-    failure: unknown,
-    name: string,
-    useFailureName = false,
-  ): CodeModeToolResult => ({
-    success: false,
-    error: {
-      message: failure instanceof Error ? failure.message : String(failure),
-      name: useFailureName && failure instanceof Error ? failure.name : name,
-      ...(failure instanceof Error && failure.stack !== undefined ? { stack: failure.stack } : {}),
-    },
-  });
+}
+
+async function executeWithoutBindings(
+  code: string,
+  policy: CodeModePolicy,
+  transpile: (code: string) => string | Promise<string>,
+  emit: (name: string, payload: Record<string, unknown>) => void,
+): Promise<CodeModeToolResult> {
+  const finish = finisher(emit, Date.now());
+  let isolateContext: IsolateContext | null = null;
 
   if (!code) {
     return finish(
@@ -146,65 +220,34 @@ async function executeWithoutBindings(
   }
 
   emit("code_mode:execution_started", { timestamp: Date.now(), codeLength: code.length });
+
   try {
-    let strippedCode: string;
-    try {
-      strippedCode = await transpile(code);
-    } catch (failure) {
-      return finish(errorResult(failure, "TypeScriptError"), "transpile");
+    const stripped = await attempt(async () => transpile(code), "TypeScriptError", false);
+
+    if (!stripped.ok) {
+      return finish(stripped.result, "transpile");
     }
 
-    try {
-      isolateContext = await quickjsDriver.createContext({
-        bindings: {},
-        timeout: policy.timeoutMs,
-        memoryLimit: policy.memoryLimitMb,
-      });
-    } catch (failure) {
-      return finish(errorResult(failure, "CreateContextError", true), "create-context");
-    }
-
-    const executionResult = await isolateContext.execute(strippedCode);
-    for (const log of executionResult.logs ?? []) {
-      let level = "log";
-      let message = log;
-      if (log.startsWith("ERROR: ")) {
-        level = "error";
-        message = log.slice(7);
-      } else if (log.startsWith("WARN: ")) {
-        level = "warn";
-        message = log.slice(6);
-      } else if (log.startsWith("INFO: ")) {
-        level = "info";
-        message = log.slice(6);
-      }
-      emit("code_mode:console", { level, message, timestamp: Date.now() });
-    }
-
-    if (executionResult.success) {
-      return finish(
-        { success: true, result: executionResult.value, logs: executionResult.logs },
-        "execute",
-      );
-    }
-    return finish(
-      {
-        success: false,
-        error: executionResult.error
-          ? {
-              message: executionResult.error.message,
-              name: executionResult.error.name,
-              ...(executionResult.error.stack !== undefined
-                ? { stack: executionResult.error.stack }
-                : {}),
-            }
-          : { message: "Unknown execution error", name: "UnknownError" },
-        logs: executionResult.logs,
-      },
-      "execute",
+    const created = await attempt(
+      () =>
+        quickjsDriver.createContext({
+          bindings: {},
+          timeout: policy.timeoutMs,
+          memoryLimit: policy.memoryLimitMb,
+        }),
+      "CreateContextError",
+      true,
     );
+
+    if (!created.ok) {
+      return finish(created.result, "create-context");
+    }
+
+    isolateContext = created.value;
+
+    return finish(await executeIsolated(isolateContext, stripped.value, emit), "execute");
   } catch (failure) {
-    return finish(errorResult(failure, "Error", true), "unhandled");
+    return finish(failureResult(failure, "Error", true), "unhandled");
   } finally {
     if (isolateContext) {
       await isolateContext.dispose();
@@ -212,11 +255,7 @@ async function executeWithoutBindings(
   }
 }
 
-function consolePolicy(policy: CodeModePolicy): string {
-  return `(() => {
-  const maxEntries = ${policy.maxConsoleEntries};
-  const maxBytes = ${policy.maxConsoleBytes};
-  const maxEntry = ${policy.maxConsoleEntryBytes};
+const consoleRuntime = `(maxEntries, maxBytes, maxEntry) => {
   const seen = { entries: 0, bytes: 0 };
   const defineProperty = Object.defineProperty;
   const stringify = JSON.stringify;
@@ -299,11 +338,15 @@ function consolePolicy(policy: CodeModePolicy): string {
     writable: false,
     configurable: false
   });
-})();`;
+}`;
+
+function consolePolicy(policy: CodeModePolicy): string {
+  return `(${consoleRuntime})(${policy.maxConsoleEntries}, ${policy.maxConsoleBytes}, ${policy.maxConsoleEntryBytes});`;
 }
 
 function encoded(value: unknown): string {
   const text = JSON.stringify(value);
+
   return text === undefined ? "" : text;
 }
 
@@ -352,9 +395,11 @@ const eventProjectors = new Map<string, EventProjector>([
 
 function projectEvent(name: string, payload: Record<string, unknown>): ProjectedEvent | undefined {
   const projector = eventProjectors.get(name);
+
   if (!projector) {
     return undefined;
   }
+
   return { name, value: projector(payload) };
 }
 
@@ -364,147 +409,194 @@ function assertObjectInput(value: unknown): asserts value is Record<string, unkn
   }
 }
 
-export function composeCodeModeTurn(input: {
-  definitions: readonly ModelTool[];
-  dispatch: Dispatch;
+type CodeModeState = {
+  parentCallId: string;
+  signal: AbortSignal | undefined;
+  controller: AbortController | undefined;
+  calls: number;
+  closed: boolean;
+  fatal: boolean;
+  fatalMessage: string;
+};
+
+type CodeModeBoundary = Readonly<{
+  state: CodeModeState;
+  policy: CodeModePolicy;
   guard: Guard;
-  policy?: Partial<CodeModePolicy>;
-}): CodeModeTurn {
-  const policy: CodeModePolicy = { ...defaultPolicy, ...input.policy };
-  const state = {
-    parentCallId: codeModeToolName,
-    signal: undefined as AbortSignal | undefined,
-    controller: undefined as AbortController | undefined,
-    calls: 0,
-    closed: false,
-    fatal: false,
-    fatalMessage: "",
-  };
-  const stopped = () =>
-    new CodeModeBoundaryError(state.fatalMessage || "codemode stopped after a boundary failure");
-  const stop = (message: string) => {
+}>;
+
+type CustomEmit = ToolExecutionContext["emitCustomEvent"];
+type EmitOptions = Parameters<CustomEmit>[2];
+type ComposedCodeMode = ReturnType<typeof createCodeMode> | undefined;
+type CodeModeRequest = { typescriptCode: string };
+
+function stopped(state: CodeModeState): CodeModeBoundaryError {
+  return new CodeModeBoundaryError(
+    state.fatalMessage || "codemode stopped after a boundary failure",
+  );
+}
+
+function stop(state: CodeModeState, message: string): CodeModeBoundaryError {
+  state.fatal = true;
+  state.closed = true;
+  state.fatalMessage ||= message;
+  state.controller?.abort();
+
+  return new CodeModeBoundaryError(message);
+}
+
+function guarded(boundary: CodeModeBoundary, value: unknown): void {
+  try {
+    boundary.guard(value);
+  } catch (failure) {
+    throw stop(
+      boundary.state,
+      failure instanceof Error ? failure.message : "codemode boundary check failed",
+    );
+  }
+}
+
+function assertNotClosed(state: CodeModeState): void {
+  if (state.fatal) {
+    throw stopped(state);
+  }
+
+  if (state.closed) {
+    throw new CodeModeBoundaryError("codemode is no longer accepting tool calls");
+  }
+}
+
+function assertNotCancelled(state: CodeModeState): void {
+  if (state.signal?.aborted) {
+    throw stop(state, "codemode was cancelled");
+  }
+}
+
+function rethrowHostFailure(state: CodeModeState, failure: unknown): never {
+  assertNotCancelled(state);
+
+  if (failure instanceof ToolBoundaryError) {
+    throw stop(state, failure.message);
+  }
+
+  throw failure;
+}
+
+function boundHostResult(boundary: CodeModeBoundary, output: unknown): unknown {
+  assertNotCancelled(boundary.state);
+  assertNotClosed(boundary.state);
+  guarded(boundary, output);
+
+  if (byteLength(output) > boundary.policy.maxHostResultBytes) {
+    throw stop(boundary.state, "codemode tool result is too large");
+  }
+
+  return output;
+}
+
+function boundSandboxResult(boundary: CodeModeBoundary, result: unknown): unknown {
+  const { policy, state } = boundary;
+  guarded(boundary, result);
+
+  if (byteLength(result) > policy.maxResultBytes) {
+    throw stop(state, "codemode result is too large");
+  }
+
+  const logs = (result as { logs?: unknown }).logs;
+
+  if (Array.isArray(logs) && logs.length > policy.maxConsoleEntries) {
+    throw stop(state, "codemode console output exceeded its bound");
+  }
+
+  return result;
+}
+
+function emitProjected(
+  boundary: CodeModeBoundary,
+  emit: CustomEmit,
+  name: string,
+  payload: Record<string, unknown>,
+  options?: EmitOptions,
+): void {
+  guarded(boundary, payload);
+  const projected = projectEvent(name, payload);
+
+  if (projected) {
+    emit(projected.name, projected.value, options);
+  }
+}
+
+function onSandboxEvent(
+  boundary: CodeModeBoundary,
+  emit: CustomEmit,
+  controller: AbortController,
+  name: string,
+  payload: Record<string, unknown>,
+  options?: EmitOptions,
+): void {
+  const { state } = boundary;
+
+  if (name === "code_mode:execution_finished") {
+    state.closed = true;
+    controller.abort();
+    emitProjected(boundary, emit, name, payload, options);
+
+    return;
+  }
+
+  if (state.closed) {
+    return;
+  }
+
+  try {
+    emitProjected(boundary, emit, name, payload, options);
+  } catch (failure) {
     state.fatal = true;
     state.closed = true;
-    state.fatalMessage ||= message;
-    state.controller?.abort();
-    return new CodeModeBoundaryError(message);
-  };
-  const guarded = (value: unknown) => {
-    try {
-      input.guard(value);
-    } catch (failure) {
-      throw stop(failure instanceof Error ? failure.message : "codemode boundary check failed");
-    }
-  };
-  function assertHostCallOpen(): void {
-    if (state.fatal) {
-      throw stopped();
-    }
-    if (state.closed) {
-      throw new CodeModeBoundaryError("codemode is no longer accepting tool calls");
-    }
-    if (state.signal?.aborted) {
-      throw stop("codemode was cancelled");
-    }
-  }
-  function assertHostCallStillOpen(): void {
-    if (state.signal?.aborted) {
-      throw stop("codemode was cancelled");
-    }
-    if (state.fatal) {
-      throw stopped();
-    }
-    if (state.closed) {
-      throw new CodeModeBoundaryError("codemode is no longer accepting tool calls");
-    }
-  }
-  function rethrowHostFailure(failure: unknown): never {
-    if (state.signal?.aborted) {
-      throw stop("codemode was cancelled");
-    }
-    if (failure instanceof ToolBoundaryError) {
-      throw stop(failure.message);
-    }
+    controller.abort();
     throw failure;
   }
-  function boundHostResult(output: unknown): unknown {
-    assertHostCallStillOpen();
-    guarded(output);
-    if (byteLength(output) > policy.maxHostResultBytes) {
-      throw stop("codemode tool result is too large");
-    }
-    return output;
+}
+
+function admitHostCall(boundary: CodeModeBoundary, value: unknown): string {
+  const { policy, state } = boundary;
+  assertNotClosed(state);
+  assertNotCancelled(state);
+
+  if (state.calls >= policy.maxHostCalls) {
+    throw stop(state, `codemode exceeded ${policy.maxHostCalls} tool calls`);
   }
-  function boundSandboxResult(result: unknown): unknown {
-    guarded(result);
-    if (byteLength(result) > policy.maxResultBytes) {
-      throw stop("codemode result is too large");
-    }
-    const logs = (result as { logs?: unknown }).logs;
-    if (Array.isArray(logs) && logs.length > policy.maxConsoleEntries) {
-      throw stop("codemode console output exceeded its bound");
-    }
-    return result;
+
+  assertObjectInput(value);
+  state.calls += 1;
+  guarded(boundary, value);
+  const argumentsText = encoded(value);
+
+  if (Buffer.byteLength(argumentsText) > policy.maxHostInputBytes) {
+    throw stop(state, "codemode tool input is too large");
   }
-  type CustomEmit = ToolExecutionContext["emitCustomEvent"];
-  function emitProjected(
-    emit: CustomEmit,
-    name: string,
-    payload: Record<string, unknown>,
-    options?: Parameters<CustomEmit>[2],
-  ): void {
-    guarded(payload);
-    const projected = projectEvent(name, payload);
-    if (projected) {
-      emit(projected.name, projected.value, options);
-    }
-  }
-  function onSandboxEvent(
-    emit: CustomEmit,
-    controller: AbortController,
-    name: string,
-    payload: Record<string, unknown>,
-    options?: Parameters<CustomEmit>[2],
-  ): void {
-    if (name === "code_mode:execution_finished") {
-      state.closed = true;
-      controller.abort();
-      emitProjected(emit, name, payload, options);
-      return;
-    }
-    if (state.closed) {
-      return;
-    }
-    try {
-      emitProjected(emit, name, payload, options);
-    } catch (failure) {
-      state.fatal = true;
-      state.closed = true;
-      controller.abort();
-      throw failure;
-    }
-  }
-  const adapter = (definition: ModelTool): CodeModeTool => ({
+
+  return argumentsText;
+}
+
+function sandboxTool(
+  boundary: CodeModeBoundary,
+  dispatch: Dispatch,
+  definition: ModelTool,
+): CodeModeTool {
+  return {
     __toolSide: "server",
     name: definition.name,
     description: definition.description,
     inputSchema: definition.inputSchema,
     execute: async (value: unknown) => {
-      assertHostCallOpen();
-      if (state.calls >= policy.maxHostCalls) {
-        throw stop(`codemode exceeded ${policy.maxHostCalls} tool calls`);
-      }
-      assertObjectInput(value);
-      state.calls += 1;
-      guarded(value);
-      const argumentsText = encoded(value);
-      if (Buffer.byteLength(argumentsText) > policy.maxHostInputBytes) {
-        throw stop("codemode tool input is too large");
-      }
+      const argumentsText = admitHostCall(boundary, value);
+      const { state } = boundary;
       const childId = `${state.parentCallId}/external/${state.calls}`;
       let output: unknown;
+
       try {
-        output = await input.dispatch(
+        output = await dispatch(
           { id: childId, name: definition.name, arguments: argumentsText, input: value },
           {
             toolCallId: childId,
@@ -515,23 +607,157 @@ export function composeCodeModeTurn(input: {
           },
         );
       } catch (failure) {
-        rethrowHostFailure(failure);
+        rethrowHostFailure(state, failure);
       }
-      return boundHostResult(output);
+
+      return boundHostResult(boundary, output);
     },
-  });
+  };
+}
+
+async function transpileSource(boundary: CodeModeBoundary, code: string): Promise<string> {
+  const { policy } = boundary;
+
+  if (Buffer.byteLength(code, "utf8") > policy.maxSourceBytes) {
+    throw stop(boundary.state, `codemode source exceeds ${policy.maxSourceBytes} bytes`);
+  }
+
+  guarded(boundary, code);
+
+  return stripTypeScript(`${consolePolicy(policy)}\n${code}`);
+}
+
+function beginExecution(
+  boundary: CodeModeBoundary,
+  context: ToolExecutionContext,
+): AbortController {
+  const { state, policy } = boundary;
+
+  if (context.abortSignal?.aborted) {
+    throw stop(state, "codemode was cancelled");
+  }
+
+  const controller = new AbortController();
+  state.parentCallId = context.toolCallId || codeModeToolName;
+  state.controller = controller;
+  state.signal = AbortSignal.any([
+    AbortSignal.timeout(policy.timeoutMs),
+    ...(context.abortSignal ? [context.abortSignal] : []),
+    controller.signal,
+  ]);
+  state.calls = 0;
+  state.closed = false;
+  state.fatal = false;
+  state.fatalMessage = "";
+
+  return controller;
+}
+
+function parseRequest(
+  boundary: CodeModeBoundary,
+  composed: ComposedCodeMode,
+  controller: AbortController,
+  value: unknown,
+): CodeModeRequest {
+  try {
+    guarded(boundary, value);
+    const parsed = parseWithStandardSchema<{ code: string }>(codeModeInputSchema, value);
+    const request = { typescriptCode: parsed.code };
+
+    if (composed) {
+      parseWithStandardSchema<CodeModeRequest>(composed.tool.inputSchema, request);
+    }
+
+    return request;
+  } catch (failure) {
+    controller.abort();
+    const message = failure instanceof Error ? failure.message : "codemode input is invalid";
+    guarded(boundary, message);
+    throw stop(boundary.state, message);
+  }
+}
+
+function runSandbox(
+  boundary: CodeModeBoundary,
+  composed: ComposedCodeMode,
+  request: CodeModeRequest,
+  context: ToolExecutionContext,
+  controller: AbortController,
+): Promise<unknown> {
+  const emit = context.emitCustomEvent;
+
+  if (composed) {
+    return composed.tool.execute!(request, {
+      ...context,
+      emitCustomEvent: (name, payload, options) => {
+        onSandboxEvent(boundary, emit, controller, name, payload, options);
+      },
+    });
+  }
+
+  return executeWithoutBindings(
+    request.typescriptCode,
+    boundary.policy,
+    (code) => transpileSource(boundary, code),
+    (name, payload) => {
+      onSandboxEvent(boundary, emit, controller, name, payload);
+    },
+  );
+}
+
+async function executeTurn(
+  boundary: CodeModeBoundary,
+  composed: ComposedCodeMode,
+  value: unknown,
+  context: ToolExecutionContext,
+): Promise<unknown> {
+  const { state } = boundary;
+  const controller = beginExecution(boundary, context);
+  const request = parseRequest(boundary, composed, controller, value);
+
+  try {
+    const result = await runSandbox(boundary, composed, request, context, controller);
+
+    if (state.fatal) {
+      throw stopped(state);
+    }
+
+    if (context.abortSignal?.aborted) {
+      throw stop(state, "codemode was cancelled");
+    }
+
+    return boundSandboxResult(boundary, result);
+  } finally {
+    state.closed = true;
+    controller.abort();
+  }
+}
+
+export function composeCodeModeTurn(input: {
+  definitions: readonly ModelTool[];
+  dispatch: Dispatch;
+  guard: Guard;
+  policy?: Partial<CodeModePolicy>;
+}): CodeModeTurn {
+  const policy: CodeModePolicy = { ...defaultPolicy, ...input.policy };
+  const boundary: CodeModeBoundary = {
+    state: {
+      parentCallId: codeModeToolName,
+      signal: undefined,
+      controller: undefined,
+      calls: 0,
+      closed: false,
+      fatal: false,
+      fatalMessage: "",
+    },
+    policy,
+    guard: input.guard,
+  };
   const sandboxTools = input.definitions
     .filter(
       (definition) => definition.name !== codeModeToolName && definition.name !== discoveryToolName,
     )
-    .map(adapter);
-  const transpile = async (code: string) => {
-    if (Buffer.byteLength(code, "utf8") > policy.maxSourceBytes) {
-      throw stop(`codemode source exceeds ${policy.maxSourceBytes} bytes`);
-    }
-    guarded(code);
-    return stripTypeScript(`${consolePolicy(policy)}\n${code}`);
-  };
+    .map((definition) => sandboxTool(boundary, input.dispatch, definition));
   const composed =
     sandboxTools.length > 0
       ? createCodeMode({
@@ -540,16 +766,18 @@ export function composeCodeModeTurn(input: {
           timeout: policy.timeoutMs,
           memoryLimit: policy.memoryLimitMb,
           onSecretParameter: "ignore",
-          transpile,
+          transpile: (code: string) => transpileSource(boundary, code),
         })
       : undefined;
   const bindings = toolsToBindings(sandboxTools, "external_");
   const systemPrompt = codeModeSystemPrompt(bindings);
-  guarded(systemPrompt);
+  guarded(boundary, systemPrompt);
   const inputSchema = convertSchemaToJsonSchema(codeModeInputSchema);
+
   if (!inputSchema) {
     throw new Error("Codemode tool schema is unavailable");
   }
+
   return {
     definition: {
       name: codeModeToolName,
@@ -557,65 +785,7 @@ export function composeCodeModeTurn(input: {
       inputSchema,
     },
     systemPrompt,
-    async execute(value: unknown, context: ToolExecutionContext) {
-      if (context.abortSignal?.aborted) {
-        throw stop("codemode was cancelled");
-      }
-      state.parentCallId = context.toolCallId || codeModeToolName;
-      state.controller = new AbortController();
-      state.signal = AbortSignal.any([
-        AbortSignal.timeout(policy.timeoutMs),
-        ...(context.abortSignal ? [context.abortSignal] : []),
-        state.controller.signal,
-      ]);
-      state.calls = 0;
-      state.closed = false;
-      state.fatal = false;
-      state.fatalMessage = "";
-      const controller = state.controller;
-      const emit = context.emitCustomEvent;
-      let request: { typescriptCode: string };
-      try {
-        guarded(value);
-        const parsed = parseWithStandardSchema<{ code: string }>(codeModeInputSchema, value);
-        request = { typescriptCode: parsed.code };
-        if (composed) {
-          parseWithStandardSchema<{ typescriptCode: string }>(composed.tool.inputSchema, request);
-        }
-      } catch (failure) {
-        controller.abort();
-        const message = failure instanceof Error ? failure.message : "codemode input is invalid";
-        guarded(message);
-        throw stop(message);
-      }
-      try {
-        const emitSandboxEvent = (name: string, payload: Record<string, unknown>) => {
-          onSandboxEvent(emit, controller, name, payload);
-        };
-        const result = composed
-          ? await composed.tool.execute!(request, {
-              ...context,
-              emitCustomEvent: (name, payload, options) => {
-                onSandboxEvent(emit, controller, name, payload, options);
-              },
-            })
-          : await executeWithoutBindings(
-              request.typescriptCode,
-              policy,
-              transpile,
-              emitSandboxEvent,
-            );
-        if (state.fatal) {
-          throw stopped();
-        }
-        if (context.abortSignal?.aborted) {
-          throw stop("codemode was cancelled");
-        }
-        return boundSandboxResult(result);
-      } finally {
-        state.closed = true;
-        controller.abort();
-      }
-    },
+    execute: (value: unknown, context: ToolExecutionContext) =>
+      executeTurn(boundary, composed, value, context),
   };
 }

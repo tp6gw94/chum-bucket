@@ -17,6 +17,7 @@ export type CompactionEvent = z.infer<typeof compactionEventSchema>["value"];
 
 export function parseCompactionEvent(chunk: unknown): CompactionEvent | null {
   const parsed = compactionEventSchema.safeParse(chunk);
+
   return parsed.success ? parsed.data.value : null;
 }
 

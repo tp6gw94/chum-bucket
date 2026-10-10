@@ -72,6 +72,7 @@ test("read throws RunRequestError 400 for invalid threadId UUID", async () => {
       assert.strictEqual(err.message, "Invalid thread ID");
       const mapped = problem(err);
       assert.deepEqual(mapped, { status: 400, message: "Invalid thread ID" });
+
       return true;
     },
   );
@@ -86,6 +87,7 @@ test("cancel throws RunRequestError 400 for invalid threadId UUID", async () => 
       assert.strictEqual(err.message, "Invalid thread ID");
       const mapped = problem(err);
       assert.deepEqual(mapped, { status: 400, message: "Invalid thread ID" });
+
       return true;
     },
   );

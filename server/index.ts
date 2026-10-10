@@ -18,17 +18,22 @@ app.route("/api/testing", testing);
 await launchChatRuntime();
 const server = serve({ fetch: app.fetch, port: Number(process.env.PORT ?? 3000) });
 let stopping = false;
+
 async function shutdown() {
   if (stopping) {
     return;
   }
+
   stopping = true;
   server.close();
+
   if ("closeAllConnections" in server) {
     server.closeAllConnections();
   }
+
   await shutdownChatRuntime();
 }
+
 process.once("SIGINT", () => {
   void shutdown();
 });

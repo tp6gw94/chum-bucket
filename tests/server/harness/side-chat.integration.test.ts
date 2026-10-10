@@ -55,8 +55,10 @@ async function waitFor(predicate: () => Promise<boolean>) {
     if (await predicate()) {
       return;
     }
+
     await delay(20);
   }
+
   throw new Error("Outcome did not settle");
 }
 
@@ -77,6 +79,7 @@ test(
     const provider = mock.method(globalThis, "fetch", async (_url: unknown, init?: RequestInit) => {
       if (String(_url).includes("api.figma.com")) {
         toolDispatched = true;
+
         return new Promise<Response>((_resolve, reject) => {
           init?.signal?.addEventListener(
             "abort",
@@ -88,6 +91,7 @@ test(
           );
         });
       }
+
       modelCalls++;
       requested.push(String(init?.body));
       const encoder = new TextEncoder();
@@ -115,6 +119,7 @@ test(
             id: `provider-${modelCalls}`,
             choices: [{ index: 0, delta, finish_reason: null }],
           });
+
           if (slow) {
             init?.signal?.addEventListener(
               "abort",
@@ -134,9 +139,11 @@ test(
           }
         },
       });
+
       return new Response(body, { headers: { "Content-Type": "text/event-stream" } });
     });
     await launchChatRuntime();
+
     try {
       const parentId = randomUUID();
       await db.insert(threadsTable).values({ id: parentId, title: "Parent", messages: [] });
@@ -404,30 +411,39 @@ test(
               "fetch",
               async (url: unknown, init?: RequestInit) => {
                 const path = String(url);
+
                 if (!path.startsWith("/api/side-chat/")) {
                   return providerFetch(url as RequestInfo, init);
                 }
+
                 bodies.push(String(init?.body));
+
                 if (loseResponse && fault === "before-acceptance") {
                   loseResponse = false;
                   throw new TypeError("Connection failed before the request arrived");
                 }
+
                 const response = await sideChat.request(path.slice("/api/side-chat".length), init);
                 assert.equal(response.status, 200);
+
                 if (loseResponse) {
                   loseResponse = false;
                   await response.json();
+
                   if (fault === "post-commit-503") {
                     return Response.json(
                       { error: "SDK start failed after commit" },
                       { status: 503 },
                     );
                   }
+
                   if (fault === "invalid-receipt") {
                     return Response.json({ accepted: true });
                   }
+
                   throw new TypeError("Accepted receipt was lost in transit");
                 }
+
                 return response;
               },
             );
@@ -440,6 +456,7 @@ test(
                   text: summary.text,
                 }),
               }).then((body) => transferReceiptSchema.parse(body));
+
             try {
               try {
                 await confirm();
@@ -447,6 +464,7 @@ test(
               } catch (cause) {
                 summary = summaryTransferFailure(summary, cause);
               }
+
               assert.deepEqual(summary, {
                 kind: "unresolved",
                 draft,
@@ -494,9 +512,11 @@ test(
                 reconnect: { maxAttempts: 0 },
               });
               const processor = new StreamProcessor({ initialMessages: before.messages });
+
               for await (const chunk of connection.joinRun!(receipt.mainRunId)) {
                 processor.processChunk(chunk);
               }
+
               const visible = (messages: UIMessage[]) =>
                 messages.map(({ id, role, parts }) => ({ id, role, parts }));
               assert.deepEqual(visible(processor.getMessages()), visible(main.messages));
@@ -682,6 +702,7 @@ test(
             discardSideChat(child.id, scope),
           ]);
           assert.equal(close.status, "fulfilled");
+
           if (transfer.status === "fulfilled") {
             const replay = await transferSideSummary(child.id, scope, input);
             assert.deepEqual(replay.receipt, transfer.value.receipt);
@@ -695,6 +716,7 @@ test(
             assert.equal(receipts.length, 0);
             assert.match(String(transfer.reason), /closed/);
           }
+
           const [side] = await db
             .select()
             .from(sideChatsTable)

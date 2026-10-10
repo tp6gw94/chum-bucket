@@ -29,6 +29,7 @@ function partitionArguments(parsed: Record<string, unknown>): {
 } {
   const multiline: Array<[string, string]> = [];
   const remaining: Array<[string, unknown]> = [];
+
   for (const [name, value] of Object.entries(parsed)) {
     if (isMultilineString(value)) {
       multiline.push([name, value]);
@@ -36,6 +37,7 @@ function partitionArguments(parsed: Record<string, unknown>): {
       remaining.push([name, value]);
     }
   }
+
   return { multiline, remaining };
 }
 
@@ -43,16 +45,20 @@ function remainingArgsText(multilineCount: number, remaining: Array<[string, unk
   if (multilineCount > 0 && remaining.length === 0) {
     return "";
   }
+
   return JSON.stringify(Object.fromEntries(remaining), null, 2);
 }
 
 function displayArguments(text: string): ArgumentDisplay {
   try {
     const parsed: unknown = JSON.parse(text);
+
     if (!isPlainObject(parsed)) {
       return { args: JSON.stringify(parsed, null, 2), multiline: [] };
     }
+
     const { multiline, remaining } = partitionArguments(parsed);
+
     return { args: remainingArgsText(multiline.length, remaining), multiline };
   } catch {
     return { args: text, multiline: [] };
@@ -61,6 +67,7 @@ function displayArguments(text: string): ArgumentDisplay {
 
 export function ToolCall({ part }: { part: ToolCallPart }) {
   const { args, multiline } = displayArguments(part.arguments);
+
   return (
     <details open className="min-w-0 rounded-lg border border-border bg-muted/30 p-3">
       <summary className="cursor-pointer break-all text-sm">

@@ -8,9 +8,6 @@ export type ArtifactKind = (typeof ARTIFACT_KINDS)[number];
 
 export type NonEmpty<T> = readonly [T, ...T[]];
 
-export const TEST_RUN_STATES = ["active", "cancelling", "finished"] as const;
-export type TestRunState = (typeof TEST_RUN_STATES)[number];
-
 export type TaskOutcome =
   | "completed"
   | "failed"
@@ -86,7 +83,7 @@ export const actionSchema = z.discriminatedUnion("kind", [
 ]);
 export type Action = Readonly<z.infer<typeof actionSchema>>;
 
-export const toleranceSchema = z.discriminatedUnion("kind", [
+const toleranceSchema = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("exact") }),
   z.strictObject({
     kind: z.literal("numeric"),
@@ -96,13 +93,13 @@ export const toleranceSchema = z.discriminatedUnion("kind", [
 ]);
 export type Tolerance = Readonly<z.infer<typeof toleranceSchema>>;
 
-export const fixtureIdentitySchema = z.strictObject({
+const fixtureIdentitySchema = z.strictObject({
   id: z.string().trim().min(1).max(128),
   version: z.string().trim().min(1).max(64),
 });
 export type FixtureIdentity = Readonly<z.infer<typeof fixtureIdentitySchema>>;
 
-export const functionalCheckSchema = z.strictObject({
+const functionalCheckSchema = z.strictObject({
   id: z.string().trim().min(1).max(64),
   criterionId: z.string().trim().min(1).max(128),
   kind: z.literal("functional"),
@@ -110,7 +107,7 @@ export const functionalCheckSchema = z.strictObject({
 });
 export type FunctionalCheck = Readonly<z.infer<typeof functionalCheckSchema>>;
 
-export const styleCheckSchema = z.strictObject({
+const styleCheckSchema = z.strictObject({
   id: z.string().trim().min(1).max(64),
   criterionId: z.string().trim().min(1).max(128),
   kind: z.literal("style"),
@@ -217,7 +214,6 @@ export type BrowserOutput = Readonly<z.infer<typeof browserOutputSchema>>;
 export const useBrowserInputSchema = z.strictObject({
   checkId: z.string().trim().min(1).max(64),
 });
-export type UseBrowserInput = Readonly<z.infer<typeof useBrowserInputSchema>>;
 
 export type ArtifactOrigin = Readonly<{
   originalRunId: TestRunId;
@@ -245,7 +241,6 @@ export type ReuseDecision = Readonly<{ ref: ArtifactRef }> &
   );
 
 export class TestingRequestError extends Error {
-  readonly code = "invalid_artifacts";
   readonly decisions: NonEmpty<ReuseDecision>;
 
   constructor(decisions: NonEmpty<ReuseDecision>) {

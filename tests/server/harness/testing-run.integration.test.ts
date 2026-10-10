@@ -37,6 +37,7 @@ async function migrationsFolder() {
   if (migrationFolder) {
     return migrationFolder;
   }
+
   const source = path.resolve("drizzle");
   const journal = JSON.parse(await readFile(path.join(source, "meta/_journal.json"), "utf8")) as {
     version: string;
@@ -54,21 +55,25 @@ async function migrationsFolder() {
     .map((entry, idx) => ({ ...entry, idx }));
   migrationFolder = await mkdtemp(path.join(tmpdir(), "chum-testing-runtime-migrations-"));
   await mkdir(path.join(migrationFolder, "meta"));
+
   for (const entry of entries) {
     await copyFile(
       path.join(source, `${entry.tag}.sql`),
       path.join(migrationFolder, `${entry.tag}.sql`),
     );
   }
+
   await writeFile(
     path.join(migrationFolder, "meta/_journal.json"),
     JSON.stringify({ ...journal, entries }),
   );
+
   return migrationFolder;
 }
 
 async function migrateDatabase() {
   const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
+
   try {
     await migrate(drizzle(pool), { migrationsFolder: await migrationsFolder() });
   } finally {
@@ -78,8 +83,10 @@ async function migrateDatabase() {
 
 function installFigmaBoundary() {
   const original = globalThis.fetch;
+
   globalThis.fetch = async (input, init) => {
     const url = String(input);
+
     if (url.includes("api.figma.com")) {
       return new Response(
         JSON.stringify({
@@ -98,8 +105,10 @@ function installFigmaBoundary() {
         { headers: { "content-type": "application/json" } },
       );
     }
+
     return original(input, init);
   };
+
   restoreFetch = () => {
     globalThis.fetch = original;
   };
@@ -117,6 +126,7 @@ async function installProviderBoundary() {
         (options.systemPrompts ?? []).join("\n").match(/testing-role:([a-z]+)/)?.[1] ?? "main";
       providerCalls.push(role);
       const events = scriptedEvents(options, control);
+
       for (const event of events) {
         yield event.type === "RUN_STARTED" ? { ...event, type: EventType.RUN_STARTED } : event;
       }
@@ -131,6 +141,7 @@ async function createThread() {
     headers: { "content-type": "application/json" },
   });
   assert.equal(response.status, 200);
+
   return (await response.json()) as { id: string; revision: number };
 }
 
@@ -149,17 +160,21 @@ function requestBody(threadId: string, revision: number, extra: Record<string, u
 
 async function readView(threadId: string, runId: string) {
   const response = await testingApp.request(`/${encodeURIComponent(runId)}?threadId=${threadId}`);
+
   return { status: response.status, body: await response.json() };
 }
 
 async function waitFinished(threadId: string, runId: string) {
   for (let attempt = 0; attempt < 80; attempt += 1) {
     const view = await readView(threadId, runId);
+
     if (view.status === 200 && view.body.state === "finished") {
       return view.body;
     }
+
     await delay(250);
   }
+
   const last = await readView(threadId, runId);
   throw new Error(`testing run did not finish: ${JSON.stringify(last.body).slice(0, 800)}`);
 }
@@ -168,6 +183,7 @@ before(async () => {
   if (!enabled) {
     return;
   }
+
   process.env.DATABASE_URL = enabled;
   process.env.MODEL_API_KEY = "offline";
   process.env.FIGMA_API_KEY = "offline-figma";
@@ -181,9 +197,11 @@ after(async () => {
   if (!enabled) {
     return;
   }
+
   chatStream?.mock.restore();
   restoreFetch?.();
   await shutdownChatRuntime().catch(() => undefined);
+
   if (migrationFolder) {
     await rm(migrationFolder, { recursive: true, force: true });
   }
@@ -237,10 +255,12 @@ test(
       assert.equal(providerCalls.slice(beforeCalls).includes("planner"), true);
       assert.equal(providerCalls.slice(beforeCalls).includes("ac"), true);
       const evidence = finished.report.results.ac[0].evidence[0];
+
       if (evidence.outcome !== "blocked") {
         assert.notEqual(evidence.observed, evidence.expected);
         assert.notEqual(evidence.observed, "UNIQUE-EXPECTED");
       }
+
       const deliveries = await readStartCancelDeliveries(started.runId);
       assert.equal(deliveries.filter((delivery) => delivery.kind === "start").length, 3);
       assert.equal(
@@ -273,10 +293,12 @@ test(
       });
       await ensureStarted(accepted.run);
       let done = await hydrateThread(thread.id);
+
       for (let attempt = 0; attempt < 80 && done.activeRun; attempt += 1) {
         await delay(250);
         done = await hydrateThread(thread.id);
       }
+
       assert.equal(done.activeRun, null);
       assert.equal(done.publishedTesting?.state, "finished");
       const db = await database();
@@ -303,5 +325,6 @@ async function countRuns(threadId: string) {
     .select({ count: sql<number>`count(*)::int` })
     .from(chatRunsTable)
     .where(eq(chatRunsTable.thread_id, threadId));
+
   return row?.count ?? 0;
 }

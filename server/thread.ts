@@ -15,9 +15,11 @@ const createThreadBody = z.strictObject({});
 
 app.post("/", async (c) => {
   const payload = createThreadBody.safeParse(await c.req.json().catch(() => null));
+
   if (!payload.success) {
     return c.json({ error: "An empty object is required" }, 400);
   }
+
   const [thread] = await db
     .insert(threadsTable)
     .values({ title: "新對話", messages: [] })
@@ -39,14 +41,17 @@ app.get("/", async (c) => {
     .where(isNull(threadsTable.parent_thread_id))
     .orderBy(desc(threadsTable.updated_at), desc(threadsTable.id))
     .limit(100);
+
   return c.json(threads);
 });
 
 app.get("/:threadId", async (c) => {
   const threadId = c.req.param("threadId");
+
   if (!z.uuid().safeParse(threadId).success) {
     return c.json({ error: "Invalid thread id" }, 400);
   }
+
   const [thread] = await db
     .select({
       id: threadsTable.id,
@@ -55,6 +60,7 @@ app.get("/:threadId", async (c) => {
     })
     .from(threadsTable)
     .where(and(eq(threadsTable.id, threadId), isNull(threadsTable.parent_thread_id)));
+
   return thread ? c.json(thread) : c.notFound();
 });
 

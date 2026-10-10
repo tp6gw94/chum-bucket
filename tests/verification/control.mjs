@@ -39,19 +39,24 @@ async function fingerprint() {
     "index.html",
   ]);
   const hash = createHash("sha256");
+
   for (const file of [...new Set(files.split("\n"))].sort()) {
     const content = await readFile(resolve(root, file)).catch((error) => {
       if (error.code === "ENOENT") {
         return null;
       }
+
       throw error;
     });
+
     if (content === null) {
       continue;
     }
+
     hash.update(file);
     hash.update(content);
   }
+
   return hash.digest("hex");
 }
 
@@ -63,17 +68,21 @@ async function freePort() {
   });
   const port = server.address().port;
   await new Promise((done) => server.close(done));
+
   return port;
 }
 
 async function until(check, timeout = 90_000) {
   const deadline = Date.now() + timeout;
+
   while (Date.now() < deadline) {
     if (await check()) {
       return;
     }
+
     await delay(250);
   }
+
   throw new Error("Timed out waiting for verification instance; inspect launch.log");
 }
 
@@ -96,11 +105,13 @@ async function supervisorRequest(state, stop = false) {
 function container(state) {
   const info = JSON.parse(exec("docker", ["inspect", state.container]))[0];
   assert.equal(info.Config.Labels["chum-bucket-verification"], state.token);
+
   return info;
 }
 
 function sql(state, query) {
   container(state);
+
   return exec("docker", [
     "exec",
     state.container,
@@ -125,6 +136,7 @@ async function doctor() {
   assert.equal(state.fingerprint, await fingerprint(), "Source changed; launch a fresh instance");
   const info = container(state);
   assert(info.State.Running);
+
   for (const [port, pid] of [
     [state.clientPort, state.pid],
     [state.serverPort, state.serverPid],
@@ -132,6 +144,7 @@ async function doctor() {
     const owners = exec("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-t"]).split("\n");
     assert.deepEqual([...new Set(owners)], [String(pid)], "Port is not owned by this run");
   }
+
   const response = await fetch(`${state.origin}/api/thread`, {
     signal: AbortSignal.timeout(10_000),
   });
@@ -177,24 +190,30 @@ async function supervise() {
   const controller = createHttpServer((request, response) => {
     if (request.headers.authorization !== `Bearer ${token}`) {
       response.writeHead(403).end();
+
       return;
     }
+
     if (request.method === "POST" && request.url === "/cleanup") {
       interrupted = true;
     }
+
     response.setHeader("content-type", "application/json");
     response.end(JSON.stringify({ token, pid: process.pid, root }));
   });
   await new Promise((done) => controller.listen(0, "127.0.0.1", done));
   state.controlPort = controller.address().port;
+
   async function cleanup(error) {
     if (stopping) {
       return stopping;
     }
+
     stopping = (async () => {
       if (vite) {
         await Promise.race([vite.close(), delay(10_000)]);
       }
+
       if (backend && backend.exitCode === null && backend.signalCode === null) {
         backend.kill("SIGTERM");
         await until(
@@ -203,9 +222,11 @@ async function supervise() {
         ).catch(() => backend.kill("SIGKILL"));
         await until(async () => backend.exitCode !== null || backend.signalCode !== null, 5000);
       }
+
       try {
         exec("docker", ["logs", state.container]);
       } catch {}
+
       try {
         container(state);
         exec("docker", ["rm", "-f", "-v", state.container]);
@@ -214,6 +235,7 @@ async function supervise() {
           throw failure;
         }
       }
+
       await new Promise((done) => controller.close(done));
       await rm(resolve(directory, "vite-cache"), { recursive: true, force: true });
       state.status = error ? "failed" : "cleaned";
@@ -222,14 +244,18 @@ async function supervise() {
       await save(state);
       console.log(JSON.stringify({ cleanup: state.status, evidence: directory }));
     })();
+
     return stopping;
   }
+
   const stop = () => {
     interrupted = true;
   };
+
   process.once("SIGTERM", stop);
   process.once("SIGINT", stop);
   await save(state);
+
   try {
     state.fingerprint = await fingerprint();
     state.containerId = exec("docker", [
@@ -252,6 +278,7 @@ async function supervise() {
     ]);
     await until(async () => {
       assert(!interrupted, "Launch interrupted");
+
       try {
         return exec("docker", [
           "exec",
@@ -271,6 +298,7 @@ async function supervise() {
       ...process.env,
       DATABASE_URL: `postgresql://postgres:verification@127.0.0.1:${databasePort}/verify`,
     };
+
     if (!state.external) {
       for (const key of [
         "MODEL_API_KEY",
@@ -283,6 +311,7 @@ async function supervise() {
         env[key] = "";
       }
     }
+
     execFileSync("pnpm", ["exec", "drizzle-kit", "push", "--force"], {
       cwd: root,
       env,
@@ -318,6 +347,7 @@ async function supervise() {
     state.origin = `http://127.0.0.1:${state.clientPort}`;
     await until(async () => {
       assert(!interrupted, "Backend stopped before readiness");
+
       try {
         return (
           (await fetch(`${state.origin}/api/thread`, { signal: AbortSignal.timeout(1000) }))
@@ -330,9 +360,11 @@ async function supervise() {
     state.status = "ready";
     await save(state);
     console.log(`READY ${state.origin}`);
+
     while (!interrupted) {
       await delay(250);
     }
+
     await cleanup();
   } catch (error) {
     console.error(error);
@@ -353,19 +385,23 @@ if (command === "launch") {
   });
   closeSync(log);
   child.unref();
+
   try {
     await until(async () => {
       const state = await readState().catch(() => null);
       assert(state?.status !== "failed", state?.error);
+
       return state?.status === "ready";
     });
     await doctor();
   } catch (error) {
     const state = await readState().catch(() => null);
     child.kill("SIGTERM");
+
     if (state) {
       await until(async () => ["cleaned", "failed"].includes((await readState()).status), 60_000);
     }
+
     throw error;
   }
 } else if (command === "supervise") {
@@ -382,27 +418,35 @@ if (command === "launch") {
   console.log(proof);
 } else if (command === "cleanup") {
   const state = await readState();
+
   if (!["cleaned", "failed"].includes(state.status)) {
     await supervisorRequest(state, true);
     await until(async () => ["cleaned", "failed"].includes((await readState()).status), 60_000);
   }
+
   const final = await readState();
   assert(final.cleanedAt);
+
   for (const port of [final.clientPort, final.serverPort, final.controlPort].filter(Boolean)) {
     let listening = false;
+
     try {
       exec("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-t"]);
       listening = true;
     } catch {}
+
     assert(!listening, `Port ${port} is still in use`);
   }
+
   let exists = false;
+
   try {
     container(final);
     exists = true;
   } catch (error) {
     assert(String(error).toLowerCase().includes("no such object"), "Container identity mismatch");
   }
+
   assert(!exists, "Verification container still exists");
   console.log(JSON.stringify({ status: "cleaned", evidence: directory }));
 } else {

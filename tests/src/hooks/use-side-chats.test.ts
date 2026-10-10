@@ -12,8 +12,10 @@ test("side commands carry a page-memory scope and return the server receipt unch
   const calls: Array<{ url: string; headers: Headers; body: string }> = [];
   const transport = mock.method(globalThis, "fetch", async (url: unknown, init?: RequestInit) => {
     calls.push({ url: String(url), headers: new Headers(init?.headers), body: String(init?.body) });
+
     return Response.json({ mainRunId: "accepted-main", messageId: "one-user-message" });
   });
+
   try {
     assert.deepEqual(
       await sideRequest("/child/transfer", "page-scope", {
@@ -42,11 +44,13 @@ test("only known transaction rejections unlock a transfer, never network faults,
     text: "凍結的回填文字",
     key: "2f7f288b-a1fb-47d2-b24b-075a26835baf",
   };
+
   for (const outcome of [400, 404, 409, 500, 503, 200, "network", "callback"] as const) {
     const transport = mock.method(globalThis, "fetch", async () => {
       if (outcome === "network") {
         throw new TypeError("Connection lost");
       }
+
       return Response.json(
         { error: "No valid receipt" },
         {
@@ -54,20 +58,25 @@ test("only known transaction rejections unlock a transfer, never network faults,
         },
       );
     });
+
     try {
       let retained = original;
       let rejected = false;
+
       try {
         const receipt = await sideRequest("/child/transfer", "page-scope", { method: "POST" });
+
         if (outcome === "callback") {
           throw new TypeError("Callback failed after acceptance");
         }
+
         transferReceiptSchema.parse(receipt);
         assert.fail("No valid receipt was returned");
       } catch (cause) {
         rejected = isDefinitiveTransferRejection(cause);
         retained = summaryTransferFailure(original, cause);
       }
+
       const definitive = outcome === 400 || outcome === 404 || outcome === 409;
       assert.equal(rejected, definitive, String(outcome));
       assert.deepEqual(retained, { ...original, kind: definitive ? "draft" : "unresolved" });
@@ -81,6 +90,7 @@ test("busy transfer reports retention instead of pretending to accept", async ()
   const transport = mock.method(globalThis, "fetch", async () =>
     Response.json({ error: "busy" }, { status: 409 }),
   );
+
   try {
     await assert.rejects(
       sideRequest("/child/transfer", "page-scope", { method: "POST" }),

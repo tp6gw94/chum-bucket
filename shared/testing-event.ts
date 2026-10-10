@@ -221,16 +221,19 @@ const testingHydrationSchema = z.object({
 
 export function parseTestView(value: unknown): TestView | null {
   const parsed = testViewSchema.safeParse(value);
+
   return parsed.success ? parsed.data : null;
 }
 
 export function parseTestingProjectionEvent(chunk: unknown): TestView | null {
   const parsed = testingProjectionChunkSchema.safeParse(chunk);
+
   return parsed.success ? parsed.data.value : null;
 }
 
 export function parsePublishedTesting(payload: unknown): TestView | null {
   const parsed = testingHydrationSchema.safeParse(payload);
+
   return parsed.success ? (parsed.data.publishedTesting ?? null) : null;
 }
 

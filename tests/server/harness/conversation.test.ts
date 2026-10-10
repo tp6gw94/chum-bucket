@@ -57,6 +57,7 @@ test("canonical results update current calls without losing native text, metadat
     ],
   };
   let state = { display: [original, call], context: [summary, call] };
+
   for (const toolCallId of ["read-one", "read-two"]) {
     const processor = new StreamProcessor({ initialMessages: structuredClone(state.context) });
     processor.processChunk({
@@ -68,6 +69,7 @@ test("canonical results update current calls without losing native text, metadat
     });
     state = advanceConversation(state, processor.getMessages(), call.id);
   }
+
   assert.deepEqual(state.display[0], original);
   assert.deepEqual(state.display[1]?.metadata, { native: "tool-owner" });
   assert.deepEqual(state.display[1]?.parts, [

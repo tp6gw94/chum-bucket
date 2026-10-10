@@ -90,25 +90,25 @@ const ROLE_ISSUE_LABELS: Record<string, string> = {
   unexpected_not_required: "不應為不需要",
 };
 
+const ROW_STATUS_LABELS: Record<Exclude<ProgressRow["status"], "waiting" | "terminal">, string> = {
+  reused: "已重用",
+  not_required: "不需要",
+  undispatched: "未派工",
+  running: "執行中",
+  tool_activity: "工具活動",
+  cancelling: "取消中",
+};
+
 function rowStatusLabel(row: ProgressRow): string {
-  switch (row.status) {
-    case "waiting":
-      return row.reason === "dependency" ? "等待相依" : "等待派工";
-    case "reused":
-      return "已重用";
-    case "not_required":
-      return "不需要";
-    case "undispatched":
-      return "未派工";
-    case "running":
-      return "執行中";
-    case "tool_activity":
-      return "工具活動";
-    case "cancelling":
-      return "取消中";
-    case "terminal":
-      return OUTCOME_LABELS[row.outcome];
+  if (row.status === "waiting") {
+    return row.reason === "dependency" ? "等待相依" : "等待派工";
   }
+
+  if (row.status === "terminal") {
+    return OUTCOME_LABELS[row.outcome];
+  }
+
+  return ROW_STATUS_LABELS[row.status];
 }
 
 function rowBadgeVariant(row: ProgressRow): "default" | "secondary" | "outline" | "destructive" {
@@ -143,9 +143,11 @@ function runningActivityLabel(activity: "model" | "tool" | null): string {
   if (activity === "model") {
     return "模型推理中。";
   }
+
   if (activity === "tool") {
     return "工具執行中。";
   }
+
   return "準備中。";
 }
 
@@ -154,8 +156,10 @@ function roleStatusSummary(role: RoleId, row: ProgressRow): string {
     case "running": {
       const activity =
         row.activity === "model" ? "模型推理中" : row.activity === "tool" ? "工具執行中" : "準備中";
+
       return `${ROLE_LABELS[role]}：執行中（${activity}）`;
     }
+
     case "tool_activity":
       return `${ROLE_LABELS[role]}：工具活動${row.active.length ? `（${row.active.length} 個工具）` : ""}`;
     case "cancelling":
@@ -178,27 +182,35 @@ function progressStatusSummary(view: TestView, request: CancelRequest): string {
   const parts = [lifecycle, roleSummary];
   const cancelMessage =
     request.status === "failed" ? "取消要求失敗" : cancelRequestMessage(request);
+
   if (cancelMessage) {
     parts.push(cancelMessage);
   }
+
   return parts.join("；");
 }
 
 function reasonLabel(reason: string): string {
   const known = Object.hasOwn(REASON_LABELS, reason) ? REASON_LABELS[reason] : undefined;
+
   if (known) {
     return known;
   }
+
   const roleMatch = /^role_([a-z]+)_(.+)$/.exec(reason);
+
   if (roleMatch) {
     const role = ROLE_ORDER.find((candidate) => candidate === roleMatch[1]);
+
     if (role) {
       const issue = Object.hasOwn(ROLE_ISSUE_LABELS, roleMatch[2])
         ? ROLE_ISSUE_LABELS[roleMatch[2]]
         : undefined;
+
       return `${ROLE_LABELS[role]}：${issue ?? roleMatch[2]}`;
     }
   }
+
   return reason;
 }
 
@@ -227,6 +239,7 @@ function checkText(check: PlanCheck): string {
   if (check.kind === "functional") {
     return `功能檢查 ${check.id}（準則 ${check.criterionId}）：預期 ${check.expectedObservation}`;
   }
+
   return `樣式檢查 ${check.id}（準則 ${check.criterionId}）：${check.property}，容差 ${toleranceText(check.tolerance)}，設計 ${designReferenceText(check.design)}`;
 }
 
@@ -242,7 +255,15 @@ function sourceText(source: Source): string {
   return source.kind === "jira" ? `Jira ${source.issueKey}` : `Confluence ${source.pageId}`;
 }
 
-function CheckProgressLine({ checks }: { checks: Readonly<{ completed: number; total: number }> }) {
+function CheckProgressLine({
+  checks,
+}: {
+  checks?: Readonly<{ completed: number; total: number }>;
+}) {
+  if (!checks) {
+    return null;
+  }
+
   return (
     <p>
       Host 檢查 {checks.completed}/{checks.total}
@@ -254,6 +275,7 @@ function ToolActivityList({ active }: { active: readonly ToolActivityView[] }) {
   if (active.length === 0) {
     return <p>目前沒有進行中的工具。</p>;
   }
+
   return (
     <ul className="flex flex-col gap-1">
       {active.map((tool, index) => (
@@ -269,14 +291,15 @@ function ToolActivityList({ active }: { active: readonly ToolActivityView[] }) {
   );
 }
 
+const WAITING_DETAILS: Record<Extract<ProgressRow, { status: "waiting" }>["reason"], string> = {
+  dependency: "等待相依條件完成。",
+  dispatch: "等待派工。",
+};
+
 function RoleProgressDetail({ row }: { row: ProgressRow }) {
   switch (row.status) {
     case "waiting":
-      return (
-        <p className="text-xs text-muted-foreground">
-          {row.reason === "dependency" ? "等待相依條件完成。" : "等待派工。"}
-        </p>
-      );
+      return <p className="text-xs text-muted-foreground">{WAITING_DETAILS[row.reason]}</p>;
     case "reused":
       return (
         <div className="flex flex-col gap-1 text-xs text-muted-foreground">
@@ -300,14 +323,14 @@ function RoleProgressDetail({ row }: { row: ProgressRow }) {
       return (
         <div className="flex flex-col gap-1 text-xs text-muted-foreground">
           <p>{runningActivityLabel(row.activity)}</p>
-          {row.checks ? <CheckProgressLine checks={row.checks} /> : null}
+          <CheckProgressLine checks={row.checks} />
         </div>
       );
     case "tool_activity":
       return (
         <div className="flex flex-col gap-1 text-xs text-muted-foreground">
           <ToolActivityList active={row.active} />
-          {row.checks ? <CheckProgressLine checks={row.checks} /> : null}
+          <CheckProgressLine checks={row.checks} />
         </div>
       );
     case "cancelling":
@@ -348,6 +371,7 @@ function AcceptanceSummary({ acceptance }: { acceptance: Acceptance }) {
       </div>
     );
   }
+
   return (
     <div data-verdict="blocked" className="flex flex-col gap-1">
       <Badge variant="destructive">受阻</Badge>
@@ -371,10 +395,12 @@ function RequirementsSummary({ requirements }: { requirements: PublicRequirement
       </div>
     );
   }
+
   const selectedKeys = new Set(
     requirements.selection.kind === "selected" ? requirements.selection.keys : [],
   );
   const allSelected = requirements.selection.kind === "all";
+
   return (
     <div className="flex flex-col gap-1">
       <h4 className="text-sm font-medium">需求</h4>
@@ -386,6 +412,7 @@ function RequirementsSummary({ requirements }: { requirements: PublicRequirement
       <ul className="flex flex-col gap-1">
         {requirements.criteria.map((criterion) => {
           const chosen = allSelected || selectedKeys.has(criterion.key);
+
           return (
             <li
               key={criterion.id}
@@ -423,6 +450,7 @@ function PlanSummary({ plan }: { plan: PublicPlan | null }) {
       </div>
     );
   }
+
   return (
     <div className="flex flex-col gap-2">
       <h4 className="text-sm font-medium">測試計畫</h4>
@@ -619,6 +647,7 @@ function RoleOutcomeList({ rows }: { rows: Readonly<Record<RoleId, ProgressRow>>
       <ul className="flex flex-col gap-1">
         {ROLE_ORDER.map((role) => {
           const row = rows[role];
+
           return (
             <li
               key={role}
@@ -706,13 +735,7 @@ function TestReportSection({
   );
 }
 
-export function TestingPanel({
-  view,
-  onCancel,
-}: {
-  view: TestView;
-  onCancel?: (runId: TestRunId) => Promise<void>;
-}) {
+function useCancelRequest(view: TestView, onCancel?: (runId: TestRunId) => Promise<void>) {
   const [tracker, setTracker] = useState<CancelTracker | null>(null);
   const cancelGeneration = useRef(0);
   const request = cancelRequestFor(tracker, view.runId);
@@ -722,9 +745,11 @@ export function TestingPanel({
     if (!onCancel || cancelDisabled) {
       return;
     }
+
     const runId = view.runId;
     const generation = ++cancelGeneration.current;
     setTracker((current) => beginCancelRequest(current, runId, generation));
+
     try {
       await onCancel(runId);
       setTracker((current) =>
@@ -740,10 +765,49 @@ export function TestingPanel({
     }
   }
 
-  const cancelLabel =
-    view.state === "cancelling" || request.status === "requesting" || request.status === "accepted"
-      ? "取消中…"
-      : "取消測試";
+  return { request, cancelDisabled, requestCancel };
+}
+
+function cancelLabel(view: TestView, request: CancelRequest): string {
+  return view.state === "cancelling" ||
+    request.status === "requesting" ||
+    request.status === "accepted"
+    ? "取消中…"
+    : "取消測試";
+}
+
+function CancelAction({
+  label,
+  disabled,
+  onCancel,
+}: {
+  label: string;
+  disabled: boolean;
+  onCancel: () => void;
+}) {
+  return (
+    <div data-slot="card-action">
+      <Button
+        variant="outline"
+        size="sm"
+        aria-label="取消測試"
+        disabled={disabled}
+        onClick={onCancel}
+      >
+        {label}
+      </Button>
+    </div>
+  );
+}
+
+export function TestingPanel({
+  view,
+  onCancel,
+}: {
+  view: TestView;
+  onCancel?: (runId: TestRunId) => Promise<void>;
+}) {
+  const { request, cancelDisabled, requestCancel } = useCancelRequest(view, onCancel);
 
   return (
     <>
@@ -767,17 +831,11 @@ export function TestingPanel({
           <CardHeader>
             <CardTitle>測試角色進度</CardTitle>
             {onCancel ? (
-              <div data-slot="card-action">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  aria-label="取消測試"
-                  disabled={cancelDisabled}
-                  onClick={requestCancel}
-                >
-                  {cancelLabel}
-                </Button>
-              </div>
+              <CancelAction
+                label={cancelLabel(view, request)}
+                disabled={cancelDisabled}
+                onCancel={requestCancel}
+              />
             ) : null}
           </CardHeader>
           <CardContent className="flex flex-col gap-2">

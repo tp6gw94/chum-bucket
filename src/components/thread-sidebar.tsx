@@ -50,6 +50,7 @@ export function ThreadSidebar({
         <div role="list" className="flex flex-col gap-1">
           {threads.map((thread) => {
             const extraPanes = thread.paneCount - 1;
+
             return (
               <Button
                 key={thread.id}

@@ -22,6 +22,7 @@ function requireToolCallId(context?: ToolExecutionContext) {
   if (!context?.toolCallId) {
     throw new Error("Missing tool call ID");
   }
+
   return context.toolCallId;
 }
 
@@ -39,6 +40,7 @@ export const read = toolDefinition({
     },
   });
   let onAbort: (() => void) | undefined;
+
   try {
     return await new Promise<unknown>((resolve, reject) => {
       onAbort = () => reject(new Error("Read was cancelled"));
@@ -48,6 +50,7 @@ export const read = toolDefinition({
       );
       worker.once("error", reject);
       worker.once("exit", () => reject(new Error("Read worker exited")));
+
       if (context?.abortSignal?.aborted) {
         onAbort();
       }
@@ -56,6 +59,7 @@ export const read = toolDefinition({
     if (onAbort) {
       context?.abortSignal?.removeEventListener("abort", onAbort);
     }
+
     await worker.terminate();
   }
 });

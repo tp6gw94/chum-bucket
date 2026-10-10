@@ -1,12 +1,7 @@
 import { CircleIcon, LoaderCircleIcon } from "lucide-react";
 import { cn } from "cn";
 
-import {
-  Card,
-  CardContent,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import type { RunStatus } from "./types";
 
 export function ProgressPanel({
@@ -28,11 +23,7 @@ export function ProgressPanel({
     <Card size="sm">
       <CardHeader>
         <CardTitle className="flex items-center gap-2 text-xs font-medium tracking-wide text-muted-foreground uppercase">
-          {running ? (
-            <LoaderCircleIcon className="motion-safe:animate-spin" />
-          ) : (
-            <CircleIcon />
-          )}
+          {running ? <LoaderCircleIcon className="motion-safe:animate-spin" /> : <CircleIcon />}
           {`${label}（${running ? "持續執行中" : "已結束"}）`}
         </CardTitle>
       </CardHeader>
@@ -40,10 +31,7 @@ export function ProgressPanel({
         {lines.map((line, index) => (
           <span
             key={line}
-            className={cn(
-              "flex gap-2",
-              index === lines.length - 1 && "text-foreground",
-            )}
+            className={cn("flex gap-2", index === lines.length - 1 && "text-foreground")}
           >
             <span aria-hidden="true">▸</span>
             <span>{line}</span>

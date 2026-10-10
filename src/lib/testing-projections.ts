@@ -6,16 +6,21 @@ export function mergeTestingView(
   incoming: TestView,
 ): readonly TestView[] {
   const index = views.findIndex((view) => view.runId === incoming.runId);
+
   if (index < 0) {
     return [...views, incoming];
   }
+
   const current = views[index]!;
   const merged = mergeTestView(current, incoming);
+
   if (merged === current) {
     return views;
   }
+
   const next = views.slice();
   next[index] = merged;
+
   return next;
 }
 

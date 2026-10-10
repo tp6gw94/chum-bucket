@@ -25,14 +25,17 @@ export async function request(input: TestingRequest): Promise<TestView> {
   const parsed = testingRequestSchema.parse(input);
   const admission = await admitStandaloneTesting(parsed);
   await ensureTestingRoot(admission.parentRunId, admission.operationId);
+
   return publishProjection(admission.parentRunId, admission.operationId);
 }
 
 export async function read(threadId: string, runId: string): Promise<TestView> {
   const view = await readPublishedTesting(threadId, runId);
+
   if (!view) {
     throw new TestingPersistenceError(404, "Testing run was not found");
   }
+
   return view;
 }
 
@@ -48,11 +51,13 @@ export function problem(error: unknown): TestingProblem | null {
       ...(error.decisions ? { decisions: error.decisions } : {}),
     };
   }
+
   if (error instanceof TestingPersistenceError || error instanceof RunRequestError) {
     return {
       status: error.status,
       message: error.message,
     };
   }
+
   return null;
 }

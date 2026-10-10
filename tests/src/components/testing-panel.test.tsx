@@ -227,6 +227,7 @@ function statusAnnouncement(html: string): string {
     /<p(?=[^>]*role="status")(?=[^>]*aria-live="polite")(?=[^>]*aria-atomic="true")(?=[^>]*aria-label="測試狀態摘要")[^>]*>([\s\S]*?)<\/p>/,
   );
   assert.ok(match, "expected a named polite atomic status region");
+
   return plainText(match[1] ?? "");
 }
 
@@ -547,6 +548,7 @@ test("prototype-like acceptance reasons render as escaped fallback text", () => 
   for (const reason of reasons.slice(0, 3)) {
     assert.ok(text.includes(`${reason}（${reason}）`));
   }
+
   assert.ok(text.includes("Test AC：__proto__（role_ac___proto__）"));
   assert.match(html, /&lt;img src=x onerror=&quot;alert\(1\)&quot;&gt;/);
   assert.doesNotMatch(html, /<img\b/);

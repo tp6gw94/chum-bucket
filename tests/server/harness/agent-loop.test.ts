@@ -50,9 +50,11 @@ function sessionFor(
     getModelTools: async () => ({ definitions: [], systemPrompt: "" }),
     executeTool: async (_messages, call) => {
       executed.push(call);
+
       return output;
     },
   };
+
   return {
     runId: "run-shared",
     assertExecution: async () => {},
@@ -61,9 +63,11 @@ function sessionFor(
     },
     chatStream: async () => {
       const next = queue.shift();
+
       if (!next) {
         throw new Error("Unexpected model call");
       }
+
       return next;
     },
     tools,
@@ -216,6 +220,7 @@ test("chat compaction runs threshold then overflow before retrying", async () =>
     kind: "chat",
     compact: async ({ reason }) => {
       reasons.push(reason);
+
       return baseline;
     },
   };

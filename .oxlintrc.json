@@ -1,5 +1,6 @@
 {
   "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "ignorePatterns": ["docs/**/*.sketch.ts", "tests/**"],
   "plugins": ["typescript", "unicorn", "oxc", "eslint"],
   "jsPlugins": [
     {

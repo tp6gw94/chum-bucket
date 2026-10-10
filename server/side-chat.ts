@@ -26,31 +26,39 @@ app.onError((error, c) => {
   if (error instanceof RunRequestError) {
     return c.json({ error: error.message }, error.status);
   }
+
   console.error("Side chat request failed", error);
+
   return c.json({ error: "附屬對話操作失敗，草稿已保留。" }, 503);
 });
 
 function access(header?: string) {
   const parsed = sideScopeSchema.safeParse(header);
+
   if (!parsed.success) {
     throw new RunRequestError(400, "A valid side chat page scope is required");
   }
+
   return { scope: parsed.data };
 }
 
 function sideId(value: string) {
   const parsed = z.uuid().safeParse(value);
+
   if (!parsed.success) {
     throw new RunRequestError(400, "Invalid side chat ID");
   }
+
   return parsed.data;
 }
 
 app.post("/open/:parentId", async (c) => {
   const input = sideOpenSchema.safeParse(await c.req.json().catch(() => null));
+
   if (!input.success) {
     throw new RunRequestError(400, "Invalid open command");
   }
+
   return c.json(
     await openSideChat(
       sideId(c.req.param("parentId")),
@@ -62,6 +70,7 @@ app.post("/open/:parentId", async (c) => {
 
 app.post("/heartbeat", async (c) => {
   await heartbeatSideScope(access(c.req.header(SIDE_SCOPE_HEADER)));
+
   return c.json({ renewed: true });
 });
 
@@ -71,6 +80,7 @@ const SIDE_SUMMARY_PROMPT =
 app.post("/:id/summary", async (c) => {
   const id = sideId(c.req.param("id"));
   const owner = access(c.req.header(SIDE_SCOPE_HEADER));
+
   return c.json(
     await trackSideSummary(id, async (signal) => {
       const range = await readSideSummaryRange(id, owner);
@@ -78,10 +88,12 @@ app.post("/:id/summary", async (c) => {
       let text: string | null = null;
       let batch = [] as typeof range.transcript;
       let bytes = 0;
+
       async function flush() {
         if (!batch.length) {
           return;
         }
+
         text = await summarizeTranscript(
           { previousSummary: text, transcript: batch },
           MODEL,
@@ -91,8 +103,10 @@ app.post("/:id/summary", async (c) => {
         batch = [];
         bytes = 0;
       }
+
       for (const message of range.transcript) {
         const original = JSON.stringify(message);
+
         for (let offset = 0; offset < original.length; offset += 12_000) {
           const fragment = {
             id: `${message.id}/fragment/${offset}`,
@@ -100,15 +114,19 @@ app.post("/:id/summary", async (c) => {
             parts: [{ type: "text" as const, content: original.slice(offset, offset + 12_000) }],
           };
           const size = Buffer.byteLength(JSON.stringify(fragment));
+
           if (bytes + size > 60_000) {
             await flush();
           }
+
           batch.push(fragment);
           bytes += size;
         }
       }
+
       await flush();
       signal.throwIfAborted();
+
       return saveSideDraft(id, owner, range.epoch, {
         id: randomUUID(),
         sideRevision: range.sideRevision,
@@ -121,25 +139,31 @@ app.post("/:id/summary", async (c) => {
 
 app.post("/:id/transfer", async (c) => {
   const input = sideTransferSchema.safeParse(await c.req.json().catch(() => null));
+
   if (!input.success) {
     throw new RunRequestError(400, "Invalid summary transfer");
   }
+
   const id = sideId(c.req.param("id"));
   const owner = access(c.req.header(SIDE_SCOPE_HEADER));
   const accepted = await transferSideSummary(id, owner, input.data);
+
   if (accepted.pending) {
     await ensureStarted(accepted.run).catch((error: unknown) =>
       console.error("Accepted transfer awaits reconciliation", error),
     );
   }
+
   void discardSideChat(id, owner).catch((error: unknown) =>
     console.error("Accepted transfer cleanup retries via the side scanner", error),
   );
+
   return c.json(accepted.receipt);
 });
 
 app.delete("/:id", async (c) => {
   await discardSideChat(sideId(c.req.param("id")), access(c.req.header(SIDE_SCOPE_HEADER)));
+
   return c.json({ discarded: true });
 });
 

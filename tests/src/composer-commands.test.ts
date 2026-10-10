@@ -25,6 +25,7 @@ const key = {
 
 test("only the exact standalone compact command is recognized", () => {
   assert.equal(parseComposerCommand(" /compact\n"), "compact");
+
   for (const text of [
     "/com",
     "/compact now",
@@ -45,6 +46,7 @@ test("suggestions follow the focused leading slash query at the collapsed cursor
     commandSuggestions({ ...query, text: "/compact", cursor: 2 }).map((command) => command.name),
     ["compact"],
   );
+
   for (const change of [
     { focused: false },
     { composing: true },
@@ -67,6 +69,7 @@ test("IME never selects or sends while editor navigation retains command control
   assert.equal(composerKeyAction({ ...key, key: "ArrowDown" }), "next");
   assert.equal(composerKeyAction({ ...key, key: "ArrowUp" }), "previous");
   assert.equal(composerKeyAction({ ...key, key: "Escape" }), "dismiss");
+
   for (const change of [
     { isComposing: true },
     { composing: true },

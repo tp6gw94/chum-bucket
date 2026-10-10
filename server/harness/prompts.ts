@@ -7,6 +7,7 @@ export function openuiInstructions(extra?: string): string {
   const library = JSON.parse(
     readFileSync(join(process.cwd(), "src/generated/spec.json"), "utf-8"),
   ) as LibrarySpec;
+
   return generateSystemPrompt({
     cloud: false,
     library,

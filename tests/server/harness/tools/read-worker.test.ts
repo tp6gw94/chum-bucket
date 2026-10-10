@@ -9,6 +9,7 @@ test("native file reading has a terminable cancellation boundary and retains its
   const dir = await mkdtemp(join(tmpdir(), "side-read-"));
   const path = join(dir, "input.txt");
   await writeFile(path, "original file text");
+
   try {
     const controller = new AbortController();
     const pending = read.execute!(

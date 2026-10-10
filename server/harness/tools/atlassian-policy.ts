@@ -29,11 +29,13 @@ function fail(message: string): never {
 
 function jiraUrl(value: string): URL {
   let url: URL;
+
   try {
     url = new URL(value);
   } catch {
     return fail("JIRA_BASE_URL must be an HTTPS URL without credentials, query, or fragment");
   }
+
   if (
     value !== value.trim() ||
     url.protocol !== "https:" ||
@@ -44,6 +46,7 @@ function jiraUrl(value: string): URL {
   ) {
     return fail("JIRA_BASE_URL must be an HTTPS URL without credentials, query, or fragment");
   }
+
   return url;
 }
 
@@ -52,6 +55,7 @@ const FORBIDDEN_ENDPOINT_FIELDS = ["username", "password", "search", "hash"] as 
 
 function endpoint(value: string): string {
   let url: URL;
+
   try {
     url = new URL(value);
   } catch {
@@ -59,6 +63,7 @@ function endpoint(value: string): string {
       "ATLASSIAN_MCP_URL must be a loopback HTTP URL without credentials, query, or fragment",
     );
   }
+
   if (
     value !== value.trim() ||
     /\s/.test(value) ||
@@ -70,6 +75,7 @@ function endpoint(value: string): string {
       "ATLASSIAN_MCP_URL must be a loopback HTTP URL without credentials, query, or fragment",
     );
   }
+
   return value;
 }
 
@@ -92,19 +98,25 @@ export function readAtlassianConfiguration(env: Environment): AtlassianConfigura
   const token = env.JIRA_API_TOKEN ?? "";
   const configuredEndpoint = env.ATLASSIAN_MCP_URL ?? "";
   const configured = [baseUrl, email, token].filter(Boolean).length;
+
   if (configured === 0) {
     if (configuredEndpoint) {
       return fail("ATLASSIAN_MCP_URL requires JIRA_BASE_URL, JIRA_EMAIL, and JIRA_API_TOKEN");
     }
+
     return { mode: "local" };
   }
+
   if (configured !== 3) {
     return fail("Configure JIRA_BASE_URL, JIRA_EMAIL, and JIRA_API_TOKEN together");
   }
+
   const jira = jiraUrl(baseUrl);
+
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || !/^[\x21-\x7e]+$/.test(token)) {
     return fail("JIRA_EMAIL or JIRA_API_TOKEN is invalid; check backend configuration");
   }
+
   return {
     mode: "http",
     endpoint: configuredEndpoint ? endpoint(configuredEndpoint) : defaultAtlassianEndpoint,

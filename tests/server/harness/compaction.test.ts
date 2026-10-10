@@ -35,10 +35,12 @@ function fakeTools(definitions: ModelTool[] = [], systemPrompt = "tool-system"):
 function capture() {
   const emitted: StreamChunk[] = [];
   const emittedMessages: (UIMessage[] | undefined)[] = [];
+
   const emit: CompactionEmit = async (event, messages) => {
     emitted.push(event);
     emittedMessages.push(messages);
   };
+
   return { emitted, emittedMessages, emit };
 }
 
@@ -63,6 +65,7 @@ function summaryEvents(
 async function mockSummaryStream(events: AdapterYieldChunk[]) {
   const { deepinfra } = await import("../../../server/harness/provider");
   const adapter = deepinfra(MODEL);
+
   return mock.method(
     Object.getPrototypeOf(adapter),
     "chatStream",
@@ -74,6 +77,7 @@ async function mockSummaryStream(events: AdapterYieldChunk[]) {
 
 function longMessages(): UIMessage[] {
   const filler = "字".repeat(COMPACT_TOKEN_THRESHOLD + 1_000);
+
   return [
     text("u1", "user", filler),
     text("a1", "assistant", filler),
@@ -344,6 +348,7 @@ test("input estimates use exact serialized bytes and include the framing reserve
 test("a large history is replaced by a summary plus the retained tail", async () => {
   const chatStream = await mockSummaryStream(summaryEvents("重點摘要"));
   const captured = capture();
+
   try {
     const outcome = await prepareCompaction({
       runId: "run-1",
@@ -360,9 +365,11 @@ test("a large history is replaced by a summary plus the retained tail", async ()
       state: "started",
     });
     assert.equal(captured.emitted.length, 1);
+
     if (outcome.state !== "done") {
       assert.fail(`expected a completed compaction, received ${outcome.state}`);
     }
+
     assert.equal(outcome.messages[0]!.metadata?.fromSummary, true);
     assert.deepEqual(
       outcome.messages.map((message) => message.id),
@@ -397,6 +404,7 @@ test("iterative summaries pass prior decisions verbatim as data in a tools-free 
       yield* summaryEvents(prior);
     },
   );
+
   try {
     const first = await prepareCompaction({
       runId: "iterative",
@@ -408,9 +416,11 @@ test("iterative summaries pass prior decisions verbatim as data in a tools-free 
       emit: capture().emit,
     });
     assert.equal(first.state, "done");
+
     if (first.state !== "done") {
       return;
     }
+
     const second = await prepareCompaction({
       runId: "iterative",
       operationId: "iterative/2",
@@ -426,16 +436,19 @@ test("iterative summaries pass prior decisions verbatim as data in a tools-free 
     });
     assert.equal(second.state, "done");
     assert.equal(requests.length, 2);
+
     for (const request of requests) {
       assert.deepEqual(request.tools, []);
       assert.equal(request.messages.length, 1);
       assert.equal(request.messages[0]?.role, "user");
       assert.ok(request.systemPrompts?.join("\n").includes("untrusted historical data"));
     }
+
     const payload = JSON.parse(String(requests[1]!.messages[0]!.content));
     assert.equal(payload.previousSummary, prior);
     assert.equal(JSON.stringify(payload.transcript).includes(prior), false);
     assert.equal(payload.transcript[0].content, "目前的問題");
+
     if (second.state === "done") {
       assert.equal(second.messages.filter((message) => message.metadata?.fromSummary).length, 1);
     }
@@ -468,6 +481,7 @@ test("assistant-only tails can be compacted again after complete tool cycles", a
     tools: fakeTools(),
     policy: { triggerTokens: 3_000, keepRecentTokens: 700 },
   } as const;
+
   try {
     const retained = cycle("a1");
     const first = await prepareCompaction({
@@ -477,12 +491,15 @@ test("assistant-only tails can be compacted again after complete tool cycles", a
       emit: capture().emit,
     });
     assert.equal(first.state, "done");
+
     if (first.state !== "done") {
       assert.fail("First compaction must finish");
     }
+
     assert.equal(first.messages[1], retained);
     const appended = [cycle("a2"), cycle("a3"), cycle("a4")];
     const messages = [...first.messages, ...appended];
+
     for (const reason of ["threshold", "overflow"] as const) {
       const captured = capture();
       const second = await prepareCompaction({
@@ -494,9 +511,11 @@ test("assistant-only tails can be compacted again after complete tool cycles", a
         emit: captured.emit,
       });
       assert.equal(second.state, "done");
+
       if (second.state !== "done") {
         assert.fail("Continued compaction must finish");
       }
+
       assert.deepEqual(
         second.messages.slice(1).map((message) => message.id),
         ["a4"],
@@ -554,12 +573,15 @@ test("tool cycles require terminal states and results after their calls", () => 
   });
   const first = text("u1", "user", "old");
   const last = text("u2", "user", "new");
+
   for (const state of ["input-streaming", "input-complete"] as const) {
     assert.equal(planCompaction([first, call(state), last]), null);
   }
+
   for (const state of ["complete", "error"] as const) {
     assert.deepEqual(planCompaction([first, call(state), last])?.tail, [last]);
   }
+
   const result: UIMessage = {
     id: "result",
     role: "assistant",
@@ -617,6 +639,7 @@ test("tool cycles require terminal states and results after their calls", () => 
 test("a truncated summary keeps the original history", async () => {
   const chatStream = await mockSummaryStream(summaryEvents("部分摘要", "length"));
   const captured = capture();
+
   try {
     const outcome = await prepareCompaction({
       runId: "run-1",
@@ -640,6 +663,7 @@ test("a truncated summary keeps the original history", async () => {
 test("an oversized summary keeps the original history", async () => {
   const chatStream = await mockSummaryStream(summaryEvents("字".repeat(9_000)));
   const captured = capture();
+
   try {
     const outcome = await prepareCompaction({
       runId: "run-1",
@@ -659,6 +683,7 @@ test("an oversized summary keeps the original history", async () => {
 test("a failing summary keeps the original history", async () => {
   const chatStream = await mockSummaryStream([]);
   const captured = capture();
+
   try {
     const outcome = await prepareCompaction({
       runId: "run-1",
@@ -694,6 +719,7 @@ test("empty or filtered summaries do not replace history", async () => {
   ]) {
     const stream = await mockSummaryStream(events);
     const captured = capture();
+
     try {
       const outcome = await prepareCompaction({
         runId: "invalid-summary",
@@ -719,6 +745,7 @@ test("empty or filtered summaries do not replace history", async () => {
 test("oversized fixed prompts trigger compaction but non-shrinking summaries are rejected", async () => {
   const stream = await mockSummaryStream(summaryEvents("x".repeat(2_000)));
   const captured = capture();
+
   try {
     const outcome = await prepareCompaction({
       runId: "fixed-prompt",
@@ -748,6 +775,7 @@ test("persistence failures propagate instead of becoming summary failures", asyn
   const emit: CompactionEmit = async () => {
     throw new Error("Offline persistence");
   };
+
   await assert.rejects(
     prepareCompaction({
       runId: "persistence",
@@ -767,6 +795,7 @@ test("safety classifications are rejected without changing original content", as
     const stream = await mockSummaryStream(summaryEvents(summary));
     const messages = longMessages();
     const original = structuredClone(messages);
+
     try {
       const outcome = await prepareCompaction({
         runId: "safety",

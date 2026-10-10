@@ -21,4 +21,5 @@ const result = spawnSync(process.execPath, ["--import", "tsx", "--test", ...file
 if (result.error) {
   throw result.error;
 }
+
 process.exit(result.status ?? 1);

@@ -45,6 +45,7 @@ const context = (overrides: Partial<ToolExecutionContext> = {}): ToolExecutionCo
 
 const modelCall = (code: string, id = "code-mode-call"): ModelCall => {
   const input = { code };
+
   return { id, name: "codemode", arguments: JSON.stringify(input), input };
 };
 
@@ -75,10 +76,12 @@ const rejection = (promise: Promise<unknown>) =>
 async function temporaryDirectory(t: TestContext) {
   const directory = await mkdtemp(join(tmpdir(), "chum-code-mode-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
+
   return directory;
 }
 
 let discoverySequence = 0;
+
 async function discoveryHistory(tools: RunTools, toolNames: string[]): Promise<UIMessage[]> {
   const id = `code-mode-discovery-${++discoverySequence}`;
   const argumentsText = JSON.stringify({ toolNames });
@@ -87,6 +90,7 @@ async function discoveryHistory(tools: RunTools, toolNames: string[]): Promise<U
     { id, name: "discover_atlassian_tools", arguments: argumentsText, input: { toolNames } },
     context({ toolCallId: id }),
   );
+
   return [
     {
       id: `${id}-message`,
@@ -406,6 +410,7 @@ test("configured credentials never cross the code mode boundary", async () => {
           assert.match(failure.message, /configured Atlassian credentials/);
           assert.equal(failure.message.includes(fakeToken), false);
         }
+
         for (const input of [
           { code: "return 1;", [fakeToken]: true },
           { code: 42, extra: fakeToken },
@@ -479,6 +484,7 @@ test("sandbox host calls carry child identifiers, the parent deadline and the ca
       toolCallId: child.toolCallId,
       signal: Boolean(child.abortSignal),
     });
+
     return { content: [{ type: "text", text: String((call.input as { path?: unknown }).path) }] };
   });
   const result = (await turn.execute(
@@ -641,6 +647,7 @@ test("a late guest continuation cannot dispatch host work after the execution fi
       dispatched.push(call.name);
       signals.push(child.abortSignal);
       await release.promise;
+
       return { content: [{ type: "text", text: "slow" }] };
     },
   });
@@ -680,6 +687,7 @@ test("guest tool calls reject non-object input without dispatching", async () =>
   const dispatched: string[] = [];
   const turn = compose({ timeoutMs: 5000 }, async (call) => {
     dispatched.push(call.name);
+
     return { ok: true };
   });
   const result = (await turn.execute(
@@ -705,8 +713,10 @@ test("invalid input and oversized results are rejected before returning to the m
   const dispatched: string[] = [];
   const turn = compose({ timeoutMs: 5000 }, async (call) => {
     dispatched.push(call.name);
+
     return { ok: true };
   });
+
   for (const invalid of [
     {},
     { code: 42 },
@@ -716,6 +726,7 @@ test("invalid input and oversized results are rejected before returning to the m
   ]) {
     await assert.rejects(turn.execute(invalid, context()), /expected string|Unrecognized key/);
   }
+
   assert.deepEqual(dispatched, []);
   await assert.rejects(
     compose({ maxResultBytes: 64, timeoutMs: 5000 }).execute(
@@ -734,6 +745,7 @@ test("a credential in the sandbox result or error never reaches the host logger"
       const spy = mock.method(console, "error", (...args: unknown[]) => {
         logged.push(args);
       });
+
       try {
         await withRunTools(async (tools) => {
           for (const code of [
@@ -799,6 +811,7 @@ return out;`;
     guard: () => {},
     dispatch: async (call) => {
       calls.push({ name: call.name, input: call.input });
+
       return { ok: true, key: "FETM-77" };
     },
   });

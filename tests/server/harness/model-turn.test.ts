@@ -23,7 +23,9 @@ test("offline HTTP SSE smoke exposes safe overflow and a complete provider respo
   const server = createServer(async (request, response) => {
     for await (const _chunk of request) {
     }
+
     requests++;
+
     if (requests === 1) {
       response.writeHead(400, { "Content-Type": "application/json" });
       response.end(
@@ -31,8 +33,10 @@ test("offline HTTP SSE smoke exposes safe overflow and a complete provider respo
           error: { code: "context_length_exceeded", message: "Private provider payload" },
         }),
       );
+
       return;
     }
+
     response.writeHead(200, { "Content-Type": "text/event-stream" });
     response.end(
       [
@@ -70,6 +74,7 @@ test("offline HTTP SSE smoke exposes safe overflow and a complete provider respo
       }),
       append: async () => {},
     });
+
   try {
     await assert.rejects(
       invoke(),
@@ -120,9 +125,11 @@ test("provider overflow classification is allowlisted for streamed and thrown fa
     { error: { code: "context_length_exceeded", message: "Rate limit exceeded" }, overflow: false },
     { error: { message: "Input too long" }, overflow: false },
   ];
+
   for (const fixture of cases) {
     for (const streamed of [false, true]) {
       const failure = Object.assign(new Error(fixture.error.message), fixture.error);
+
       async function* stream(): AsyncGenerator<AdapterYieldChunk> {
         if (streamed) {
           yield { type: EventType.RUN_ERROR, message: failure.message, rawEvent: failure };
@@ -130,6 +137,7 @@ test("provider overflow classification is allowlisted for streamed and thrown fa
           throw failure;
         }
       }
+
       await assert.rejects(
         streamModelTurn({ messages: [], stream: stream(), append: async () => {} }),
         (error: unknown) => {
@@ -138,9 +146,11 @@ test("provider overflow classification is allowlisted for streamed and thrown fa
             fixture.overflow,
             JSON.stringify(fixture),
           );
+
           if (fixture.overflow) {
             assert.equal((error as Error).message, "Model context capacity exceeded");
           }
+
           return true;
         },
       );
@@ -152,9 +162,11 @@ test("local append and protected-history failures never become provider overflow
   const failure = Object.assign(new Error("context_length_exceeded"), {
     code: "context_length_exceeded",
   });
+
   async function* stream(): AsyncGenerator<AdapterYieldChunk> {
     yield { type: EventType.TEXT_MESSAGE_START, messageId: "fresh", role: "assistant" };
   }
+
   await assert.rejects(
     streamModelTurn({
       messages: [],
@@ -165,9 +177,11 @@ test("local append and protected-history failures never become provider overflow
     }),
     (error: unknown) => error === failure,
   );
+
   async function* collision(): AsyncGenerator<AdapterYieldChunk> {
     yield { type: EventType.TEXT_MESSAGE_START, messageId: "archived", role: "assistant" };
   }
+
   await assert.rejects(
     streamModelTurn({
       messages: [],
@@ -185,6 +199,7 @@ test("iterator cleanup preserves primary provider and local failures", async () 
   });
   const ordinary = new Error("ordinary provider failure");
   const local = Object.assign(new Error("local failure"), { code: "context_length_exceeded" });
+
   for (const fixture of [
     { source: "next", failure: overflow, overflow: true },
     { source: "next", failure: ordinary, overflow: false },
@@ -199,6 +214,7 @@ test("iterator cleanup preserves primary provider and local failures", async () 
             if (fixture.source === "next") {
               throw fixture.failure;
             }
+
             const value: AdapterYieldChunk =
               fixture.source === "event"
                 ? {
@@ -207,6 +223,7 @@ test("iterator cleanup preserves primary provider and local failures", async () 
                     rawEvent: fixture.failure,
                   }
                 : { type: EventType.TEXT_MESSAGE_START, messageId: "fresh", role: "assistant" };
+
             return { done: false, value };
           },
           async return() {
@@ -231,6 +248,7 @@ test("iterator cleanup preserves primary provider and local failures", async () 
         } else {
           assert.equal(error, fixture.failure);
         }
+
         return true;
       },
     );
@@ -253,6 +271,7 @@ function compatibleStream(definition: ModelTool, argumentsJson: string, strict: 
         tools: { function: { name: string; strict?: boolean } }[];
       };
       assert.equal(body.tools[0]?.function.strict, strict);
+
       return new Response(
         [
           {
@@ -281,6 +300,7 @@ function compatibleStream(definition: ModelTool, argumentsJson: string, strict: 
       );
     },
   });
+
   return adapter.chatStream({
     model: "offline-model",
     messages: convertMessagesToModelMessages(messages),
