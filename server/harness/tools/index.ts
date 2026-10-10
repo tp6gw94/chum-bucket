@@ -1,13 +1,16 @@
 import {
   convertSchemaToJsonSchema,
+  toolDefinition,
   type Tool,
   type ToolExecutionContext,
   type UIMessage,
 } from "@tanstack/ai";
+import { testingRequestInputSchema } from "../../../shared/testing";
 import type { ModelCall } from "../model-turn";
 import { codeModeToolName, composeCodeModeTurn } from "./code-mode";
 import {
   withAtlassianScope,
+  ToolBoundaryError,
   type AtlassianCatalog,
   type LocalToolHandler,
   type ModelTool,
@@ -35,7 +38,15 @@ export type RunTools = Readonly<{
   ) => Promise<unknown>;
 }>;
 
-class ToolBoundaryError extends Error {}
+export const RUN_TESTS_TOOL = "run_tests";
+export type RunToolScope = "ordinary" | "main";
+
+const runTests = toolDefinition({
+  name: RUN_TESTS_TOOL,
+  description:
+    "Run supervised tests for this main conversation. Pass only the testing intent: goal, sources, criteria, target URL, and optional design or artifact references.",
+  inputSchema: testingRequestInputSchema,
+});
 
 function registration(
   tool: Pick<Tool, "name" | "description" | "inputSchema">,
@@ -76,6 +87,7 @@ function mergeLocalDefinitions(remote: AtlassianCatalog): ModelTool[] {
 export async function withRunTools<T>(
   use: (tools: RunTools) => Promise<T>,
   signal?: AbortSignal,
+  runScope: RunToolScope = "ordinary",
 ): Promise<T> {
   return withAtlassianScope(async (scope) => {
     const pending = new Set<Promise<unknown>>();
@@ -83,6 +95,9 @@ export async function withRunTools<T>(
       (messages: readonly UIMessage[]) => (call: ModelCall, context: ToolExecutionContext) => {
         context.abortSignal?.throwIfAborted();
         signal?.throwIfAborted();
+        if (call.name === RUN_TESTS_TOOL) {
+          throw new ToolBoundaryError("run_tests is direct-only on the main run");
+        }
         const work = scope.executeTool(
           messages,
           call,
@@ -98,9 +113,22 @@ export async function withRunTools<T>(
       };
     const buildTurn = async (messages: readonly UIMessage[]) => {
       const definitions = await scope.getModelTools(messages, mergeLocalDefinitions);
+      const bindable = definitions.filter((definition) => definition.name !== RUN_TESTS_TOOL);
       const guard = await scope.guard();
-      const turn = composeCodeModeTurn({ definitions, dispatch: dispatchFor(messages), guard });
-      return { definitions, turn };
+      const turn = composeCodeModeTurn({
+        definitions: bindable,
+        dispatch: dispatchFor(messages),
+        guard,
+      });
+      const direct =
+        runScope === "main"
+          ? [
+              registration(runTests, async () => {
+                throw new ToolBoundaryError("run_tests cannot execute inside a tool step");
+              }).definition,
+            ]
+          : [];
+      return { definitions: [...bindable, ...direct], turn };
     };
     try {
       return await use({
@@ -112,6 +140,9 @@ export async function withRunTools<T>(
           };
         },
         async executeTool(messages, call, context) {
+          if (call.name === RUN_TESTS_TOOL) {
+            throw new ToolBoundaryError("run_tests is direct-only on the main run");
+          }
           if (call.name !== codeModeToolName) {
             return dispatchFor(messages)(call, context);
           }
@@ -120,7 +151,7 @@ export async function withRunTools<T>(
         },
       });
     } finally {
-      await Promise.allSettled([...pending]);
+      await Promise.allSettled(pending);
     }
   }, signal);
 }

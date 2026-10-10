@@ -2,6 +2,7 @@ import { ArrowDownIcon, PlusIcon, XIcon } from "lucide-react";
 import { useEffect, type ReactNode } from "react";
 import type { SendResult, CompactNotice } from "../hooks/use-threads";
 import { Marker, MarkerContent } from "@/components/ui/marker";
+import type { TestRunId, TestView } from "../../shared/testing";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -19,6 +20,7 @@ import { CompactMarker, MessageList } from "./message-list";
 import { PaneShell } from "./pane-shell";
 import { ProgressPanel } from "./progress-panel";
 import { StatusBadge } from "./status-badge";
+import { TestingPanel } from "./testing-panel";
 import { type Pane as PaneModel } from "./types";
 
 type PanePresentation = Readonly<{
@@ -28,6 +30,8 @@ type PanePresentation = Readonly<{
   emptyCopy: string;
   progressLabel: string;
 }>;
+
+const EMPTY_TESTING_VIEWS: readonly TestView[] = [];
 
 const PANE_PRESENTATION: Record<PaneModel["kind"], PanePresentation> = {
   main: {
@@ -134,6 +138,8 @@ export function Pane({
   headerAction,
   footer,
   openDisabled = false,
+  testingViews = EMPTY_TESTING_VIEWS,
+  onCancelTesting,
 }: {
   pane: PaneModel;
   onOpenAgentPane?: () => void;
@@ -146,6 +152,8 @@ export function Pane({
   headerAction?: ReactNode;
   footer?: ReactNode;
   openDisabled?: boolean;
+  testingViews?: readonly TestView[];
+  onCancelTesting?: (runId: TestRunId) => Promise<void>;
 }) {
   const presentation = PANE_PRESENTATION[pane.kind];
   const actionsDisabled = sendDisabled || isHydrating || pane.status !== "idle" || !onSend;
@@ -185,6 +193,13 @@ export function Pane({
                 onSend={onSend}
                 actionsDisabled={actionsDisabled}
               />
+              {pane.kind === "main"
+                ? testingViews.map((view) => (
+                    <MessageScrollerItem key={view.runId} messageId={`testing-${view.runId}`}>
+                      <TestingPanel view={view} onCancel={onCancelTesting} />
+                    </MessageScrollerItem>
+                  ))
+                : null}
               {pane.progress.length > 0 ? (
                 <MessageScrollerItem messageId="pane-progress">
                   <ProgressPanel

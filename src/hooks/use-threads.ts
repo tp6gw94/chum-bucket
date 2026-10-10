@@ -6,6 +6,13 @@ import { parseComposerCommand } from "../composer-commands";
 import { fetchServerSentEvents, useChat } from "@tanstack/ai-react";
 import { parseCompactionEvent } from "@/shared/compaction-event";
 import {
+  parsePublishedTesting,
+  parseTestView,
+  parseTestingProjectionEvent,
+} from "@/shared/testing-event";
+import type { TestRunId, TestView } from "@/shared/testing";
+import { mergeHydratedTestingView, mergeTestingView } from "../lib/testing-projections";
+import {
   SIDE_SCOPE_HEADER,
   SideChatOperationError,
   isDefinitiveTransferRejection,
@@ -117,6 +124,19 @@ export function terminalResult(event: unknown, runId: string | null): SendResult
   return null;
 }
 
+function isHydrationRequest(url: string | URL | Request, init?: RequestInit): boolean {
+  const method = init?.method ?? (url instanceof Request ? url.method : "GET");
+  if (method.toUpperCase() !== "GET") {
+    return false;
+  }
+  const parsed = new URL(url instanceof Request ? url.url : String(url), window.location.href);
+  return (
+    parsed.pathname === "/api/chat" &&
+    parsed.searchParams.has("threadId") &&
+    !parsed.searchParams.has("runId")
+  );
+}
+
 export function useThread(threadId: string, sideScope?: string) {
   const scopedFetch: typeof fetch = (url, init) => {
     const headers = new Headers(init?.headers);
@@ -128,6 +148,7 @@ export function useThread(threadId: string, sideScope?: string) {
   const [phase, setPhase] = useState<ThreadPhase>("loading");
   const [error, setError] = useState<string | null>(null);
   const [compactNotice, setCompactNotice] = useState<CompactNotice | null>(null);
+  const [testingViews, setTestingViews] = useState<readonly TestView[]>([]);
   const owner = useRef({
     phase: "loading" as ThreadPhase,
     mounted: true,
@@ -168,7 +189,23 @@ export function useThread(threadId: string, sideScope?: string) {
     ((stream: AsyncIterable<StreamChunk>) => AsyncIterable<StreamChunk>) | null
   >(null);
   const connection = useMemo(() => {
-    const base = fetchServerSentEvents("/api/chat", { fetchClient: scopedFetch });
+    const hydrationFetch: typeof fetch = async (url, init) => {
+      const response = await scopedFetch(url, init);
+      if (!sideScope && isHydrationRequest(url, init)) {
+        void response
+          .clone()
+          .json()
+          .then((payload: unknown) => {
+            const published = parsePublishedTesting(payload);
+            if (published && owner.mounted) {
+              setTestingViews((current) => mergeHydratedTestingView(current, published));
+            }
+          })
+          .catch(() => undefined);
+      }
+      return response;
+    };
+    const base = fetchServerSentEvents("/api/chat", { fetchClient: hydrationFetch });
     let hydration: ReturnType<NonNullable<typeof base.hydrate>> | undefined;
     const observe = async function* (stream: AsyncIterable<StreamChunk>) {
       try {
@@ -189,6 +226,12 @@ export function useThread(threadId: string, sideScope?: string) {
               }
               owner.compactOperationId = null;
               publish("busy");
+            }
+          }
+          if (!sideScope) {
+            const projection = parseTestingProjectionEvent(chunk);
+            if (projection && owner.mounted) {
+              setTestingViews((current) => mergeTestingView(current, projection));
             }
           }
           yield chunk;
@@ -415,6 +458,37 @@ export function useThread(threadId: string, sideScope?: string) {
     settle();
     return owner.commandRejected ? "failed" : (owner.terminal ?? "uncertain");
   }
+  async function cancelTesting(runId: TestRunId): Promise<void> {
+    if (sideScope) {
+      throw new Error("附屬對話不支援測試取消。");
+    }
+    let response: Response;
+    try {
+      response = await fetch(`/api/testing/${encodeURIComponent(runId)}/cancel`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ threadId }),
+      });
+    } catch {
+      throw new Error("取消要求無法送出，請稍後再試。");
+    }
+    if (!response.ok) {
+      throw new Error(`伺服器回應異常（HTTP ${response.status}）。`);
+    }
+    let payload: unknown;
+    try {
+      payload = await response.json();
+    } catch {
+      throw new Error("伺服器回應無法解析。");
+    }
+    const view = parseTestView(payload);
+    if (!view || view.runId !== runId) {
+      throw new Error("伺服器回應與取消要求不符。");
+    }
+    if (owner.mounted) {
+      setTestingViews((current) => mergeTestingView(current, view));
+    }
+  }
   function navigate(id: string | null) {
     if (owner.phase !== "ready" || id === threadId) {
       return false;
@@ -429,6 +503,8 @@ export function useThread(threadId: string, sideScope?: string) {
     phase,
     error,
     compactNotice,
+    testingViews,
+    cancelTesting,
     send,
     compact: () => send("/compact"),
     acceptExternalRun,

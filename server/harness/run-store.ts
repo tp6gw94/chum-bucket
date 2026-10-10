@@ -10,6 +10,7 @@ import {
   chatRunsTable,
   sideChatsTable,
   sideTransfersTable,
+  testingOperationsTable,
   threadsTable,
 } from "../db/schema";
 import {
@@ -26,9 +27,48 @@ import { openuiInstructions } from "./prompts";
 import { snapshot } from "./model-turn";
 import { projectConversation, readProjection, type ConversationState } from "./conversation";
 import { compactionEvent, parseCompactionEvent } from "../../shared/compaction-event";
+import {
+  testingRequestSchema,
+  type ArtifactKind,
+  type ArtifactRef,
+  type RoleId,
+  type RootRunOutcome,
+  type TestingRequest,
+  type TestView,
+} from "../../shared/testing";
+import {
+  admitAttachedInTransaction,
+  acceptRoleCandidateInTransaction,
+  cancelTestingInTransaction,
+  closeTestingInTransaction,
+  closeUnfinishedTesting,
+  findStandaloneAdmission,
+  guardActualIOInTransaction,
+  hostTestingRuntime,
+  insertStandaloneOperation,
+  prepareStandaloneClosure,
+  publishProjectionInTransaction,
+  readTestingExecutionInTransaction,
+  readPublishedTesting as readPublishedTestingRow,
+  readPublishedThreadViews as readPublishedThreadViewsRow,
+  readPublishedThreadViewsInTransaction,
+  selectTestingCancellation,
+  readTestingAdmissionInTransaction,
+  recordRoleFailureInTransaction,
+  reserveRoleTasksInTransaction,
+  testingFinishOutcome,
+  TestingPersistenceError,
+  type ActualIoGuard,
+  type ActualIoInput,
+  type AppendTestingEvent,
+  type RoleFrame,
+  type TestingAdmission,
+  type TestingExecution,
+} from "./testing-store";
 
 export const PREVIOUS_BUILD = "durable-chat-loop-v9";
 export const BUILD = "durable-chat-loop-v10";
+export const TESTING_ROOT_BUILD = "testing-root-v1";
 export const MODEL = "deepseek-ai/DeepSeek-V4.1-Flash";
 const runIdSchema = z
   .string()
@@ -57,7 +97,7 @@ export type AcceptedRun = z.output<typeof runInputSchema> & {
   context: UIMessage[];
   prompt: string;
   model: typeof MODEL;
-  build: typeof BUILD | typeof PREVIOUS_BUILD;
+  build: typeof BUILD | typeof PREVIOUS_BUILD | typeof TESTING_ROOT_BUILD;
   side?: SideFence;
 };
 type RunRow = typeof chatRunsTable.$inferSelect;
@@ -384,6 +424,14 @@ async function failedConversation(
   return committed ? readProjection(run.projection) : undefined;
 }
 
+function testingEventAppend(tx: Transaction, run: RunRow): AppendTestingEvent {
+  return async (key, event) => {
+    const sequence = run.next_sequence;
+    await appendEvent(tx, run, key, event);
+    return sequence;
+  };
+}
+
 export async function finishRun(
   runId: string,
   conversation?: ConversationState,
@@ -397,6 +445,12 @@ export async function finishRun(
       return;
     }
     assertThreadClaim(run, thread);
+    await closeUnfinishedTesting(
+      tx,
+      run.id,
+      testingFinishOutcome(code, succeeded),
+      testingEventAppend(tx, run),
+    );
     let committed =
       conversation ??
       (await failedConversation(tx, run)) ??
@@ -476,6 +530,7 @@ export async function listPendingRuns() {
       and(
         eq(chatRunsTable.state, "pending"),
         sql`not exists (select 1 from ${sideChatsTable} where ${sideChatsTable.id} = ${chatRunsTable.thread_id} and (${sideChatsTable.state} <> 'open' or ${sideChatsTable.lease_until} <= now()))`,
+        sql`not exists (select 1 from ${testingOperationsTable} where ${testingOperationsTable.id} = ${chatRunsTable.id} and ${testingOperationsTable.parent_run_id} = ${chatRunsTable.id})`,
       ),
     )
     .orderBy(chatRunsTable.created_at);
@@ -510,10 +565,12 @@ export async function hydrateThread(threadId: string, access?: SideAccess) {
       }
       messages = readProjection(run.projection).display;
     }
+    const published = await readPublishedThreadViewsInTransaction(tx, threadId);
     return {
       messages,
       revision: thread.revision,
       activeRun: thread.active_run_id ? { runId: thread.active_run_id } : null,
+      publishedTesting: published[0] ?? null,
     };
   });
 }
@@ -941,4 +998,297 @@ export async function* observeRun(
     }
     await pollWhileOpen(signal);
   }
+}
+
+async function withTestingRoot<T>(
+  ownerRunId: string,
+  work: (tx: Transaction, run: RunRow, thread: ThreadRow, append: AppendTestingEvent) => Promise<T>,
+): Promise<T> {
+  const db = await database();
+  return db.transaction(async (tx) => {
+    const locked = await lockRun(tx, ownerRunId);
+    if (locked.run.state !== "pending") {
+      throw new TestingPersistenceError(409, "Run is terminal");
+    }
+    assertThreadClaim(locked.run, locked.thread);
+    return work(tx, locked.run, locked.thread, testingEventAppend(tx, locked.run));
+  });
+}
+
+async function claimStandaloneRoot(tx: Transaction, request: TestingRequest) {
+  const side = await lockSide(tx, request.threadId);
+  if (side) {
+    throw new TestingPersistenceError(409, "Standalone testing cannot claim a side chat");
+  }
+  const [thread] = await tx
+    .select()
+    .from(threadsTable)
+    .where(eq(threadsTable.id, request.threadId))
+    .for("update");
+  if (!thread) {
+    throw new TestingPersistenceError(404, "Unknown thread");
+  }
+  const [existingRun] = await tx
+    .select()
+    .from(chatRunsTable)
+    .where(eq(chatRunsTable.id, request.requestId))
+    .for("update");
+  if (existingRun) {
+    if (existingRun.thread_id !== request.threadId || thread.active_run_id !== request.requestId) {
+      throw new TestingPersistenceError(409, "Testing request identity collision");
+    }
+    return;
+  }
+  if (thread.active_run_id || thread.revision !== request.expectedRevision) {
+    throw new TestingPersistenceError(409, "Thread revision or claim conflict");
+  }
+  const priorContext = await committedModelContext(tx, thread);
+  const claimInput = compactInputSchema.parse({
+    kind: "compact",
+    threadId: request.threadId,
+    runId: request.requestId,
+    baseRevision: request.expectedRevision,
+  });
+  const accepted: AcceptedRun = {
+    ...claimInput,
+    messages: thread.messages,
+    context: priorContext,
+    prompt: openuiInstructions(),
+    model: MODEL,
+    build: TESTING_ROOT_BUILD,
+  };
+  const [inserted] = await tx
+    .insert(chatRunsTable)
+    .values({
+      id: request.requestId,
+      thread_id: request.threadId,
+      request: claimInput,
+      accepted,
+      projection: projectConversation({ display: thread.messages, context: priorContext }),
+    })
+    .onConflictDoNothing({ target: chatRunsTable.id })
+    .returning();
+  if (!inserted) {
+    throw new TestingPersistenceError(409, "Testing request identity collision");
+  }
+  await tx
+    .update(threadsTable)
+    .set({ active_run_id: request.requestId })
+    .where(eq(threadsTable.id, request.threadId));
+  await appendEvent(tx, inserted, "started", {
+    type: EventType.RUN_STARTED,
+    threadId: request.threadId,
+    runId: request.requestId,
+  });
+}
+
+async function releaseStandaloneClaim(
+  tx: Transaction,
+  run: RunRow,
+  thread: ThreadRow,
+  outcome: RootRunOutcome,
+) {
+  if (thread.active_run_id === run.id) {
+    await tx
+      .update(threadsTable)
+      .set({ active_run_id: null })
+      .where(eq(threadsTable.id, thread.id));
+  }
+  if (run.state === "pending") {
+    const state = outcome === "completed" ? "succeeded" : "failed";
+    await tx.update(chatRunsTable).set({ state }).where(eq(chatRunsTable.id, run.id));
+    run.state = state;
+  }
+}
+
+export async function admitAttachedTesting(
+  parent: AcceptedRun,
+  callId: string,
+  intent: unknown,
+  now = new Date(),
+): Promise<TestingAdmission> {
+  const runtime = hostTestingRuntime({ model: parent.model, build: parent.build }, now);
+  const db = await database();
+  return db.transaction(async (tx) => {
+    const locked = await lockRun(tx, parent.runId);
+    if (locked.run.thread_id !== parent.threadId || locked.run.state !== "pending") {
+      throw new TestingPersistenceError(409, "Attached testing requires the active parent run");
+    }
+    assertThreadClaim(locked.run, locked.thread);
+    return admitAttachedInTransaction(tx, parent.runId, parent.threadId, callId, intent, runtime);
+  });
+}
+
+export async function admitStandaloneTesting(
+  request: TestingRequest,
+  now = new Date(),
+): Promise<TestingAdmission> {
+  const parsed = testingRequestSchema.safeParse(request);
+  if (!parsed.success || !runIdSchema.safeParse(parsed.data.requestId).success) {
+    throw new TestingPersistenceError(400, "Invalid testing request");
+  }
+  if (!z.uuid().safeParse(parsed.data.threadId).success) {
+    throw new TestingPersistenceError(400, "Invalid testing request");
+  }
+  const runtime = hostTestingRuntime({ model: MODEL, build: BUILD }, now);
+  const db = await database();
+  return db.transaction(async (tx) => {
+    const existing = await findStandaloneAdmission(tx, parsed.data);
+    if (existing) {
+      return existing;
+    }
+    const prepared = await prepareStandaloneClosure(tx, parsed.data, runtime);
+    await claimStandaloneRoot(tx, parsed.data);
+    return insertStandaloneOperation(tx, parsed.data, runtime, prepared);
+  });
+}
+
+export async function reserveRoleTasks(
+  ownerRunId: string,
+  operationId: string,
+  frontier: readonly Readonly<{ role: RoleId; input: unknown }>[],
+): Promise<readonly RoleFrame[]> {
+  return withTestingRoot(ownerRunId, (tx) =>
+    reserveRoleTasksInTransaction(tx, operationId, ownerRunId, frontier),
+  );
+}
+
+export async function guardActualIO(input: ActualIoInput): Promise<ActualIoGuard> {
+  const db = await database();
+  return db.transaction(async (tx) => {
+    let owner: { run: RunRow; thread: ThreadRow };
+    try {
+      owner = await lockRun(tx, input.parentRunId);
+    } catch (error) {
+      if (error instanceof RunRequestError) {
+        return { state: "denied", reason: "scope" };
+      }
+      throw error;
+    }
+    if (owner.run.state !== "pending") {
+      return { state: "denied", reason: "terminal" };
+    }
+    if (
+      owner.thread.active_run_id !== owner.run.id ||
+      owner.thread.revision !== owner.run.request.baseRevision
+    ) {
+      return { state: "denied", reason: "scope" };
+    }
+    return guardActualIOInTransaction(tx, input, owner.thread.id);
+  });
+}
+
+export async function acceptRoleCandidate(
+  ownerRunId: string,
+  taskId: string,
+  proposal: unknown,
+): Promise<{ ref: ArtifactRef; kind: ArtifactKind }> {
+  return withTestingRoot(ownerRunId, (tx) =>
+    acceptRoleCandidateInTransaction(tx, ownerRunId, taskId, proposal),
+  );
+}
+
+export async function readTestingExecution(
+  ownerRunId: string,
+  operationId: string,
+): Promise<TestingExecution> {
+  return withTestingRoot(ownerRunId, (tx, run, thread) =>
+    readTestingExecutionInTransaction(tx, run.id, thread.id, operationId),
+  );
+}
+
+export async function publishProjection(
+  ownerRunId: string,
+  operationId: string,
+): Promise<TestView> {
+  return withTestingRoot(ownerRunId, (tx, _run, _thread, append) =>
+    publishProjectionInTransaction(tx, ownerRunId, operationId, append),
+  );
+}
+
+export async function cancelTesting(ownerRunId: string, operationId: string): Promise<TestView> {
+  return withTestingRoot(ownerRunId, (tx, _run, _thread, append) =>
+    cancelTestingInTransaction(tx, ownerRunId, operationId, append),
+  );
+}
+
+export async function closeTesting(
+  ownerRunId: string,
+  operationId: string,
+  rootOutcome: RootRunOutcome,
+): Promise<TestView> {
+  return withTestingRoot(ownerRunId, async (tx, run, thread, append) => {
+    const view = await closeTestingInTransaction(tx, ownerRunId, operationId, rootOutcome, append);
+    const [operation] = await tx
+      .select({
+        runtime: testingOperationsTable.runtime,
+        terminal_outcome: testingOperationsTable.terminal_outcome,
+      })
+      .from(testingOperationsTable)
+      .where(eq(testingOperationsTable.id, operationId));
+    const runtime = operation?.runtime as { mode?: string } | undefined;
+    if (runtime?.mode === "standalone" && operation?.terminal_outcome) {
+      await releaseStandaloneClaim(tx, run, thread, operation.terminal_outcome as RootRunOutcome);
+    }
+
+    return view;
+  });
+}
+
+function requireThreadId(threadId: string): void {
+  if (!z.uuid().safeParse(threadId).success) {
+    throw new RunRequestError(400, "Invalid thread ID");
+  }
+}
+
+export async function readPublishedTesting(
+  threadId: string,
+  runId: string,
+): Promise<TestView | null> {
+  requireThreadId(threadId);
+
+  return readPublishedTestingRow(threadId, runId);
+}
+
+export async function readPublishedThreadViews(threadId: string): Promise<readonly TestView[]> {
+  requireThreadId(threadId);
+
+  return readPublishedThreadViewsRow(threadId);
+}
+
+export async function readTestingAdmission(
+  ownerRunId: string,
+  operationId: string,
+): Promise<TestingAdmission> {
+  return withTestingRoot(ownerRunId, (tx) =>
+    readTestingAdmissionInTransaction(tx, ownerRunId, operationId),
+  );
+}
+
+export async function recordRoleFailure(
+  ownerRunId: string,
+  taskId: string,
+  reasonCode: string,
+): Promise<{ duplicate: boolean }> {
+  return withTestingRoot(ownerRunId, (tx) =>
+    recordRoleFailureInTransaction(tx, ownerRunId, taskId, reasonCode),
+  );
+}
+
+export async function cancelPublishedTesting(threadId: string, runId: string): Promise<TestView> {
+  requireThreadId(threadId);
+  const selection = await selectTestingCancellation(threadId, runId);
+
+  if (selection.kind === "live") {
+    return cancelTesting(selection.parentRunId, selection.operationId);
+  }
+
+  const view =
+    selection.kind === "terminal" ? await readPublishedTestingRow(threadId, runId) : null;
+
+  if (!view) {
+    throw new RunRequestError(404, "Testing run was not found");
+  }
+
+  return view;
 }

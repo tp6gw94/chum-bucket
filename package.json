@@ -7,11 +7,13 @@
     "dev": "concurrently \"vite\" \"tsx watch server/index.ts\"",
     "dev:client": "vite",
     "dev:server": "tsx watch server/index.ts",
-    "typecheck": "tsc",
-    "check:contrast": "tsx scripts/check-contrast.ts",
-    "check:compaction-offline": "node scripts/check-compaction-offline.mjs",
-    "check:openui": "tsx scripts/check-openui-parse.ts",
-    "check:thread-browser": "node scripts/check-thread-browser.mjs",
+    "typecheck": "tsc -p tsconfig.json && tsc -p tests/tsconfig.json && pnpm check:boundaries",
+    "check:boundaries": "tsx tests/check-boundaries.ts",
+    "test": "node tests/runner.mjs",
+    "check:contrast": "tsx tests/scripts/check-contrast.ts",
+    "check:compaction-offline": "node tests/scripts/check-compaction-offline.mjs",
+    "check:openui": "tsx tests/scripts/check-openui-parse.ts",
+    "check:thread-browser": "node tests/scripts/check-thread-browser.mjs",
     "prebuild": "pnpm run generate",
     "build": "vite build",
     "start": "tsx server/index.ts",
@@ -23,7 +25,7 @@
     "lint": "oxlint && fallow",
     "lint:fix": "oxlint --fix-dangerously",
     "mcp:atlassian": "tsx scripts/mcp-atlassian.ts",
-    "dev:thread-browser": "vite --config scripts/thread-browser-vite.mjs"
+    "dev:thread-browser": "vite --config tests/scripts/thread-browser-vite.mjs"
   },
   "dependencies": {
     "@base-ui/react": "^1.8.0",
@@ -64,6 +66,7 @@
   },
   "devDependencies": {
     "@openuidev/cli": "^0.4.0",
+    "@stylistic/eslint-plugin": "^5.10.0",
     "@types/node": "^26.1.1",
     "@types/pg": "^8.23.1",
     "@types/react": "^19.3.0",

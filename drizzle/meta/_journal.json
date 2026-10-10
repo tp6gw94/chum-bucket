@@ -22,6 +22,13 @@
       "when": 1791383371748,
       "tag": "0002_side_chats",
       "breakpoints": false
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1791540092512,
+      "tag": "0003_supervised_testing",
+      "breakpoints": true
     }
   ]
 }

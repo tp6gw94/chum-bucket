@@ -9,6 +9,8 @@ import {
   stripTypeScript,
   toolsToBindings,
   type CodeModeTool,
+  type CodeModeToolResult,
+  type IsolateContext,
   type IsolateDriver,
   type ToolBinding,
 } from "@tanstack/ai-code-mode";
@@ -23,9 +25,7 @@ const codeModeInputSchema = z
   .object({
     code: z
       .string()
-      .describe(
-        "TypeScript code to execute in the sandbox. Use external_* functions to call available APIs. Return a value to pass results back.",
-      ),
+      .describe("TypeScript code to execute in the sandbox. Return a value to pass results back."),
   })
   .strict();
 
@@ -69,34 +69,147 @@ const defaultPolicy: CodeModePolicy = {
 const quickjsDriver: IsolateDriver = createQuickJSIsolateDriver();
 
 function codeModeDescription(bindings: Record<string, ToolBinding>): string {
-  return `Execute TypeScript in a secure sandbox. Pass the program as JSON \`{"code": "<typescript>"}\`. The code can call these async external functions: ${Object.keys(bindings).join(", ")}. All external_* calls must be awaited. Return a value to pass results back. Use console.log() for debugging.`;
+  const names = Object.keys(bindings);
+  const available =
+    names.length > 0
+      ? `The code can call these async external functions: ${names.join(", ")}.`
+      : "No external functions are available in this execution.";
+  const asyncNote = names.length > 0 ? " All external_* calls must be awaited." : "";
+  return `Execute TypeScript in a secure sandbox. Pass the program as JSON \`{"code": "<typescript>"}\`. ${available}${asyncNote} Return a value to pass results back. Use console.log() for debugging.`;
 }
 
 function codeModeSystemPrompt(bindings: Record<string, ToolBinding>): string {
-  const catalog = Object.entries(bindings)
+  const entries = Object.entries(bindings);
+  const catalog = entries
     .map(([name, binding]) => `- \`${name}(input)\`: ${binding.description}`)
     .join("\n");
+  const apiDocumentation =
+    entries.length > 0
+      ? `Inside the code, these async functions are available:\n\n${catalog}\n\n### Type Definitions\n\n\`\`\`typescript\n${generateTypeStubs(bindings)}\n\`\`\``
+      : "No external functions are available in this execution.";
+  const asyncNote =
+    entries.length > 0 ? "- All `external_*` calls are async and must be awaited.\n" : "";
   return `## Code Execution Tool
 
 Call \`${codeModeToolName}\` with JSON \`{ "code": "<typescript>" }\`. The \`code\` field runs in a sandboxed environment.
 
-Inside the code, these async functions are available:
-
-${catalog}
-
-### Type Definitions
-
-\`\`\`typescript
-${generateTypeStubs(bindings)}
-\`\`\`
+${apiDocumentation}
 
 ### Notes
 
-- All \`external_*\` calls are async and must be awaited.
-- Return a value to pass results back.
+${asyncNote}- Return a value to pass results back.
 - \`console.log()\` output is captured.
 - The sandbox is isolated with no network or filesystem access.
 - Each execution is independent.`;
+}
+
+async function executeWithoutBindings(
+  code: string,
+  policy: CodeModePolicy,
+  transpile: (code: string) => string | Promise<string>,
+  emit: (name: string, payload: Record<string, unknown>) => void,
+): Promise<CodeModeToolResult> {
+  const startedAt = Date.now();
+  let isolateContext: IsolateContext | null = null;
+  const finish = (result: CodeModeToolResult, phase: string): CodeModeToolResult => {
+    emit("code_mode:execution_finished", {
+      timestamp: Date.now(),
+      durationMs: Date.now() - startedAt,
+      phase,
+      success: result.success,
+      logCount: result.logs?.length ?? 0,
+      error: result.error,
+    });
+    return result;
+  };
+  const errorResult = (
+    failure: unknown,
+    name: string,
+    useFailureName = false,
+  ): CodeModeToolResult => ({
+    success: false,
+    error: {
+      message: failure instanceof Error ? failure.message : String(failure),
+      name: useFailureName && failure instanceof Error ? failure.name : name,
+      ...(failure instanceof Error && failure.stack !== undefined ? { stack: failure.stack } : {}),
+    },
+  });
+
+  if (!code) {
+    return finish(
+      {
+        success: false,
+        error: { message: "typescriptCode must be a non-empty string", name: "ValidationError" },
+      },
+      "validate-input",
+    );
+  }
+
+  emit("code_mode:execution_started", { timestamp: Date.now(), codeLength: code.length });
+  try {
+    let strippedCode: string;
+    try {
+      strippedCode = await transpile(code);
+    } catch (failure) {
+      return finish(errorResult(failure, "TypeScriptError"), "transpile");
+    }
+
+    try {
+      isolateContext = await quickjsDriver.createContext({
+        bindings: {},
+        timeout: policy.timeoutMs,
+        memoryLimit: policy.memoryLimitMb,
+      });
+    } catch (failure) {
+      return finish(errorResult(failure, "CreateContextError", true), "create-context");
+    }
+
+    const executionResult = await isolateContext.execute(strippedCode);
+    for (const log of executionResult.logs ?? []) {
+      let level = "log";
+      let message = log;
+      if (log.startsWith("ERROR: ")) {
+        level = "error";
+        message = log.slice(7);
+      } else if (log.startsWith("WARN: ")) {
+        level = "warn";
+        message = log.slice(6);
+      } else if (log.startsWith("INFO: ")) {
+        level = "info";
+        message = log.slice(6);
+      }
+      emit("code_mode:console", { level, message, timestamp: Date.now() });
+    }
+
+    if (executionResult.success) {
+      return finish(
+        { success: true, result: executionResult.value, logs: executionResult.logs },
+        "execute",
+      );
+    }
+    return finish(
+      {
+        success: false,
+        error: executionResult.error
+          ? {
+              message: executionResult.error.message,
+              name: executionResult.error.name,
+              ...(executionResult.error.stack !== undefined
+                ? { stack: executionResult.error.stack }
+                : {}),
+            }
+          : { message: "Unknown execution error", name: "UnknownError" },
+        logs: executionResult.logs,
+      },
+      "execute",
+    );
+  } catch (failure) {
+    return finish(errorResult(failure, "Error", true), "unhandled");
+  } finally {
+    if (isolateContext) {
+      await isolateContext.dispose();
+    }
+  }
 }
 
 function consolePolicy(policy: CodeModePolicy): string {
@@ -412,20 +525,24 @@ export function composeCodeModeTurn(input: {
       (definition) => definition.name !== codeModeToolName && definition.name !== discoveryToolName,
     )
     .map(adapter);
-  const composed = createCodeMode({
-    driver: quickjsDriver,
-    tools: sandboxTools,
-    timeout: policy.timeoutMs,
-    memoryLimit: policy.memoryLimitMb,
-    onSecretParameter: "ignore",
-    transpile: async (code: string) => {
-      if (Buffer.byteLength(code, "utf8") > policy.maxSourceBytes) {
-        throw stop(`codemode source exceeds ${policy.maxSourceBytes} bytes`);
-      }
-      guarded(code);
-      return stripTypeScript(`${consolePolicy(policy)}\n${code}`);
-    },
-  });
+  const transpile = async (code: string) => {
+    if (Buffer.byteLength(code, "utf8") > policy.maxSourceBytes) {
+      throw stop(`codemode source exceeds ${policy.maxSourceBytes} bytes`);
+    }
+    guarded(code);
+    return stripTypeScript(`${consolePolicy(policy)}\n${code}`);
+  };
+  const composed =
+    sandboxTools.length > 0
+      ? createCodeMode({
+          driver: quickjsDriver,
+          tools: sandboxTools,
+          timeout: policy.timeoutMs,
+          memoryLimit: policy.memoryLimitMb,
+          onSecretParameter: "ignore",
+          transpile,
+        })
+      : undefined;
   const bindings = toolsToBindings(sandboxTools, "external_");
   const systemPrompt = codeModeSystemPrompt(bindings);
   guarded(systemPrompt);
@@ -462,7 +579,9 @@ export function composeCodeModeTurn(input: {
         guarded(value);
         const parsed = parseWithStandardSchema<{ code: string }>(codeModeInputSchema, value);
         request = { typescriptCode: parsed.code };
-        parseWithStandardSchema<{ typescriptCode: string }>(composed.tool.inputSchema, request);
+        if (composed) {
+          parseWithStandardSchema<{ typescriptCode: string }>(composed.tool.inputSchema, request);
+        }
       } catch (failure) {
         controller.abort();
         const message = failure instanceof Error ? failure.message : "codemode input is invalid";
@@ -470,14 +589,27 @@ export function composeCodeModeTurn(input: {
         throw stop(message);
       }
       try {
-        const result = await composed.tool.execute!(request, {
-          ...context,
-          emitCustomEvent: (name, payload, options) => {
-            onSandboxEvent(emit, controller, name, payload, options);
-          },
-        });
+        const emitSandboxEvent = (name: string, payload: Record<string, unknown>) => {
+          onSandboxEvent(emit, controller, name, payload);
+        };
+        const result = composed
+          ? await composed.tool.execute!(request, {
+              ...context,
+              emitCustomEvent: (name, payload, options) => {
+                onSandboxEvent(emit, controller, name, payload, options);
+              },
+            })
+          : await executeWithoutBindings(
+              request.typescriptCode,
+              policy,
+              transpile,
+              emitSandboxEvent,
+            );
         if (state.fatal) {
           throw stopped();
+        }
+        if (context.abortSignal?.aborted) {
+          throw stop("codemode was cancelled");
         }
         return boundSandboxResult(result);
       } finally {

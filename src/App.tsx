@@ -153,6 +153,8 @@ function ThreadPage({ threadId }: { threadId: string }) {
               isHydrating={thread.phase === "loading"}
               hydrationError={hydrationError}
               compactNotice={thread.compactNotice}
+              testingViews={thread.testingViews}
+              onCancelTesting={thread.cancelTesting}
             />
             {sideChats.entries.map((entry) => (
               <SideChatPane

@@ -29,3 +29,4 @@ Each mutation needs a reload/reopen and read-only database or external-resource 
 - [Context compaction](compaction.md): literal command, suggestion click, suggestion keyboard selection, skipped/completed/failed outcomes.
 - [Pane layout](pane-layout.md): sidebar toggle, placeholder panes, close, keyboard/pointer sizing, mobile scrolling.
 - [Transcript and tool results](transcript-tools.md): OpenUI replies/fallbacks, tool result expansion, summary/original retention, jump-to-latest.
+- [Supervised testing](supervised-testing.md): composer delegation, artifact reuse, four-role progress, reports, cancellation, privacy, and DBOS recovery.

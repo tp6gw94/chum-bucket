@@ -1,26 +1,13 @@
 import { setTimeout as delay } from "node:timers/promises";
 import { DBOS, DBOSClient } from "@dbos-inc/dbos-sdk";
 import type { SideAccess } from "../../shared/side-chat";
-import {
-  EventType,
-  StreamProcessor,
-  convertMessagesToModelMessages,
-  type StreamChunk,
-  type UIMessage,
-} from "@tanstack/ai";
-import { resolveDebugOption } from "@tanstack/ai/adapter-internals";
-import { withRunTools, type RunTools } from "./tools";
+import { runAgentLoop, type AgentCheckpoint, type AgentSession } from "./agent-loop";
+import { ContextOverflowError } from "./model-turn";
+import { RUN_TESTS_TOOL, withRunTools, type RunTools } from "./tools";
+import { drainTestingTransports } from "./testing-child";
+import { orchestrateAttachedTesting, reconcileTestingOperations } from "./testing-run";
 import { prepareCompaction, publishCompaction } from "./compaction";
-import { advanceConversation, type ConversationState } from "./conversation";
-import {
-  ContextOverflowError,
-  snapshot,
-  streamModelTurn,
-  throwProviderError,
-  type ModelCall,
-  type Turn,
-} from "./model-turn";
-import { createToolEventBuffer, drainToolEvents } from "./tool-events";
+import type { ConversationState } from "./conversation";
 import {
   BUILD,
   PREVIOUS_BUILD,
@@ -39,8 +26,6 @@ import {
   type AcceptedRun,
 } from "./run-store";
 
-const MAX_TURN = 20;
-
 export async function acceptRun(value: RunInput, access?: SideAccess): Promise<AcceptedRun> {
   const accepted = await persistRun(value, access);
   if (accepted.pending) {
@@ -48,116 +33,6 @@ export async function acceptRun(value: RunInput, access?: SideAccess): Promise<A
   }
   return accepted.run;
 }
-
-async function toolStep(
-  runId: string,
-  conversation: ConversationState,
-  call: ModelCall,
-  tools: RunTools,
-  signal: AbortSignal,
-): Promise<ConversationState> {
-  signal.throwIfAborted();
-  const messages = conversation.context;
-  await emit(runId, snapshot(conversation.display), conversation);
-  const events = createToolEventBuffer(call.id);
-  let output: unknown;
-  let error = false;
-  try {
-    const context = {
-      toolCallId: call.id,
-      abortSignal: AbortSignal.any([signal, AbortSignal.timeout(35_000)]),
-      emitCustomEvent: (name: string, value: Record<string, unknown>) => events.emit(name, value),
-    };
-    output = await tools.executeTool(messages, call, context);
-  } catch (failure) {
-    output = { error: failure instanceof Error ? failure.message.slice(0, 2000) : "Tool failed" };
-    error = true;
-  }
-  signal.throwIfAborted();
-  await drainToolEvents(events, (event) => emit(runId, event));
-  const content = JSON.stringify(output);
-  if (typeof content !== "string") {
-    throw new Error("Tool output is not JSON serializable");
-  }
-  const event: StreamChunk = {
-    type: EventType.TOOL_CALL_RESULT,
-    toolCallId: call.id,
-    messageId: `${call.id}/result`,
-    role: "tool",
-    content,
-    timestamp: Date.now(),
-    metadata: { tanstack: { state: error ? "output-error" : "output-available" } },
-  };
-  const processor = new StreamProcessor({ initialMessages: structuredClone(messages) });
-  processor.processChunk(event);
-  const encoded = JSON.stringify(processor.getMessages());
-  const next = JSON.parse(encoded) as UIMessage[];
-  const owner = messages.find((message) =>
-    message.parts.some((part) => part.type === "tool-call" && part.id === call.id),
-  );
-  const updated = advanceConversation(conversation, next, owner?.id);
-  await emit(runId, event, updated);
-  return updated;
-}
-
-type ModelOutcome =
-  | { state: "done"; conversation: ConversationState; calls: ModelCall[] }
-  | { state: "overflow"; error: string };
-
-async function modelStep(
-  run: AcceptedRun,
-  conversation: ConversationState,
-  tools: RunTools,
-  signal: AbortSignal,
-): Promise<ModelOutcome> {
-  signal.throwIfAborted();
-  await assertExecution(run);
-  await emit(run.runId, snapshot(conversation.display), conversation);
-  const { deepinfra } = await import("./provider");
-  const adapter = deepinfra(run.model);
-  const turn = await tools.getModelTools(conversation.context);
-  signal.throwIfAborted();
-  await assertExecution(run);
-  const options: Parameters<typeof adapter.chatStream>[0] = {
-    model: run.model,
-    messages: convertMessagesToModelMessages(conversation.context),
-    systemPrompts: [run.prompt, turn.systemPrompt],
-    tools: turn.definitions,
-    logger: resolveDebugOption(false),
-    request: { signal: AbortSignal.any([signal, AbortSignal.timeout(120_000)]) },
-  };
-  let result: Turn;
-  try {
-    let stream: ReturnType<typeof adapter.chatStream>;
-    try {
-      stream = adapter.chatStream(options);
-    } catch (error) {
-      throwProviderError(error);
-    }
-    result = await streamModelTurn({
-      messages: conversation.context,
-      protectedMessages: conversation.display,
-      stream,
-      append: (event) => emit(run.runId, event),
-    });
-  } catch (error) {
-    if (error instanceof ContextOverflowError) {
-      return { state: "overflow", error: error.message };
-    }
-    throw error;
-  }
-  signal.throwIfAborted();
-  const next = advanceConversation(conversation, result.messages);
-  await emit(run.runId, snapshot(next.display), next);
-  return { state: "done", conversation: next, calls: result.calls };
-}
-
-const MODEL_RETRY = {
-  retriesAllowed: true,
-  maxAttempts: 3,
-  intervalSeconds: 1,
-  backoffRate: 2,
-};
 
 async function compactConversation(
   run: AcceptedRun,
@@ -211,71 +86,75 @@ export async function executeRun(run: AcceptedRun) {
   await assertExecution(run);
   const signal = executions.get(run.runId)?.controller.signal ?? new AbortController().signal;
   signal.throwIfAborted();
-  return withRunTools(async (tools) => {
-    let conversation: ConversationState = { display: run.messages, context: run.context };
-    if (run.kind === "compact") {
-      const result = await compactConversation(run, conversation, tools, 0, "manual", signal);
-      await DBOS.runStep(
-        () =>
-          finishRun(
-            run.runId,
-            result.state === "failed" ? undefined : result.conversation,
-            "compaction_failed",
-          ),
-        { name: "finish" },
-      );
-      return;
-    }
-    let turn = 0;
-    while (turn < MAX_TURN) {
-      signal.throwIfAborted();
-      await assertExecution(run);
-      conversation = (
-        await compactConversation(run, conversation, tools, turn, "threshold", signal)
-      ).conversation;
-      let result = await DBOS.runStep(() => modelStep(run, conversation, tools, signal), {
-        name: `model:${turn}`,
-        ...MODEL_RETRY,
-        shouldRetry: () => !signal.aborted,
-      });
-      if (result.state === "overflow") {
-        await DBOS.runStep(() => emit(run.runId, snapshot(conversation.display), conversation), {
-          name: `reset-model:${turn}:overflow`,
-        });
-        conversation = (
-          await compactConversation(run, conversation, tools, turn, "overflow", signal)
-        ).conversation;
-        result = await DBOS.runStep(() => modelStep(run, conversation, tools, signal), {
-          name: `model-overflow:${turn}`,
-          ...MODEL_RETRY,
-          shouldRetry: () => !signal.aborted,
-        });
-        if (result.state === "overflow") {
-          await DBOS.runStep(() => emit(run.runId, snapshot(conversation.display), conversation), {
-            name: `reset-model:${turn}:exhausted`,
-          });
-          throw new ContextOverflowError();
-        }
-      }
-      conversation = result.conversation;
-      if (!result.calls.length) {
-        await DBOS.runStep(() => finishRun(run.runId, conversation), { name: "finish" });
+  return withRunTools(
+    async (tools) => {
+      let conversation: ConversationState = { display: run.messages, context: run.context };
+      if (run.kind === "compact") {
+        const result = await compactConversation(run, conversation, tools, 0, "manual", signal);
+        await DBOS.runStep(
+          () =>
+            finishRun(
+              run.runId,
+              result.state === "failed" ? undefined : result.conversation,
+              "compaction_failed",
+            ),
+          { name: "finish" },
+        );
         return;
       }
-      for (const [index, call] of result.calls.entries()) {
-        signal.throwIfAborted();
-        await assertExecution(run);
-        conversation = await DBOS.runStep(
-          () => toolStep(run.runId, conversation, call, tools, signal),
-          {
-            name: `tool:${turn}:${index}`,
-          },
-        );
+      const session: AgentSession = {
+        runId: run.runId,
+        assertExecution: () => assertExecution(run),
+        emit,
+        chatStream: async (options) => {
+          const { deepinfra } = await import("./provider");
+          return deepinfra(run.model).chatStream(options);
+        },
+        tools,
+      };
+      const checkpoint: AgentCheckpoint = ({ name, retry, shouldRetry, work }) =>
+        retry ? DBOS.runStep(work, { name, ...retry, shouldRetry }) : DBOS.runStep(work, { name });
+      const result = await runAgentLoop({
+        session,
+        conversation,
+        model: run.model,
+        prompt: run.prompt,
+        signal,
+        checkpoint,
+        orchestration: run.side
+          ? undefined
+          : async (call) => {
+              if (call.name !== RUN_TESTS_TOOL) {
+                return { state: "unhandled" };
+              }
+              try {
+                return { state: "handled", output: await orchestrateAttachedTesting(run, call) };
+              } catch (error) {
+                return {
+                  state: "handled",
+                  error: true,
+                  output: {
+                    error: error instanceof Error ? error.message : "Testing delegation failed",
+                  },
+                };
+              }
+            },
+        compaction: {
+          kind: "chat",
+          compact: ({ conversation: current, reason, turn: step }) =>
+            compactConversation(run, current, tools, step, reason, signal).then(
+              (outcome) => outcome.conversation,
+            ),
+        },
+      });
+      if (result.state !== "done") {
+        throw new Error("Model iteration limit exceeded");
       }
-      turn++;
-    }
-    throw new Error("Model iteration limit exceeded");
-  }, signal);
+      await DBOS.runStep(() => finishRun(run.runId, result.conversation), { name: "finish" });
+    },
+    signal,
+    run.side ? "ordinary" : "main",
+  );
 }
 
 const workflow = DBOS.registerWorkflow(executeRun, { name: BUILD });
@@ -446,6 +325,7 @@ export async function launchChatRuntime() {
       await discardSideChat(side.id);
     }
     await reconcileRuns();
+    await reconcileTestingOperations();
   } catch (error) {
     await DBOS.shutdown();
     const db = await database();
@@ -465,6 +345,7 @@ export async function launchChatRuntime() {
           await discardSideChat(side.id);
         }
         await reconcileRuns();
+        await reconcileTestingOperations();
       } catch (error) {
         console.error("Chat reconciliation failed", error);
       }
@@ -478,6 +359,7 @@ export async function shutdownChatRuntime() {
   for (const side of await listDiscardableSides(true)) {
     await discardSideChat(side.id);
   }
+  await drainTestingTransports();
   await DBOS.shutdown();
   const db = await database();
   await db.$client.end();
