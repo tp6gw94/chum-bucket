@@ -1,0 +1,10 @@
+{
+  "extends": "../.fallowrc.json",
+  "entry": [
+    "src/index.{ts,tsx,js,jsx}",
+    "src/main.{ts,tsx,js,jsx}",
+    "tests/verification/*.mjs",
+    "demo-site/shop.js",
+    "demo-site/styles.css"
+  ]
+}

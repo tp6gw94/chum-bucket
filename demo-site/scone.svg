@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 560 330" role="img" aria-labelledby="scone-art-title">
+                <title id="scone-art-title">原味司康放在白色陶盤上，旁邊是一杯茶的插畫</title>
+                <defs>
+                  <linearGradient id="baked" x2="0" y2="1"><stop stop-color="#e9c98c"/><stop offset="1" stop-color="#bd823e"/></linearGradient>
+                  <linearGradient id="crumb" x2="0" y2="1"><stop stop-color="#f7e6bf"/><stop offset="1" stop-color="#d5b178"/></linearGradient>
+                  <filter id="soft"><feGaussianBlur stdDeviation="5"/></filter>
+                </defs>
+                <path d="M70 60L290 48 319 295 91 310Z" fill="#d9ddcc"/>
+                <path d="M81 72L291 62M85 99L295 90M89 126L299 117M93 153L302 144M96 180L306 172M101 207L310 199M104 234L314 225M107 261L318 253" stroke="#f5f5e9" stroke-width="3"/>
+                <ellipse cx="270" cy="265" rx="150" ry="25" fill="#9da792" opacity=".3" filter="url(#soft)"/>
+                <ellipse cx="262" cy="216" rx="166" ry="73" fill="#f8f8ed"/>
+                <ellipse cx="262" cy="209" rx="142" ry="56" fill="#e8e9da" stroke="#d2d4c3"/>
+                <ellipse cx="262" cy="206" rx="127" ry="47" fill="#f4f4e9"/>
+                <g transform="translate(153 82) rotate(-9 100 90)">
+                  <path d="M10 81Q6 130 33 151L151 161Q181 142 180 90Z" fill="url(#baked)"/>
+                  <path d="M14 100L37 106 65 103 89 112 117 106 142 117 175 104 177 130 155 127 135 134 112 125 85 132 59 121 34 126 13 118Z" fill="url(#crumb)"/>
+                  <path d="M12 83Q0 70 17 50L45 30 87 23 139 35 171 58Q190 84 173 100L143 106 111 100 79 108 41 99Z" fill="url(#baked)" stroke="#b08043" stroke-width="2"/>
+                  <path d="M46 36L72 52 91 41 111 63 139 48 156 72M72 53L56 73 75 92M112 64L99 83 112 99" fill="none" stroke="#f4dfb2" stroke-width="5" stroke-linecap="round"/>
+                  <path d="M44 60L49 64M133 79L139 80M87 29L91 32M31 81L34 86M153 60L157 63" stroke="#936031" stroke-width="3" stroke-linecap="round"/>
+                  <path d="M40 132L44 137M80 139L83 143M148 142L153 141" stroke="#f1d7a6" stroke-width="3" stroke-linecap="round"/>
+                </g>
+                <g transform="translate(366 67)">
+                  <ellipse cx="56" cy="94" rx="72" ry="22" fill="#d2d8c5"/>
+                  <ellipse cx="56" cy="88" rx="64" ry="20" fill="#fafbf3"/>
+                  <path d="M93 25Q139 17 126 52Q118 68 96 61" fill="none" stroke="#fafbf3" stroke-width="12"/>
+                  <path d="M11 28L19 72Q53 104 91 72L100 28Z" fill="#f8f9f0"/>
+                  <ellipse cx="56" cy="28" rx="45" ry="17" fill="#dce1d2"/>
+                  <ellipse cx="56" cy="28" rx="37" ry="12" fill="#a97c42"/>
+                  <path d="M39 2Q27 -11 39 -23M65 1Q77 -13 65 -26" fill="none" stroke="#fffdf4" stroke-width="3" opacity=".8" stroke-linecap="round"/>
+                </g>
+                <path d="M367 281Q374 264 388 262M377 273Q366 264 364 253M380 268Q396 270 406 262" fill="none" stroke="#7a8b60" stroke-width="3"/>
+                <circle cx="139" cy="266" r="3" fill="#c6a474"/><circle cx="146" cy="257" r="2" fill="#c6a474"/>
+              </svg>
