@@ -1,8 +1,13 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { test } from "node:test";
-import { artifactRefSchema } from "../../../shared/testing";
-import { roleRegistry } from "../../../server/harness/testing-domain";
+import { artifactRefSchema, type TestingRequestInput } from "../../../shared/testing";
+import {
+  digestOf,
+  requirementsScopeDigest,
+  validateRequirements,
+} from "../../../server/harness/testing-domain";
+import { roleRegistry } from "../../../server/harness/agents";
 import {
   closureDecisions,
   hostTestingRuntime,
@@ -83,6 +88,83 @@ test("explicit bad refs and cross-run results reject without dropping any ref", 
       { ref: missing, kind: "rejected", reason: "not_accessible" },
       { ref: result, kind: "rejected", reason: "cross_run_result_forbidden" },
     ],
+  );
+});
+
+test("old agent profile artifacts are incompatible even when their requirements remain valid", () => {
+  const source = { kind: "jira" as const, issueKey: "CHUM-42" };
+  const intent: TestingRequestInput = {
+    goal: "Verify checkout",
+    sources: [source],
+    criteria: { kind: "all" },
+    targetUrl: "https://preview.example.test/checkout",
+  };
+  const requirements = validateRequirements(
+    {
+      criteria: [{ key: "AC-1", statement: "Receipt appears", source, anchor: "AC-1" }],
+      unresolved: [],
+    },
+    {
+      goal: intent.goal,
+      selection: intent.criteria,
+      captures: [
+        {
+          reference: source,
+          digest: "source",
+          anchors: ["AC-1"],
+          capturedAt: "2026-10-10T00:00:00Z",
+        },
+      ],
+    },
+  );
+  assert.equal(requirements.kind, "accepted");
+
+  if (requirements.kind !== "accepted") {
+    return;
+  }
+
+  const ref = artifactRefSchema.parse("requirements-profile-artifact");
+  const metadata = {
+    dependencies: [],
+    versions: host.versions,
+    profiles: host.profiles,
+    registration: host.registration,
+    bounds: host.bounds,
+    fixture: host.fixture,
+    parentRunId: "run-1",
+    producerTaskId: "task-1",
+    attempt: 1,
+    inputDigest: "input",
+    outputDigest: digestOf(requirements.value),
+    complete: true,
+  };
+  const artifact = row({
+    ref,
+    kind: "requirements",
+    payload: requirements.value,
+    payloadDigest: digestOf(requirements.value),
+    metadata,
+    scopeDigest: requirementsScopeDigest({
+      goal: intent.goal,
+      sources: intent.sources,
+      selection: intent.criteria,
+    }),
+  });
+  const decide = (value: StoredArtifactRow) =>
+    closureDecisions({
+      threadId: "thread-1",
+      intent,
+      refs: [ref],
+      rows: new Map([[ref, value]]),
+      host,
+    });
+  assert.equal(decide(artifact)[0]?.kind, "accepted");
+  assert.deepEqual(
+    decide({
+      ...artifact,
+      metadata: { ...metadata, profiles: { ...metadata.profiles, atlassian: "requirements-v1" } },
+    }),
+    [{ ref, kind: "rejected", reason: "incompatible_snapshot" }],
   );
 });
 

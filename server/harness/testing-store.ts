@@ -44,7 +44,6 @@ import {
   planScopeDigest,
   projectProgress,
   requirementsScopeDigest,
-  roleRegistry,
   sameSource,
   sourceCaptureSchema,
   validateRequirements,
@@ -58,6 +57,7 @@ import {
   type TrustedToolReceipt,
   type Validation,
 } from "./testing-domain";
+import { roleRegistry } from "./agents";
 
 export const TESTING_WORKFLOW_VERSION = "testing-child-v1";
 const TESTING_SCHEMA_VERSION = "supervised-testing-schema-v1";

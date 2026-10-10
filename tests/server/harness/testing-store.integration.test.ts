@@ -852,7 +852,7 @@ test(
         registration?: { atlassian?: string };
         versions?: { model?: string };
       };
-      assert.equal(metadata.profiles?.atlassian, "requirements-v1");
+      assert.equal(metadata.profiles?.atlassian, "requirements-v2");
       assert.equal(typeof metadata.registration?.atlassian, "string");
       assert.equal(metadata.versions?.model, MODEL);
     }

@@ -151,8 +151,10 @@ function parseJson(content) {
 }
 
 export function scriptedEvents(options, control = {}) {
-  const { role, task } = parseTask(options.systemPrompts ?? []);
   const messages = options.messages ?? [];
+  const { role, task } = parseTask(
+    messages.filter((message) => message.role === "user").map(textOf),
+  );
   const toolOutputs = (messages ?? []).filter((message) => message.role === "tool");
   const identity = eventIdentity(options, role);
 

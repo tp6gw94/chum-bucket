@@ -279,11 +279,14 @@ test("scripted provider IDs are stable and do not collide with conversation hist
     { id: "feedback-3", role: "user", content: "Private validation feedback" },
   ];
   const options = {
-    systemPrompts: [
-      "testing-role:atlassian",
-      `testing-task:\n${JSON.stringify({ sources: [{ kind: "jira", issueKey: "CHUM-42" }] })}`,
+    systemPrompts: ["Extract grounded acceptance criteria."],
+    messages: [
+      {
+        role: "user",
+        content: `testing-role:atlassian\ntesting-task:\n${JSON.stringify({ sources: [{ kind: "jira", issueKey: "CHUM-42" }] })}`,
+      },
+      ...messages,
     ],
-    messages,
   };
   const events = scriptedEvents(options);
   assert.deepEqual(events, scriptedEvents(options));
@@ -332,16 +335,18 @@ test("scripted provider IDs are stable and do not collide with conversation hist
 
 test("planner fixture uses the accepted requirement identity from its root task", () => {
   const events = scriptedEvents({
-    systemPrompts: [
-      "testing-role:planner",
-      `testing-task:\n${JSON.stringify({
-        targetUrl: "https://preview.example.test/orders",
-        requirements: {
-          criteria: [{ id: "crit:AC-9", key: "AC-9", statement: "Receipt appears" }],
-        },
-      })}`,
+    systemPrompts: ["Plan reproducible test cases."],
+    messages: [
+      {
+        role: "user",
+        content: `testing-role:planner\ntesting-task:\n${JSON.stringify({
+          targetUrl: "https://preview.example.test/orders",
+          requirements: {
+            criteria: [{ id: "crit:AC-9", key: "AC-9", statement: "Receipt appears" }],
+          },
+        })}`,
+      },
     ],
-    messages: [],
   });
   const content = events.find((event) => event.type === "TEXT_MESSAGE_CONTENT")?.delta;
   const proposal = JSON.parse(String(content)) as {

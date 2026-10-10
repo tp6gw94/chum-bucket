@@ -14,7 +14,6 @@ import {
   planScopeDigest,
   projectProgress,
   requirementsScopeDigest,
-  roleRegistry,
   validateRequirements,
   validateResults,
   validateReuse,
@@ -286,30 +285,6 @@ function completeUiResults(): Results {
     ),
   );
 }
-
-test("the role registry is the sole four-role capability authority", () => {
-  assert.deepEqual(roleRegistry, {
-    atlassian: {
-      artifact: "requirements",
-      capabilities: ["atlassian_read"],
-      codeMode: "enabled",
-      profile: "requirements-v1",
-    },
-    planner: { artifact: "plan", capabilities: [], codeMode: "enabled", profile: "planning-v1" },
-    ac: {
-      artifact: "ac-result",
-      capabilities: ["browser_mock"],
-      codeMode: "enabled",
-      profile: "functional-v1",
-    },
-    ui: {
-      artifact: "ui-result",
-      capabilities: ["browser_mock", "figma_read"],
-      codeMode: "enabled",
-      profile: "style-v1",
-    },
-  });
-});
 
 test("requirements freeze captured inputs and reject fabricated sources and anchors", () => {
   assert.deepEqual(requirements.criteria, [

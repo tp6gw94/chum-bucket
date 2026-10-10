@@ -18,6 +18,8 @@ import { database, persistRun, hydrateThread } from "../../../server/harness/run
 import { readStartCancelDeliveries } from "../../../server/harness/testing-store";
 import { launchChatRuntime, shutdownChatRuntime, ensureStarted } from "../../../server/harness/run";
 import { withMcpEnvironment } from "../../fixtures/mcp-fixture";
+import { roleRegistry } from "../../../server/harness/agents";
+import { ROLE_IDS } from "../../../shared/testing";
 
 const require = createRequire(import.meta.url);
 const { scriptedEvents } = require("../../fixtures/testing-runtime-external-fixture.mjs") as {
@@ -28,6 +30,21 @@ const { scriptedEvents } = require("../../fixtures/testing-runtime-external-fixt
 };
 const enabled = process.env.TESTING_RUNTIME_DATABASE_URL;
 const providerCalls: string[] = [];
+type ProviderRequest = { systemPrompts?: string[]; messages?: unknown[] };
+const providerRequests: ProviderRequest[] = [];
+
+function userTaskText(options: ProviderRequest): string {
+  const messages = options.messages as Array<{ role: string; content: unknown }> | undefined;
+  const user = messages?.find((message) => message.role === "user");
+
+  if (typeof user?.content === "string") {
+    return user.content;
+  }
+
+  return Array.isArray(user?.content)
+    ? user.content.map((part: { text?: string }) => part.text ?? "").join("")
+    : "";
+}
 const control: { intent?: Record<string, unknown>; failUi?: boolean } = {};
 let migrationFolder: string | undefined;
 let restoreFetch: (() => void) | undefined;
@@ -122,9 +139,14 @@ async function installProviderBoundary() {
     Object.getPrototypeOf(adapter),
     "chatStream",
     async function* (options: { systemPrompts?: string[]; messages?: unknown[] }) {
-      const role =
-        (options.systemPrompts ?? []).join("\n").match(/testing-role:([a-z]+)/)?.[1] ?? "main";
+      const role = userTaskText(options).match(/testing-role:([a-z]+)/)?.[1] ?? "main";
       providerCalls.push(role);
+      providerRequests.push(
+        structuredClone({
+          systemPrompts: options.systemPrompts,
+          messages: options.messages,
+        }),
+      );
       const events = scriptedEvents(options, control);
 
       for (const event of events) {
@@ -315,6 +337,59 @@ test(
         ),
         true,
       );
+    });
+  },
+);
+
+test(
+  "all four child roles send distinct system instructions and task data only as user messages",
+  { skip: !enabled, timeout: 120_000 },
+  async () => {
+    await withMcpEnvironment(async () => {
+      const start = providerRequests.length;
+      const thread = await createThread();
+      const response = await testingApp.request("/", {
+        method: "POST",
+        body: JSON.stringify(
+          requestBody(thread.id, thread.revision, {
+            design: { fileKey: "FILE", nodeId: "12:34" },
+          }),
+        ),
+        headers: { "content-type": "application/json" },
+      });
+      assert.equal(response.status, 200);
+      const started = await response.json();
+      const finished = await waitFinished(thread.id, started.runId);
+      assert.equal(finished.report.results.ac.length > 0, true);
+      assert.equal(finished.report.results.ui.length > 0, true);
+      assert.notEqual(finished.report.acceptance.verdict, "passed");
+      const requests = providerRequests.slice(start);
+
+      for (const role of ROLE_IDS) {
+        const calls = requests.filter((request) =>
+          userTaskText(request).startsWith(`testing-role:${role}\n`),
+        );
+        assert.ok(calls.length > 0, `${role} must reach the provider`);
+
+        for (const call of calls) {
+          assert.equal(call.systemPrompts?.[0], roleRegistry[role].systemPrompt);
+          assert.ok((call.systemPrompts?.length ?? 0) > 1, "tool instructions remain separate");
+          assert.equal(
+            call.systemPrompts?.some((prompt) => prompt.includes("testing-task:")),
+            false,
+          );
+          const taskText = userTaskText(call);
+          assert.equal(taskText.includes(roleRegistry[role].systemPrompt), false);
+          const task = JSON.parse(taskText.split("testing-task:\n")[1]!);
+          assert.equal(task.goal, "Verify checkout");
+          assert.deepEqual(task.bounds, { maxCases: 20, maxChecks: 80, maxChecksPerCase: 12 });
+
+          if (role === "ac" || role === "ui") {
+            assert.ok(task.plan.assignments[role].length > 0);
+            assert.ok(task.plan.cases[0].actions.length > 0);
+          }
+        }
+      }
     });
   },
 );

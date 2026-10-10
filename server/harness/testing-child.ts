@@ -38,6 +38,7 @@ import {
   type TestingNativeReceiptReference,
 } from "./testing-tools";
 import { runAgentLoop, type AgentCheckpoint, type AgentSession } from "./agent-loop";
+import { roleFeedbackPrompt, roleSystemPrompt, roleTaskPrompt } from "./agents";
 import type { ConversationState } from "./conversation";
 import {
   browserOutputSchema,
@@ -403,29 +404,6 @@ function pinnedPlan(execution: TestingExecution): CanonicalPlan | null {
   return artifact ? (artifact.payload as CanonicalPlan) : null;
 }
 
-function taskText(role: RoleId, execution: TestingExecution): string {
-  const plan = pinnedPlan(execution);
-  const checks =
-    plan?.cases.flatMap((planCase) =>
-      planCase.checks.map((check) => ({ id: check.id, caseId: planCase.id, kind: check.kind })),
-    ) ?? [];
-
-  return [
-    `testing-role:${role}`,
-    "testing-task:",
-    JSON.stringify({
-      goal: execution.intent.goal,
-      sources: execution.intent.sources,
-      criteria: execution.intent.criteria,
-      requirements: pinnedRequirements(execution),
-      targetUrl: execution.intent.targetUrl,
-      design: execution.intent.design ?? null,
-      checks,
-    }),
-    "Return one JSON object and no prose. Atlassian criteria use anchors copied from tool results. Planner returns cases. AC and UI return checks citing receiptId and outputDigest from use_browser. Do not invent receipt ids.",
-  ].join("\n");
-}
-
 function assistantText(conversation: ConversationState): string {
   const assistant = [...conversation.context]
     .reverse()
@@ -572,7 +550,7 @@ function feedbackConversation(
   const message: UIMessage = {
     id: `feedback-${conversation.context.length}`,
     role: "user",
-    parts: [{ type: "text", content: `Private validation failed: ${issues.join("; ")}` }],
+    parts: [{ type: "text", content: roleFeedbackPrompt(issues) }],
   };
 
   return {
@@ -837,6 +815,7 @@ type ChildRun = Readonly<{
   deadline: AbortSignal;
   plan: CanonicalPlan | null;
   requested: readonly string[];
+  systemPrompt: string;
   nativeReceipts: Map<string, NativeInvocationReceipt>;
 }>;
 
@@ -1177,7 +1156,12 @@ async function runRoleLoops(run: ChildRun, tools: RunTools): Promise<TestingChil
       step.current = name.replaceAll(":", "-");
     }
   });
-  const prompt = taskText(input.role, execution);
+  const prompt = roleTaskPrompt(input.role, {
+    intent: execution.intent,
+    requirements: pinnedRequirements(execution),
+    plan: pinnedPlan(execution),
+    bounds: execution.runtime.bounds,
+  });
   const initial: ConversationState = {
     display: [{ id: "task", role: "user", parts: [{ type: "text", content: prompt }] }],
     context: [{ id: "task", role: "user", parts: [{ type: "text", content: prompt }] }],
@@ -1188,7 +1172,7 @@ async function runRoleLoops(run: ChildRun, tools: RunTools): Promise<TestingChil
       session,
       conversation,
       model: execution.runtime.model,
-      prompt,
+      prompt: run.systemPrompt,
       compaction: { kind: "bounded", maxTurn },
       checkpoint: prefixed(checkpoint, prefix),
       signal,
@@ -1225,6 +1209,7 @@ async function runClaimedChild(
     };
   }
 
+  const systemPrompt = roleSystemPrompt(input.role, execution.runtime.profiles[input.role]);
   const deadline = armDeadline(execution, transport);
   watchCancellation(input, transport, signal);
   const plan = pinnedPlan(execution);
@@ -1236,6 +1221,7 @@ async function runClaimedChild(
     deadline,
     plan,
     requested: styleProperties(plan),
+    systemPrompt,
     nativeReceipts: new Map(),
   };
 

@@ -20,11 +20,10 @@ import {
   type TestingRequestInput,
 } from "../../shared/testing";
 import type { ModelCall } from "./model-turn";
+import { capabilityToolNames, roleRegistry } from "./agents";
 import {
-  capabilityToolNames,
   checksForRole,
   digestOf,
-  roleRegistry,
   type CanonicalPlan,
   type Requirements,
   type SourceCapture,

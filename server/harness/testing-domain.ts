@@ -13,7 +13,6 @@ import {
   sourceSchema,
   testRunIdSchema,
   type Acceptance,
-  type ArtifactKind,
   type ArtifactOrigin,
   type ArtifactRef,
   type CheckProgress,
@@ -42,48 +41,6 @@ import {
   type Tolerance,
   type ToolActivityView,
 } from "../../shared/testing";
-
-type Capability = "atlassian_read" | "browser_mock" | "figma_read";
-
-type RoleDefinition = Readonly<{
-  artifact: ArtifactKind;
-  capabilities: readonly Capability[];
-  codeMode: "enabled";
-  profile: string;
-}>;
-
-export const roleRegistry = {
-  atlassian: {
-    artifact: "requirements",
-    capabilities: ["atlassian_read"],
-    codeMode: "enabled",
-    profile: "requirements-v1",
-  },
-  planner: {
-    artifact: "plan",
-    capabilities: [],
-    codeMode: "enabled",
-    profile: "planning-v1",
-  },
-  ac: {
-    artifact: "ac-result",
-    capabilities: ["browser_mock"],
-    codeMode: "enabled",
-    profile: "functional-v1",
-  },
-  ui: {
-    artifact: "ui-result",
-    capabilities: ["browser_mock", "figma_read"],
-    codeMode: "enabled",
-    profile: "style-v1",
-  },
-} as const satisfies Record<RoleId, RoleDefinition>;
-
-export const capabilityToolNames = {
-  atlassian_read: null,
-  browser_mock: "use_browser",
-  figma_read: "get_figma",
-} as const satisfies Record<Capability, string | null>;
 
 const isFunctionalCheck = (check: PlanCheck): check is FunctionalCheck =>
   check.kind === "functional";
