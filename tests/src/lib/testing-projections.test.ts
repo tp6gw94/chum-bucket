@@ -104,6 +104,29 @@ test("multiple operations in one mounted session are preserved independently", (
   assert.equal(older, updated);
 });
 
+test("hydration enriches a frozen task origin without reviving its state or progress", () => {
+  const task = {
+    version: 2 as const,
+    role: "planner" as const,
+    summary: "Plan checkout",
+    result: null,
+  };
+  const terminal: TestView = { ...activeView(5), state: "finished", report: null, task };
+  const origin = {
+    parentRunId: "parent-one",
+    requestKey: "call-one",
+    parentMessageId: "assistant-one",
+  };
+  const enriched: TestView = { ...activeView(5), report: null, task: { ...task, origin } };
+  const result = mergeHydratedTestingView([terminal, activeView(2, otherRunId)], enriched);
+  assert.deepEqual(result[0], { ...terminal, task: { ...task, origin } });
+  assert.deepEqual(result[1], activeView(2, otherRunId));
+  assert.equal(
+    mergeTestingView(result, { ...enriched, progress: { ...enriched.progress, version: 9 } }),
+    result,
+  );
+});
+
 test("a merge leaves untouched operations and inputs unchanged", () => {
   const both = [activeView(1), activeView(1, otherRunId)];
   const snapshot = structuredClone(both);

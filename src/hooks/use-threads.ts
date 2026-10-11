@@ -6,7 +6,7 @@ import { parseComposerCommand } from "../composer-commands";
 import { fetchServerSentEvents, useChat } from "@tanstack/ai-react";
 import { parseCompactionEvent } from "@/shared/compaction-event";
 import {
-  parsePublishedTesting,
+  parsePublishedTasks,
   parseTestView,
   parseTestingProjectionEvent,
 } from "@/shared/testing-event";
@@ -312,10 +312,10 @@ function absorbPublishedTesting(state: ThreadState, response: Response) {
     .clone()
     .json()
     .then((payload: unknown) => {
-      const published = parsePublishedTesting(payload);
+      const published = parsePublishedTasks(payload);
 
-      if (published && state.owner.mounted) {
-        state.setTestingViews((current) => mergeHydratedTestingView(current, published));
+      if (state.owner.mounted) {
+        state.setTestingViews((current) => published.reduce(mergeHydratedTestingView, current));
       }
     })
     .catch(() => undefined);
@@ -741,6 +741,7 @@ export function useThread(threadId: string, sideScope?: string) {
     error,
     compactNotice,
     testingViews,
+    activeRunId: owner.runId,
     cancelTesting: (runId: TestRunId) => cancelTesting(runtime, runId),
     send: (text: string) => send(runtime, text),
     compact: () => send(runtime, "/compact"),

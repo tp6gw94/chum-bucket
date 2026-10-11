@@ -160,6 +160,7 @@ function ThreadPage({ threadId }: { threadId: string }) {
               hydrationError={hydrationError}
               compactNotice={thread.compactNotice}
               testingViews={thread.testingViews}
+              activeRunId={thread.activeRunId}
               onCancelTesting={thread.cancelTesting}
             />
             {sideChats.entries.map((entry) => (

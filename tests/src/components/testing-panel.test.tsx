@@ -390,29 +390,30 @@ test("private child fields are never rendered or stringified", () => {
 
 test("the cancel control only exists with a callback and follows the server state", () => {
   const withoutCallback = renderToStaticMarkup(<TestingPanel view={activeView(completedRows)} />);
-  assert.doesNotMatch(withoutCallback, /取消測試/);
+  assert.doesNotMatch(withoutCallback, /取消/);
   assert.doesNotMatch(withoutCallback, /<button/);
 
   const active = renderToStaticMarkup(
     <TestingPanel view={activeView(completedRows)} onCancel={async () => {}} />,
   );
-  assert.match(active, /aria-label="取消測試"/);
-  assert.match(plainText(active), />取消測試</);
+  assert.match(active, /aria-label="取消"/);
+  assert.match(plainText(active), />取消</);
   assert.doesNotMatch(active, /disabled=""/);
 
   const cancelling = renderToStaticMarkup(
     <TestingPanel view={cancellingView(completedRows)} onCancel={async () => {}} />,
   );
   assert.match(cancelling, /data-state="cancelling"/);
-  assert.match(cancelling, /aria-label="取消測試"/);
+  assert.match(cancelling, /aria-label="取消"/);
   assert.match(plainText(cancelling), /取消中…/);
   assert.match(cancelling, /disabled=""/);
 
   const finished = renderToStaticMarkup(
     <TestingPanel view={finishedView(report())} onCancel={async () => {}} />,
   );
-  assert.match(finished, /aria-label="取消測試"/);
+  assert.match(finished, /aria-label="取消"/);
   assert.match(finished, /disabled=""/);
+  assert.doesNotMatch(finished, /<details|<summary/);
 });
 
 test("a finished view renders the public report with mock-only acceptance", () => {
@@ -616,4 +617,89 @@ test("server cancellation and finished states receive concise live summaries", (
   assert.match(finishedSummary, /Test AC：已完成/);
   assert.match(finishedSummary, /Test UI：不需要/);
   assert.doesNotMatch(finishedSummary, /驗證結帳流程與樣式|模擬結果只描述/);
+});
+
+test("a planner card shows only its own result, summary, and artifact", () => {
+  const view: TestView = {
+    ...activeView(completedRows),
+    state: "finished",
+    task: {
+      version: 2,
+      role: "planner",
+      summary: "Plan checkout only",
+      result: { kind: "plan", ref: availableArtifact, payload: plan },
+    },
+    report: null,
+  };
+  const markup = renderToStaticMarkup(<TestingPanel view={view} />);
+  assert.match(markup, /Plan checkout only/);
+  assert.match(markup, /結帳成功/);
+  assert.match(markup, /artifact:plan:1/);
+  assert.doesNotMatch(markup, /測試報告|覆蓋不完整|AC 結果缺失|Test AC|Test UI/);
+});
+
+test("terminal delegated cards default to a collapsed summary while retaining every result", () => {
+  for (const [outcome, label] of [
+    ["completed", "已完成"],
+    ["failed", "失敗"],
+    ["cancelled", "已取消"],
+  ] as const) {
+    const view: TestView = {
+      ...activeView({
+        ...completedRows,
+        planner: { status: "terminal", outcome, reasonCode: `reason-${outcome}` },
+      }),
+      state: "finished",
+      task: {
+        version: 2,
+        role: "planner",
+        summary: "Plan checkout only",
+        result: { kind: "plan", ref: availableArtifact, payload: plan },
+      },
+      report: null,
+    };
+    const markup = renderToStaticMarkup(<TestingPanel view={view} onCancel={async () => {}} />);
+    assert.match(markup, /<details(?![^>]*\bopen=)[^>]*>/);
+    const summary = markup.match(/<summary[^>]*>([\s\S]*?)<\/summary>/)?.[1] ?? "";
+    assert.match(summary, /Plan checkout only/);
+    assert.match(summary, new RegExp(label));
+    assert.match(markup, /結帳成功/);
+    assert.match(markup, /artifact:plan:1/);
+    assert.match(markup, new RegExp(`reason-${outcome}`));
+    assert.doesNotMatch(markup, /aria-label="取消"/);
+  }
+});
+
+test("active and cancelling delegated cards keep their progress visible", () => {
+  for (const state of ["active", "cancelling"] as const) {
+    const view: TestView = {
+      ...activeView(completedRows),
+      state,
+      task: { version: 2, role: "planner", summary: "Planning now", result: null },
+      report: null,
+    };
+    const markup = renderToStaticMarkup(<TestingPanel view={view} />);
+    assert.match(markup, /Planning now/);
+    assert.doesNotMatch(markup, /<details/);
+  }
+});
+
+test("a cancelling individual card retains its actual tool activity", () => {
+  const view: TestView = {
+    ...cancellingView({
+      ...completedRows,
+      atlassian: {
+        status: "cancelling",
+        active: [{ toolName: "jira_get_issue", route: "direct", startedAt: "now" }],
+      },
+    }),
+    task: { version: 2, role: "atlassian", summary: "Read checkout", result: null },
+    report: null,
+  };
+  const markup = renderToStaticMarkup(
+    <TestingPanel view={view} onCancel={async () => undefined} />,
+  );
+  assert.match(markup, /jira_get_issue/);
+  assert.match(markup, /取消中/);
+  assert.doesNotMatch(markup, /Test Planner|Test AC|Test UI/);
 });

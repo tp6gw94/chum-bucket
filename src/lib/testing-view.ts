@@ -11,11 +11,15 @@ export function mergeTestView(current: TestView | null, incoming: TestView): Tes
     return incoming;
   }
 
-  if (current.state === "finished") {
-    return current;
-  }
+  const newer = incoming.progress.version > current.progress.version;
+  const selected = current.state !== "finished" && newer ? incoming : current;
+  const origin =
+    current.task?.origin ??
+    (incoming.progress.version >= current.progress.version ? incoming.task?.origin : null);
 
-  return incoming.progress.version > current.progress.version ? incoming : current;
+  return selected.task && origin && selected.task.origin !== origin
+    ? { ...selected, task: { ...selected.task, origin } }
+    : selected;
 }
 
 export type CancelRequest =

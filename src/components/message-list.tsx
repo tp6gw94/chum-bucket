@@ -1,8 +1,12 @@
-import { createParser, Renderer, type ActionEvent, type ParseResult } from "@openuidev/react-lang";
+import { Renderer, type ActionEvent } from "@openuidev/react-lang";
 import { openuiLibrary } from "@openuidev/react-ui/genui-lib";
 import { useMemo, useRef, useState } from "react";
 
 import type { SendResult } from "../hooks/use-threads";
+import type { TestRunId, TestView } from "../../shared/testing";
+import { testingTimeline } from "../lib/testing-timeline";
+import { assistantReplySegments } from "../lib/assistant-reply";
+export { parseAssistantReply } from "../lib/assistant-reply";
 
 import { Bubble, BubbleContent } from "@/components/ui/bubble";
 import { Marker, MarkerContent } from "@/components/ui/marker";
@@ -10,18 +14,15 @@ import { Message, MessageContent, MessageHeader } from "@/components/ui/message"
 import { MessageScrollerItem } from "@/components/ui/message-scroller";
 import { type ChatMessage } from "./types";
 import { ToolCall } from "./tool-call";
+import { TestingPanel } from "./testing-panel";
 
-const assistantReplyParser = createParser(openuiLibrary.toJSONSchema(), openuiLibrary.root);
+const EMPTY_TESTING_VIEWS: readonly TestView[] = [];
 
 const MESSAGE_ALIGN = {
   system: "start",
   user: "end",
   assistant: "start",
 } as const;
-
-export function parseAssistantReply(text: string): ParseResult {
-  return assistantReplyParser.parse(text);
-}
 
 export function formatActionMessage(event: ActionEvent): string | null {
   if (event.type !== "continue_conversation") {
@@ -58,28 +59,6 @@ export function formatActionMessage(event: ActionEvent): string | null {
 
 type ActionStatus = { kind: "idle" } | { kind: "pending" } | { kind: "error"; message: string };
 
-type AssistantPresentation =
-  | { kind: "raw"; text: string }
-  | { kind: "render"; text: string; errorNames: readonly string[] };
-
-function isRawFallback(text: string, result: ParseResult | null): boolean {
-  return result !== null && result.root === null && text.trim() !== "";
-}
-
-function parseErrorNames(result: ParseResult | null): readonly string[] {
-  const errors = result?.meta.errors ?? [];
-
-  return [...new Set(errors.map((error) => error.component))];
-}
-
-function assistantPresentation(text: string, result: ParseResult | null): AssistantPresentation {
-  if (isRawFallback(text, result)) {
-    return { kind: "raw", text };
-  }
-
-  return { kind: "render", text, errorNames: parseErrorNames(result) };
-}
-
 function messageText(message: ChatMessage): string {
   return message.parts
     .filter((part) => part.type === "text")
@@ -110,40 +89,43 @@ function AssistantMessage({
   controlsDisabled: boolean;
   onAction: (event: ActionEvent) => void;
 }) {
-  const result = useMemo(
-    () => (isStreaming ? null : parseAssistantReply(text)),
-    [text, isStreaming],
-  );
-  const presentation = assistantPresentation(text, result);
-
-  if (presentation.kind === "raw") {
-    return (
-      <Bubble variant="muted" align="start">
-        <BubbleContent className="whitespace-pre-wrap">{presentation.text}</BubbleContent>
-      </Bubble>
-    );
-  }
+  const segments = useMemo(() => assistantReplySegments(text, isStreaming), [text, isStreaming]);
 
   return (
     <div className="flex min-w-0 flex-col gap-1">
-      {presentation.errorNames.length > 0 ? (
-        <p className="text-xs text-destructive">
-          部分元件無法解析：
-          {presentation.errorNames.join("、")}
-        </p>
-      ) : null}
-      <fieldset
-        disabled={controlsDisabled}
-        inert={controlsDisabled}
-        className="m-0 min-w-0 border-0 p-0"
-      >
-        <Renderer
-          response={text}
-          library={openuiLibrary}
-          isStreaming={isStreaming}
-          onAction={onAction}
-        />
-      </fieldset>
+      {segments.map((segment) =>
+        segment.kind === "text" ? (
+          <Bubble key={segment.start} variant="muted" align="start">
+            <BubbleContent className="whitespace-pre-wrap">
+              {segment.warning ? (
+                <p className="text-xs text-destructive">{segment.warning}</p>
+              ) : null}
+              {segment.source}
+            </BubbleContent>
+          </Bubble>
+        ) : (
+          <div key={segment.start} className="flex min-w-0 flex-col gap-1">
+            {segment.errorNames.length > 0 ? (
+              <p className="text-xs text-destructive">
+                部分元件無法解析：
+                {segment.errorNames.join("、")}
+              </p>
+            ) : null}
+            <fieldset
+              disabled={controlsDisabled}
+              inert={controlsDisabled}
+              className="m-0 min-w-0 border-0 p-0"
+            >
+              <Renderer
+                response={segment.response}
+                library={openuiLibrary}
+                isStreaming={segment.isStreaming}
+                onAction={onAction}
+              />
+            </fieldset>
+          </div>
+        ),
+      )}
     </div>
   );
 }
@@ -230,7 +212,7 @@ function ChatMessageRow({
   );
 }
 
-export function CompactMarker() {
+function CompactMarker() {
   return (
     <MessageScrollerItem messageId="transient-compact-status">
       <Marker role="status" variant="separator">
@@ -267,6 +249,9 @@ export function MessageList({
   disabled = false,
   isStreaming = false,
   compacting = false,
+  testingViews = EMPTY_TESTING_VIEWS,
+  onCancelTesting,
+  activeRunId = null,
 }: {
   messages: ChatMessage[];
   agent: string;
@@ -274,6 +259,9 @@ export function MessageList({
   disabled?: boolean;
   isStreaming?: boolean;
   compacting?: boolean;
+  testingViews?: readonly TestView[];
+  onCancelTesting?: (runId: TestRunId) => Promise<void>;
+  activeRunId?: string | null;
 }) {
   const actionLock = useRef(false);
   const [actionStatus, setActionStatus] = useState<ActionStatus>({ kind: "idle" });
@@ -301,15 +289,22 @@ export function MessageList({
 
   return (
     <>
-      {messages.map((message) => (
-        <MessageScrollerItem key={message.id} messageId={message.id}>
-          <ChatMessageRow
-            message={message}
-            agent={agent}
-            isStreaming={message.id === streamingId && message.role === "assistant"}
-            controlsDisabled={controlsDisabled}
-            onAction={handleAction}
-          />
+      {testingTimeline(messages, testingViews, isStreaming, activeRunId).map((row) => (
+        <MessageScrollerItem
+          key={row.key}
+          messageId={row.kind === "message" ? row.message.id : `testing-${row.view.runId}`}
+        >
+          {row.kind === "testing" ? (
+            <TestingPanel view={row.view} onCancel={onCancelTesting} />
+          ) : (
+            <ChatMessageRow
+              message={row.message}
+              agent={agent}
+              isStreaming={row.message.id === streamingId && row.message.role === "assistant"}
+              controlsDisabled={controlsDisabled}
+              onAction={handleAction}
+            />
+          )}
         </MessageScrollerItem>
       ))}
       {compacting ? <CompactMarker /> : null}

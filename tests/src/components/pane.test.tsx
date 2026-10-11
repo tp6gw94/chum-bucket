@@ -352,6 +352,104 @@ test("a finished pane keeps public report details outside inherited live announc
   );
 });
 
+function originatingMessage(id: string, callId: string): ChatMessage {
+  return {
+    id,
+    role: "assistant",
+    parts: [
+      {
+        type: "tool-call",
+        id: callId,
+        name: "delegate_task",
+        arguments: "{}",
+        state: "input-complete",
+      },
+    ],
+  } as ChatMessage;
+}
+
+function originatingView(state: TestView["state"] = "active"): TestView {
+  return {
+    ...testingView(),
+    state,
+    report: null,
+    task: {
+      version: 2,
+      role: "planner",
+      summary: "Originating delegation",
+      result: null,
+      origin: {
+        parentRunId: "parent-one",
+        requestKey: "call-one",
+        parentMessageId: "assistant-one",
+      },
+    },
+  };
+}
+
+test("a delegation stays after its originating assistant and before a later turn", () => {
+  const html = renderToStaticMarkup(
+    <Pane
+      pane={paneFixture("idle", [
+        originatingMessage("assistant-one", "call-one"),
+        transcriptMessage("later", "user", "Later turn"),
+      ])}
+      testingViews={[originatingView(), originatingView()]}
+      onCancelTesting={async () => undefined}
+    />,
+  );
+  assert.ok(
+    html.indexOf('data-message-id="assistant-one"') <
+      html.indexOf('data-message-id="testing-run-1"'),
+  );
+  assert.ok(
+    html.indexOf('data-message-id="testing-run-1"') < html.indexOf('data-message-id="later"'),
+  );
+  assert.equal(html.match(/data-testid="testing-progress"/g)?.length, 1);
+});
+
+test("a resolved active projection waits during streaming and appears at the arriving message", () => {
+  const pending = renderToStaticMarkup(
+    <Pane
+      pane={paneFixture("running", [])}
+      testingViews={[originatingView()]}
+      activeRunId="parent-one"
+    />,
+  );
+  assert.doesNotMatch(pending, /data-testid="testing-progress"/);
+  const arrived = renderToStaticMarkup(
+    <Pane
+      pane={paneFixture("running", [originatingMessage("assistant-one", "call-one")])}
+      testingViews={[originatingView()]}
+    />,
+  );
+  assert.equal(arrived.match(/data-testid="testing-progress"/g)?.length, 1);
+  const terminal = renderToStaticMarkup(
+    <Pane pane={paneFixture("running", [])} testingViews={[originatingView("finished")]} />,
+  );
+  assert.equal(terminal.match(/data-testid="testing-progress"/g)?.length, 1);
+  assert.match(terminal, /data-state="finished"/);
+  const idle = renderToStaticMarkup(
+    <Pane pane={paneFixture("idle", [])} testingViews={[originatingView()]} />,
+  );
+  assert.equal(idle.match(/data-testid="testing-progress"/g)?.length, 1);
+});
+
+test("the pane defers a missing delegate part only for the matching active parent", () => {
+  const pane = paneFixture("running", [originatingMessage("assistant-one", "other-call")]);
+  const matching = renderToStaticMarkup(
+    <Pane pane={pane} testingViews={[originatingView()]} activeRunId="parent-one" />,
+  );
+  const other = renderToStaticMarkup(
+    <Pane pane={pane} testingViews={[originatingView()]} activeRunId="parent-two" />,
+  );
+  const unknown = renderToStaticMarkup(<Pane pane={pane} testingViews={[originatingView()]} />);
+  assert.match(matching, /data-message-id="assistant-one"/);
+  assert.doesNotMatch(matching, /data-testid="testing-progress"/);
+  assert.equal(other.match(/data-testid="testing-progress"/g)?.length, 1);
+  assert.equal(unknown.match(/data-testid="testing-progress"/g)?.length, 1);
+});
+
 test("an agent pane never renders testing panels even when testing views are passed", () => {
   const html = renderToStaticMarkup(
     <Pane

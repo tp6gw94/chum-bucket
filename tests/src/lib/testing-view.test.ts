@@ -115,6 +115,56 @@ test("a merge leaves both snapshots untouched", () => {
   assert.deepEqual(incoming, incomingSnapshot);
 });
 
+test("terminal and equal-version task projections enrich only missing origin metadata", () => {
+  const origin = {
+    parentRunId: "parent-one",
+    requestKey: "call-one",
+    parentMessageId: "assistant-one",
+  };
+  const task = {
+    version: 2 as const,
+    role: "planner" as const,
+    summary: "Plan checkout",
+    result: null,
+  };
+  const current: TestView = { ...activeView(5), state: "finished", report: null, task };
+  const incoming: TestView = { ...activeView(5), report: null, task: { ...task, origin } };
+  const expected = { ...current, task: { ...task, origin } };
+  assert.deepEqual(mergeTestView(current, incoming), expected);
+  assert.deepEqual(mergeTestView({ ...current, state: "active" }, incoming), {
+    ...expected,
+    state: "active",
+  });
+  assert.deepEqual(
+    mergeTestView(current, { ...incoming, progress: { ...incoming.progress, version: 9 } }),
+    expected,
+  );
+  assert.equal(
+    mergeTestView(current, { ...incoming, progress: { ...incoming.progress, version: 4 } }),
+    current,
+  );
+  assert.equal(
+    mergeTestView(expected, {
+      ...incoming,
+      task: { ...task, origin: { ...origin, parentMessageId: "wrong" } },
+    }),
+    expected,
+  );
+  assert.deepEqual(
+    mergeTestView(incoming, {
+      ...current,
+      state: "active",
+      progress: { ...current.progress, version: 6 },
+    }),
+    {
+      ...current,
+      state: "active",
+      progress: { ...current.progress, version: 6 },
+      task: { ...task, origin },
+    },
+  );
+});
+
 test("cancel state is scoped to the active run", () => {
   assert.deepEqual(cancelRequestFor(null, runId), { status: "idle" });
   assert.deepEqual(

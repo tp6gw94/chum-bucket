@@ -16,11 +16,10 @@ import {
   useMessageScroller,
 } from "@/components/ui/message-scroller";
 import { Composer } from "./composer";
-import { CompactMarker, MessageList } from "./message-list";
+import { MessageList } from "./message-list";
 import { PaneShell } from "./pane-shell";
 import { ProgressPanel } from "./progress-panel";
 import { StatusBadge } from "./status-badge";
-import { TestingPanel } from "./testing-panel";
 import { type Pane as PaneModel } from "./types";
 
 type PanePresentation = Readonly<{
@@ -91,32 +90,37 @@ function PaneMessages({
   presentation,
   onSend,
   actionsDisabled,
+  testingViews,
+  onCancelTesting,
+  activeRunId,
 }: {
   pane: PaneModel;
   presentation: PanePresentation;
   onSend?: (text: string) => Promise<SendResult>;
   actionsDisabled: boolean;
+  testingViews: readonly TestView[];
+  onCancelTesting?: (runId: TestRunId) => Promise<void>;
+  activeRunId?: string | null;
 }) {
-  if (pane.messages.length === 0) {
-    return (
-      <>
+  return (
+    <>
+      {pane.messages.length === 0 ? (
         <MessageScrollerItem className="m-auto">
           <p className="text-sm text-muted-foreground">{presentation.emptyCopy}</p>
         </MessageScrollerItem>
-        {pane.status === "compacting" ? <CompactMarker /> : null}
-      </>
-    );
-  }
-
-  return (
-    <MessageList
-      messages={pane.messages}
-      agent={pane.agent}
-      onSend={onSend}
-      disabled={actionsDisabled}
-      isStreaming={pane.status === "running"}
-      compacting={pane.status === "compacting"}
-    />
+      ) : null}
+      <MessageList
+        messages={pane.messages}
+        agent={pane.agent}
+        onSend={onSend}
+        disabled={actionsDisabled}
+        isStreaming={pane.status === "running"}
+        compacting={pane.status === "compacting"}
+        testingViews={pane.kind === "main" ? testingViews : EMPTY_TESTING_VIEWS}
+        onCancelTesting={onCancelTesting}
+        activeRunId={activeRunId}
+      />
+    </>
   );
 }
 
@@ -193,6 +197,7 @@ function PaneTranscript({
   actionsDisabled,
   testingViews,
   onCancelTesting,
+  activeRunId,
 }: {
   pane: PaneModel;
   presentation: PanePresentation;
@@ -200,6 +205,7 @@ function PaneTranscript({
   actionsDisabled: boolean;
   testingViews: readonly TestView[];
   onCancelTesting?: (runId: TestRunId) => Promise<void>;
+  activeRunId?: string | null;
 }) {
   return (
     <MessageScrollerProvider autoScroll defaultScrollPosition="end">
@@ -212,14 +218,10 @@ function PaneTranscript({
               presentation={presentation}
               onSend={onSend}
               actionsDisabled={actionsDisabled}
+              testingViews={testingViews}
+              onCancelTesting={onCancelTesting}
+              activeRunId={activeRunId}
             />
-            {pane.kind === "main"
-              ? testingViews.map((view) => (
-                  <MessageScrollerItem key={view.runId} messageId={`testing-${view.runId}`}>
-                    <TestingPanel view={view} onCancel={onCancelTesting} />
-                  </MessageScrollerItem>
-                ))
-              : null}
             {pane.progress.length > 0 ? (
               <MessageScrollerItem messageId="pane-progress">
                 <ProgressPanel
@@ -254,6 +256,7 @@ export function Pane({
   openDisabled = false,
   testingViews = EMPTY_TESTING_VIEWS,
   onCancelTesting,
+  activeRunId,
 }: {
   pane: PaneModel;
   onOpenAgentPane?: () => void;
@@ -268,6 +271,7 @@ export function Pane({
   openDisabled?: boolean;
   testingViews?: readonly TestView[];
   onCancelTesting?: (runId: TestRunId) => Promise<void>;
+  activeRunId?: string | null;
 }) {
   const presentation = PANE_PRESENTATION[pane.kind];
   const actionsDisabled = sendDisabled || isHydrating || pane.status !== "idle" || !onSend;
@@ -288,6 +292,7 @@ export function Pane({
         actionsDisabled={actionsDisabled}
         testingViews={testingViews}
         onCancelTesting={onCancelTesting}
+        activeRunId={activeRunId}
       />
       <CompactNoticeMarker notice={compactNotice} />
       <HydrationFeedback isHydrating={isHydrating} hydrationError={hydrationError} />

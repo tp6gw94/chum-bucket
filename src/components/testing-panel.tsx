@@ -169,6 +169,12 @@ function roleStatusSummary(role: RoleId, row: ProgressRow): string {
   }
 }
 
+function visibleRows(view: TestView): readonly (readonly [RoleId, ProgressRow])[] {
+  return view.task
+    ? [[view.task.role, view.progress.rows[view.task.role]]]
+    : orderedRows(view.progress);
+}
+
 function progressStatusSummary(view: TestView, request: CancelRequest): string {
   const lifecycle =
     view.state === "finished"
@@ -176,7 +182,7 @@ function progressStatusSummary(view: TestView, request: CancelRequest): string {
       : view.state === "cancelling"
         ? "伺服器已接受取消，尚未確認停止"
         : "測試進行中";
-  const roleSummary = orderedRows(view.progress)
+  const roleSummary = visibleRows(view)
     .map(([role, row]) => roleStatusSummary(role, row))
     .join("；");
   const parts = [lifecycle, roleSummary];
@@ -735,6 +741,39 @@ function TestReportSection({
   );
 }
 
+function TaskResult({ view }: { view: TestView }) {
+  const result = view.task?.result;
+
+  if (!result) {
+    return null;
+  }
+
+  return (
+    <section
+      aria-live="off"
+      aria-label="任務結果"
+      data-run-id={view.runId}
+      className="flex flex-col gap-3 break-words"
+    >
+      <h3 className="text-sm font-medium">任務結果</h3>
+      {result.kind === "requirements" ? (
+        <RequirementsSummary requirements={result.payload} />
+      ) : null}
+      {result.kind === "plan" ? <PlanSummary plan={result.payload} /> : null}
+      {result.kind === "ac-result" || result.kind === "ui-result" ? (
+        <>
+          <p className="text-xs text-muted-foreground">僅為模擬結果，不構成真實網站驗收。</p>
+          <CheckResultList
+            title={result.kind === "ac-result" ? "AC 功能結果" : "UI 樣式結果"}
+            results={result.payload}
+          />
+        </>
+      ) : null}
+      <ArtifactList title="產物參照" artifacts={[result.ref]} />
+    </section>
+  );
+}
+
 function useCancelRequest(view: TestView, onCancel?: (runId: TestRunId) => Promise<void>) {
   const [tracker, setTracker] = useState<CancelTracker | null>(null);
   const cancelGeneration = useRef(0);
@@ -773,7 +812,7 @@ function cancelLabel(view: TestView, request: CancelRequest): string {
     request.status === "requesting" ||
     request.status === "accepted"
     ? "取消中…"
-    : "取消測試";
+    : "取消";
 }
 
 function CancelAction({
@@ -787,13 +826,7 @@ function CancelAction({
 }) {
   return (
     <div data-slot="card-action">
-      <Button
-        variant="outline"
-        size="sm"
-        aria-label="取消測試"
-        disabled={disabled}
-        onClick={onCancel}
-      >
+      <Button variant="outline" size="sm" aria-label="取消" disabled={disabled} onClick={onCancel}>
         {label}
       </Button>
     </div>
@@ -809,52 +842,71 @@ export function TestingPanel({
 }) {
   const { request, cancelDisabled, requestCancel } = useCancelRequest(view, onCancel);
 
-  return (
+  const content = (
     <>
-      <section
-        aria-label="測試角色進度"
-        data-testid="testing-progress"
-        data-run-id={view.runId}
-        data-state={view.state}
-        className="flex flex-col gap-3"
-      >
-        <p
-          role="status"
-          aria-live="polite"
-          aria-atomic="true"
-          aria-label="測試狀態摘要"
-          className="sr-only"
-        >
-          {progressStatusSummary(view, request)}
-        </p>
-        <Card size="sm">
-          <CardHeader>
-            <CardTitle>測試角色進度</CardTitle>
-            {onCancel ? (
-              <CancelAction
-                label={cancelLabel(view, request)}
-                disabled={cancelDisabled}
-                onCancel={requestCancel}
-              />
-            ) : null}
-          </CardHeader>
-          <CardContent className="flex flex-col gap-2">
-            {request.status === "failed" ? (
-              <p className="break-words text-xs text-destructive">
-                {cancelRequestMessage(request)}
-              </p>
-            ) : null}
-            <ul className="flex flex-col gap-2">
-              {orderedRows(view.progress).map(([role, row]) => (
-                <RoleProgressRow key={role} role={role} row={row} />
-              ))}
-            </ul>
-          </CardContent>
-        </Card>
-      </section>
-      {view.state === "finished" ? (
+      <Card size="sm">
+        <CardHeader>
+          <CardTitle>{view.task ? ROLE_LABELS[view.task.role] : "測試角色進度"}</CardTitle>
+          {onCancel && (!view.task || view.state !== "finished") ? (
+            <CancelAction
+              label={cancelLabel(view, request)}
+              disabled={cancelDisabled}
+              onCancel={requestCancel}
+            />
+          ) : null}
+        </CardHeader>
+        <CardContent className="flex flex-col gap-2">
+          {view.task ? <p className="text-sm break-words">{view.task.summary}</p> : null}
+          {request.status === "failed" ? (
+            <p className="break-words text-xs text-destructive">{cancelRequestMessage(request)}</p>
+          ) : null}
+          <ul className="flex flex-col gap-2">
+            {visibleRows(view).map(([role, row]) => (
+              <RoleProgressRow key={role} role={role} row={row} />
+            ))}
+          </ul>
+        </CardContent>
+      </Card>
+      {view.task && view.state === "finished" ? <TaskResult view={view} /> : null}
+      {!view.task && view.state === "finished" ? (
         <TestReportSection report={view.report} availableArtifacts={view.availableArtifacts} />
       ) : null}
     </>
+  );
+
+  return (
+    <section
+      aria-label="測試角色進度"
+      data-testid="testing-progress"
+      data-run-id={view.runId}
+      data-state={view.state}
+      className="flex flex-col gap-3"
+    >
+      <p
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+        aria-label="測試狀態摘要"
+        className="sr-only"
+      >
+        {progressStatusSummary(view, request)}
+      </p>
+      {view.task && view.state === "finished" ? (
+        <details className="rounded-xl border border-border bg-card p-3">
+          <summary className="cursor-pointer rounded-md text-sm focus-visible:outline-2 focus-visible:outline-ring">
+            <span className="inline-flex flex-wrap items-center gap-2">
+              <span className="font-medium">{ROLE_LABELS[view.task.role]}</span>
+              <span className="break-words">{view.task.summary}</span>
+              <Badge variant={rowBadgeVariant(view.progress.rows[view.task.role])}>
+                {rowStatusLabel(view.progress.rows[view.task.role])}
+              </Badge>
+            </span>
+          </summary>
+          <div className="mt-3 flex flex-col gap-3">{content}</div>
+        </details>
+      ) : (
+        content
+      )}
+    </section>
   );
 }
