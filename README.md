@@ -179,7 +179,19 @@ Code Mode 就是給 LLM 一個 Sandbox，讓他可以在裡面執行程式，我
 
 ### Target
 
-- [ ] 提供 Code Mode
+建立 `codemode`，讓模型用 TypeScript 編排當輪可用的工具，回傳整理後的結果。
+
+- [ ] 接入 QuickJS 隔離執行，讓 `external_*` 經過共用工具 dispatcher。
+- [ ] 從同一份 bindings 產生模型說明，並沿用可恢復的 lazy discovery。
+- [ ] 限制執行時間、記憶體、工具呼叫與輸出，保存結果及受限事件。
+- [ ] 驗證整段 Code Mode 的 checkpoint、取消與副作用重試邊界。
+
+依序閱讀以下文件：
+
+1. [Code Mode 的工具編排架構](docs/code-mode/architecture.md)：模組責任、資料流與 discovery 的位置。
+2. [建立 Code Mode](docs/code-mode/implement-code-mode.md)：工具契約、bindings、prompt 與聊天整合。
+3. [執行、隔離與恢復邊界](docs/code-mode/execution-boundaries.md)：QuickJS、host 權限、資源預算與 DBOS 重跑限制。
+4. [驗證 Code Mode](docs/code-mode/verify-code-mode.md)：離線執行、越權與超限檢查、事件及跨程序恢復。
 
 ## 4. Compact
 
