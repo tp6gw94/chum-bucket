@@ -5,13 +5,13 @@ import {
   type ToolExecutionContext,
   type UIMessage,
 } from "@tanstack/ai";
-import { testingRequestInputSchema } from "../../../shared/testing";
+import { delegationInputSchema } from "../../../shared/testing";
+import { allowsTool } from "../agents";
 import type { ModelCall } from "../model-turn";
 import { codeModeToolName, composeCodeModeTurn } from "./code-mode";
 import {
   withAtlassianScope,
   ToolBoundaryError,
-  type AtlassianCatalog,
   type LocalToolHandler,
   type ModelTool,
 } from "./atlassian";
@@ -38,14 +38,13 @@ export type RunTools = Readonly<{
   ) => Promise<unknown>;
 }>;
 
-export const RUN_TESTS_TOOL = "run_tests";
-export type RunToolScope = "ordinary" | "main";
+export const DELEGATE_TASK_TOOL = "delegate_task";
 
-const runTests = toolDefinition({
-  name: RUN_TESTS_TOOL,
+const delegateTaskTool = toolDefinition({
+  name: DELEGATE_TASK_TOOL,
   description:
-    "Run supervised tests for this main conversation. Pass only the testing intent: goal, sources, criteria, target URL, and optional design or artifact references.",
-  inputSchema: testingRequestInputSchema,
+    "Delegate exactly one durable task. Choose atlassian to capture requirements, planner with an explicit requirementsRef to plan without a URL, or ac/ui with an explicit planRef and targetUrl for mock-only checks. Returns validated results and immutable artifact references. Never launches prerequisites. Jira issue keys identify sources, not criterion selection. For the whole PROJ-123 issue use sources:[{kind:'jira',issueKey:'PROJ-123'}], criteria:{kind:'all'}. Use selected only for explicit criterion keys such as AC-2 and AC-5, preserving that exact subset.",
+  inputSchema: delegationInputSchema,
 });
 
 function registration(
@@ -75,24 +74,26 @@ const localCatalog: Catalog = new Map(
   ].map((entry) => [entry.definition.name, entry]),
 );
 
-function mergeLocalDefinitions(remote: AtlassianCatalog): ModelTool[] {
-  const definitions = new Map([...localCatalog].map(([name, entry]) => [name, entry.definition]));
+const delegateTaskDirect = registration(delegateTaskTool, async () => {
+  throw new ToolBoundaryError("delegate_task cannot execute inside a tool step");
+}).definition;
 
-  for (const [name, definition] of remote) {
-    if (definitions.has(name)) {
-      throw new ToolBoundaryError("Atlassian MCP catalog is invalid");
+function composeLocalDefinitions(): ModelTool[] {
+  const modelDefinitions: ModelTool[] = [];
+
+  for (const [name, entry] of localCatalog) {
+    if (allowsTool("main", name, "direct")) {
+      modelDefinitions.push(entry.definition);
     }
-
-    definitions.set(name, definition);
   }
 
-  return [...definitions.values()];
+  return modelDefinitions;
 }
 
 export async function withRunTools<T>(
   use: (tools: RunTools) => Promise<T>,
   signal?: AbortSignal,
-  runScope: RunToolScope = "ordinary",
+  runScope: "main" | "side" = "main",
 ): Promise<T> {
   return withAtlassianScope(async (scope) => {
     const pending = new Set<Promise<unknown>>();
@@ -102,8 +103,16 @@ export async function withRunTools<T>(
         context.abortSignal?.throwIfAborted();
         signal?.throwIfAborted();
 
-        if (call.name === RUN_TESTS_TOOL) {
-          throw new ToolBoundaryError("run_tests is direct-only on the main run");
+        if (call.name === "run_tests") {
+          throw new ToolBoundaryError("run_tests is retired; use delegate_task");
+        }
+
+        if (call.name === DELEGATE_TASK_TOOL) {
+          throw new ToolBoundaryError("delegate_task is direct-only on the main run");
+        }
+
+        if (!allowsTool("main", call.name, "direct")) {
+          throw new ToolBoundaryError("Unknown tool");
         }
 
         const work = scope.executeTool(
@@ -122,8 +131,13 @@ export async function withRunTools<T>(
       };
 
     const buildTurn = async (messages: readonly UIMessage[]) => {
-      const definitions = await scope.getModelTools(messages, mergeLocalDefinitions);
-      const bindable = definitions.filter((definition) => definition.name !== RUN_TESTS_TOOL);
+      const definitions = composeLocalDefinitions();
+      const bindable = definitions.filter(
+        (definition) =>
+          definition.name !== DELEGATE_TASK_TOOL &&
+          (allowsTool("main", definition.name, "direct") ||
+            allowsTool("main", definition.name, "codemode")),
+      );
       const guard = await scope.guard();
       const turn = composeCodeModeTurn({
         definitions: bindable,
@@ -131,12 +145,8 @@ export async function withRunTools<T>(
         guard,
       });
       const direct =
-        runScope === "main"
-          ? [
-              registration(runTests, async () => {
-                throw new ToolBoundaryError("run_tests cannot execute inside a tool step");
-              }).definition,
-            ]
+        runScope === "main" && allowsTool("main", DELEGATE_TASK_TOOL, "direct")
+          ? [delegateTaskDirect]
           : [];
 
       return { definitions: [...bindable, ...direct], turn };
@@ -153,8 +163,8 @@ export async function withRunTools<T>(
           };
         },
         async executeTool(messages, call, context) {
-          if (call.name === RUN_TESTS_TOOL) {
-            throw new ToolBoundaryError("run_tests is direct-only on the main run");
+          if (call.name === DELEGATE_TASK_TOOL) {
+            throw new ToolBoundaryError("delegate_task is direct-only on the main run");
           }
 
           if (call.name !== codeModeToolName) {

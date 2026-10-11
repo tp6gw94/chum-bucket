@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import { test } from "node:test";
 import type { AdapterYieldChunk } from "@tanstack/ai";
-import { RUN_TESTS_TOOL, withRunTools } from "../../../server/harness/tools";
+import { DELEGATE_TASK_TOOL, withRunTools } from "../../../server/harness/tools";
 import {
   designProperties,
   hostBrowserOutcomes,
@@ -10,10 +10,14 @@ import {
   restoreDesignCapture,
   sourceAnchors,
 } from "../../../server/harness/testing-child";
-import { deriveFrontier } from "../../../server/harness/testing-policy";
-import { digestOf } from "../../../server/harness/testing-domain";
+import {
+  digestOf,
+  sourceCaptureView,
+  validateRequirements,
+} from "../../../server/harness/testing-domain";
+import { roleFeedbackPrompt } from "../../../server/harness/prompts";
 import type { TestingExecution } from "../../../server/harness/testing-store";
-import { testingRequestInputSchema, type PlanCheck } from "../../../shared/testing";
+import { delegationInputSchema, type PlanCheck } from "../../../shared/testing";
 
 const { scriptedEvents } = createRequire(import.meta.url)(
   "../../fixtures/testing-runtime-external-fixture.mjs",
@@ -24,8 +28,128 @@ const { scriptedEvents } = createRequire(import.meta.url)(
   }) => Array<Record<string, unknown>>;
 };
 
+test("private ID feedback identifies the selected capture without dumping source and stays bounded", () => {
+  const source = { kind: "jira" as const, issueKey: "PROJ-123" };
+  const capture = {
+    reference: source,
+    digest: "selected-native-digest",
+    anchors: ["private source body"],
+    capturedAt: "today",
+  };
+  const validId = sourceCaptureView(capture).anchorRefs[0]!.id;
+  const decision = validateRequirements(
+    {
+      criteria: [
+        { key: "AC-1", statement: "Checkout succeeds", source, anchorId: "later-read-id" },
+      ],
+      unresolved: [],
+    },
+    { goal: "Checkout", selection: { kind: "all" }, captures: [capture] },
+  );
+  assert.equal(decision.kind, "rejected");
+  if (decision.kind !== "rejected") throw new Error("Expected private rejection");
+  const feedback = roleFeedbackPrompt(decision.issues);
+  assert.match(feedback, /host-selected capture/);
+  assert.ok(feedback.includes(capture.digest));
+  assert.ok(feedback.includes(validId));
+  assert.equal(feedback.includes(capture.anchors[0]!), false);
+  const bounded = roleFeedbackPrompt(
+    Array.from({ length: 25 }, (_, index) => `${index}:` + "x".repeat(600)),
+  );
+  assert.equal(bounded.length, "Private validation failed: ".length + 20 * 512 + 19 * 2);
+  assert.equal(bounded.includes("20:"), false);
+});
+
 test("source anchors come from actual leaf strings", () => {
   assert.deepEqual(sourceAnchors({ issue: { summary: "AC-1", empty: "  " }, count: 1 }), ["AC-1"]);
+});
+
+test("source anchors decode the Jira result envelope without treating serialized JSON as evidence", () => {
+  const issue = { key: "FETM-78", summary: "Plan checkout", description: "d".repeat(456) };
+  assert.deepEqual(sourceAnchors({ result: JSON.stringify(issue) }, 24, "jira_get_issue"), [
+    "d".repeat(456),
+    "FETM-78",
+    "Plan checkout",
+  ]);
+  assert.deepEqual(
+    sourceAnchors(
+      { result: JSON.stringify({ ...issue, description: "d".repeat(2048) }) },
+      24,
+      "jira_get_issue",
+    ),
+    ["FETM-78", "Plan checkout"],
+  );
+  for (const result of ["", "{broken", "null", "[]", "{}", '{"error":"not found"}']) {
+    assert.deepEqual(sourceAnchors({ result }, 24, "jira_get_issue"), [], result);
+  }
+  assert.deepEqual(sourceAnchors({ description: '{"key":"FETM-78"}' }), ['{"key":"FETM-78"}']);
+});
+
+test("Jira content anchors survive metadata exhausting the leaf budget", () => {
+  const metadata = Object.fromEntries(
+    Array.from({ length: 30 }, (_, index) => [`custom-${index}`, { field_id: `field-${index}` }]),
+  );
+  const anchors = sourceAnchors(
+    {
+      result: JSON.stringify({
+        ...metadata,
+        key: "FETM-78",
+        summary: "Plan checkout",
+        description: "The product costs NT$100",
+      }),
+    },
+    24,
+    "jira_get_issue",
+  );
+  assert.deepEqual(anchors.slice(0, 3), ["The product costs NT$100", "FETM-78", "Plan checkout"]);
+});
+
+test("non-Jira result wrappers keep generic leaf anchors without decoding", () => {
+  const page = { title: "Confluence page", body: "Checkout rules" };
+  const result = JSON.stringify(page);
+  for (const nativeName of [undefined, "confluence_get_page", "unknown_tool"]) {
+    assert.deepEqual(sourceAnchors({ result }, 24, nativeName), [result]);
+    assert.deepEqual(sourceAnchors({ result: page }, 24, nativeName), [
+      "Checkout rules",
+      "Confluence page",
+    ]);
+    assert.deepEqual(
+      sourceAnchors({ result: [{ title: "Confluence page" }, "Checkout rules"] }, 24, nativeName),
+      ["Confluence page", "Checkout rules"],
+    );
+    assert.deepEqual(sourceAnchors({ result: '{"key":"FETM-78"}' }, 24, nativeName), [
+      '{"key":"FETM-78"}',
+    ]);
+  }
+});
+
+test("Jira plain objects and object or array results retain generic leaf behavior", () => {
+  const issue = { key: "FETM-78", summary: "Plan checkout", description: "Checkout rules" };
+  const expected = ["Checkout rules", "FETM-78", "Plan checkout"];
+  assert.deepEqual(sourceAnchors(issue, 24, "jira_get_issue"), expected);
+  assert.deepEqual(sourceAnchors({ result: issue }, 24, "jira_get_issue"), expected);
+  assert.deepEqual(sourceAnchors({ result: [issue] }, 24, "jira_get_issue"), expected);
+});
+
+test("duplicate Jira priority anchors do not spend the unique anchor budget", () => {
+  const result = JSON.stringify({
+    description: "Checkout description",
+    key: "FETM-78",
+    summary: "Plan checkout",
+    details: ["detail-1", "detail-2", "detail-3", "detail-4"],
+    zAcceptance: "Tail acceptance",
+    zzOverflow: "Over budget",
+  });
+  assert.deepEqual(sourceAnchors({ result }, 8, "jira_get_issue"), [
+    "Checkout description",
+    "FETM-78",
+    "Plan checkout",
+    "detail-1",
+    "detail-2",
+    "detail-3",
+    "detail-4",
+    "Tail acceptance",
+  ]);
 });
 
 test("design capture rejects truncated output, the wrong node, and missing properties", () => {
@@ -143,48 +267,60 @@ test("host browser outcomes do not copy the model expected observation", () => {
   );
 });
 
-test("run_tests is direct-only on the main scope and rejected by execution", async () => {
-  await withRunTools(async (tools) => {
-    const ordinary = await tools.getModelTools([]);
-    assert.equal(
-      ordinary.definitions.some((tool) => tool.name === RUN_TESTS_TOOL),
-      false,
-    );
-    assert.doesNotMatch(ordinary.systemPrompt, /external_run_tests/);
-    await assert.rejects(
-      () =>
-        tools.executeTool(
-          [],
-          { id: "forged", name: RUN_TESTS_TOOL, arguments: "{}", input: {} },
-          { emitCustomEvent: () => undefined },
-        ),
-      /direct-only/,
-    );
-  });
+test("delegate_task is direct-only on the main scope and rejected by execution", async () => {
+  await withRunTools(
+    async (tools) => {
+      const side = await tools.getModelTools([]);
+      assert.equal(
+        side.definitions.some((tool) => tool.name === DELEGATE_TASK_TOOL),
+        false,
+      );
+      assert.deepEqual(side.definitions.map((tool) => tool.name).sort(), [
+        "codemode",
+        "edit",
+        "get_figma",
+        "read",
+        "write",
+      ]);
+      assert.doesNotMatch(side.systemPrompt, /external_delegate_task/);
+      await assert.rejects(
+        () =>
+          tools.executeTool(
+            [],
+            { id: "forged", name: DELEGATE_TASK_TOOL, arguments: "{}", input: {} },
+            { emitCustomEvent: () => undefined },
+          ),
+        /direct-only/,
+      );
+    },
+    undefined,
+    "side",
+  );
   await withRunTools(
     async (tools) => {
       const main = await tools.getModelTools([]);
       assert.equal(
-        main.definitions.some((tool) => tool.name === RUN_TESTS_TOOL),
+        main.definitions.some((tool) => tool.name === DELEGATE_TASK_TOOL),
         true,
       );
       const publicInput = {
         goal: "Verify checkout",
         sources: [{ kind: "jira", issueKey: "CHUM-42" }],
         criteria: { kind: "all" },
-        targetUrl: "https://preview.example.test/checkout",
+        role: "atlassian",
+        summary: "Read checkout requirements",
       };
-      assert.equal(testingRequestInputSchema.safeParse(publicInput).success, true);
+      assert.equal(delegationInputSchema.safeParse(publicInput).success, true);
       assert.equal(
-        testingRequestInputSchema.safeParse({ ...publicInput, childWorkflowId: "forged" }).success,
+        delegationInputSchema.safeParse({ ...publicInput, childWorkflowId: "forged" }).success,
         false,
       );
-      assert.doesNotMatch(main.systemPrompt, /external_run_tests/);
+      assert.doesNotMatch(main.systemPrompt, /external_delegate_task/);
       await assert.rejects(
         () =>
           tools.executeTool(
             [],
-            { id: "forged", name: RUN_TESTS_TOOL, arguments: "{}", input: {} },
+            { id: "forged", name: DELEGATE_TASK_TOOL, arguments: "{}", input: {} },
             { emitCustomEvent: () => undefined },
           ),
         /direct-only/,
@@ -355,20 +491,29 @@ test("planner fixture uses the accepted requirement identity from its root task"
   assert.equal(proposal.cases[0]?.checks[0]?.criterionId, "crit:AC-9");
 });
 
-test("frontier dispatches only missing required roles", () => {
-  const execution = {
-    finished: false,
-    cancelRequested: false,
-    decisions: [{ kind: "satisfied", role: "atlassian", ref: "req", origin: "produced" }],
-    artifacts: [
-      {
-        kind: "plan",
-        payload: { assignments: { ui: [] } },
-      },
-    ],
-  } as unknown as TestingExecution;
-  assert.deepEqual(deriveFrontier({ ...execution, decisions: [] } as TestingExecution), [
-    "atlassian",
-  ]);
-  assert.deepEqual(deriveFrontier(execution), ["planner"]);
+test("the retired whole-pipeline tool is rejected instead of rerouted", async () => {
+  await withRunTools(
+    async (tools) => {
+      await assert.rejects(
+        () =>
+          tools.executeTool(
+            [],
+            { id: "legacy", name: "run_tests", arguments: "{}", input: {} },
+            { emitCustomEvent: () => undefined },
+          ),
+        /retired/,
+      );
+      const main = await tools.getModelTools([]);
+      assert.equal(
+        main.definitions.some((tool) => tool.name === "delegate_task"),
+        true,
+      );
+      assert.equal(
+        main.definitions.some((tool) => tool.name === "run_tests"),
+        false,
+      );
+    },
+    undefined,
+    "main",
+  );
 });

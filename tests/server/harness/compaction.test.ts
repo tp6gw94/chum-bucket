@@ -15,7 +15,7 @@ import {
   prepareCompaction,
   type CompactionEmit,
 } from "../../../server/harness/compaction";
-import { MODEL } from "../../../server/harness/run-store";
+import { MODEL } from "../../../server/harness/agents";
 import type { ModelTool } from "../../../server/harness/tools/atlassian";
 import type { RunTools } from "../../../server/harness/tools";
 
@@ -323,7 +323,6 @@ test("a small history is left untouched", async () => {
     operationId: "run-1/compact/0",
     messages: [text("u1", "user", "一"), text("a1", "assistant", "回"), text("u2", "user", "二")],
     prompt: "prompt",
-    model: MODEL,
     tools: fakeTools(),
     emit: captured.emit,
   });
@@ -355,7 +354,6 @@ test("a large history is replaced by a summary plus the retained tail", async ()
       operationId: "run-1/compact/0",
       messages: longMessages(),
       prompt: "prompt",
-      model: MODEL,
       tools: fakeTools(),
       emit: captured.emit,
     });
@@ -411,7 +409,6 @@ test("iterative summaries pass prior decisions verbatim as data in a tools-free 
       operationId: "iterative/1",
       messages: longMessages(),
       prompt: "prompt",
-      model: MODEL,
       tools: fakeTools(),
       emit: capture().emit,
     });
@@ -430,7 +427,6 @@ test("iterative summaries pass prior decisions verbatim as data in a tools-free 
         text("latest", "user", "continue"),
       ],
       prompt: "prompt",
-      model: MODEL,
       tools: fakeTools(),
       emit: capture().emit,
     });
@@ -477,7 +473,6 @@ test("assistant-only tails can be compacted again after complete tool cycles", a
   const options = {
     runId: "continued",
     prompt: "prompt",
-    model: MODEL,
     tools: fakeTools(),
     policy: { triggerTokens: 3_000, keepRecentTokens: 700 },
   } as const;
@@ -646,7 +641,6 @@ test("a truncated summary keeps the original history", async () => {
       operationId: "run-1/compact/0",
       messages: longMessages(),
       prompt: "prompt",
-      model: MODEL,
       tools: fakeTools(),
       emit: captured.emit,
     });
@@ -670,7 +664,6 @@ test("an oversized summary keeps the original history", async () => {
       operationId: "run-1/compact/0",
       messages: longMessages(),
       prompt: "prompt",
-      model: MODEL,
       tools: fakeTools(),
       emit: captured.emit,
     });
@@ -690,7 +683,6 @@ test("a failing summary keeps the original history", async () => {
       operationId: "run-1/compact/0",
       messages: longMessages(),
       prompt: "prompt",
-      model: MODEL,
       tools: fakeTools(),
       emit: captured.emit,
     });
@@ -726,7 +718,6 @@ test("empty or filtered summaries do not replace history", async () => {
         operationId: "invalid-summary/compact/0",
         messages: longMessages(),
         prompt: "prompt",
-        model: MODEL,
         tools: fakeTools(),
         emit: captured.emit,
       });
@@ -757,7 +748,6 @@ test("oversized fixed prompts trigger compaction but non-shrinking summaries are
         text("u3", "user", "current request"),
       ],
       prompt: "字".repeat(COMPACT_TOKEN_THRESHOLD),
-      model: MODEL,
       tools: fakeTools(),
       emit: captured.emit,
     });
@@ -782,7 +772,6 @@ test("persistence failures propagate instead of becoming summary failures", asyn
       operationId: "persistence/compact/0",
       messages: longMessages(),
       prompt: "prompt",
-      model: MODEL,
       tools: fakeTools(),
       emit,
     }),
@@ -802,7 +791,6 @@ test("safety classifications are rejected without changing original content", as
         operationId: "safety/compact/0",
         messages,
         prompt: "prompt",
-        model: MODEL,
         tools: fakeTools(),
         emit: capture().emit,
       });

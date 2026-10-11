@@ -185,13 +185,14 @@ const publicTestReportSchema = z.object({
 });
 
 const testViewBase = {
+  task: z.undefined().optional(),
   runId: testRunIdSchema,
   progress: progressCardSchema,
   reuse: z.array(reuseDecisionSchema).max(500),
   availableArtifacts: z.array(artifactRefSchema).max(500),
 };
 
-const testViewSchema = z.discriminatedUnion("state", [
+const legacyTestViewSchema = z.discriminatedUnion("state", [
   z.object({
     ...testViewBase,
     state: z.literal("active"),
@@ -207,6 +208,47 @@ const testViewSchema = z.discriminatedUnion("state", [
     state: z.literal("finished"),
     report: publicTestReportSchema,
   }),
+]);
+
+const taskArtifactSchema = z.discriminatedUnion("kind", [
+  z.object({
+    ref: artifactRefSchema,
+    kind: z.literal("requirements"),
+    payload: publicRequirementsSchema,
+  }),
+  z.object({ ref: artifactRefSchema, kind: z.literal("plan"), payload: publicPlanSchema }),
+  z.object({
+    ref: artifactRefSchema,
+    kind: z.literal("ac-result"),
+    payload: z.array(publicCheckResultSchema).max(80),
+  }),
+  z.object({
+    ref: artifactRefSchema,
+    kind: z.literal("ui-result"),
+    payload: z.array(publicCheckResultSchema).max(80),
+  }),
+]);
+
+const testViewSchema = z.union([
+  z.object({
+    ...testViewBase,
+    task: z.object({
+      version: z.literal(2),
+      role: z.enum(ROLE_IDS),
+      summary: boundedText(2_000),
+      origin: z
+        .object({
+          parentRunId: z.string().min(1),
+          requestKey: z.string().min(1),
+          parentMessageId: z.string().min(1),
+        })
+        .nullish(),
+      result: taskArtifactSchema.nullable(),
+    }),
+    state: z.enum(["active", "cancelling", "finished"]),
+    report: z.null(),
+  }),
+  legacyTestViewSchema,
 ]);
 
 const testingProjectionChunkSchema = z.object({
@@ -235,6 +277,22 @@ export function parsePublishedTesting(payload: unknown): TestView | null {
   const parsed = testingHydrationSchema.safeParse(payload);
 
   return parsed.success ? (parsed.data.publishedTesting ?? null) : null;
+}
+
+export function parsePublishedTasks(payload: unknown): readonly TestView[] {
+  const parsed = z.object({ publishedTasks: z.array(z.unknown()) }).safeParse(payload);
+
+  if (parsed.success) {
+    return parsed.data.publishedTasks.flatMap((value) => {
+      const view = parseTestView(value);
+
+      return view ? [view] : [];
+    });
+  }
+
+  const legacy = parsePublishedTesting(payload);
+
+  return legacy ? [legacy] : [];
 }
 
 export function testingProjectionEvent(view: TestView): StreamChunk {

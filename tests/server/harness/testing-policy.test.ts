@@ -1,157 +1,61 @@
-import test from "node:test";
 import assert from "node:assert/strict";
-import {
-  deriveFrontier,
-  isDecided,
-  isNotRequired,
-  isSatisfied,
-  isStyleRequired,
-  phaseEligible,
-  rootOutcome,
-  type TestingPolicyState,
-} from "../../../server/harness/testing-policy";
+import { test } from "node:test";
+import { rootOutcome, type TestingPolicyState } from "../../../server/harness/testing-policy";
+import { ROLE_IDS } from "../../../shared/testing";
 
-test("deriveFrontier returns empty when finished or cancel requested", () => {
-  const finishedState: TestingPolicyState = {
-    finished: true,
-    cancelRequested: false,
-    decisions: [],
-    artifacts: [],
-  };
-  assert.deepEqual(deriveFrontier(finishedState), []);
+const base: TestingPolicyState = {
+  intent: { task: { input: { role: "planner" } } },
+  cancelRequested: false,
+  deadline: "2030-01-01T00:00:00Z",
+  decisions: [],
+};
 
-  const cancelledState: TestingPolicyState = {
-    finished: false,
-    cancelRequested: true,
-    decisions: [],
-    artifacts: [],
-  };
-  assert.deepEqual(deriveFrontier(cancelledState), []);
+test("completion depends only on the explicitly delegated role", () => {
+  for (const role of ROLE_IDS) {
+    const state = {
+      ...base,
+      intent: { task: { input: { role } } },
+      decisions: [{ kind: "task_result", role, execution: "completed" }],
+    };
+    assert.equal(rootOutcome(state, 0), "completed");
+    assert.equal(rootOutcome({ ...state, decisions: [] }, 0), "failed");
+  }
 });
 
-test("deriveFrontier sequences atlassian before planner and AC before UI", () => {
-  const initialState: TestingPolicyState = {
-    finished: false,
-    cancelRequested: false,
-    decisions: [],
-    artifacts: [],
-  };
-  assert.deepEqual(deriveFrontier(initialState), ["atlassian"]);
-
-  const atlassianDone: TestingPolicyState = {
-    ...initialState,
-    decisions: [{ kind: "satisfied", role: "atlassian" }],
-  };
-  assert.deepEqual(deriveFrontier(atlassianDone), ["planner"]);
-
-  const plannerDoneWithoutUi: TestingPolicyState = {
-    ...initialState,
-    decisions: [
-      { kind: "satisfied", role: "atlassian" },
-      { kind: "satisfied", role: "planner" },
-    ],
-    artifacts: [{ kind: "plan", payload: { assignments: {} } }],
-  };
-  assert.deepEqual(deriveFrontier(plannerDoneWithoutUi), ["ac"]);
-
-  const plannerDoneWithUi: TestingPolicyState = {
-    ...initialState,
-    decisions: [
-      { kind: "satisfied", role: "atlassian" },
-      { kind: "satisfied", role: "planner" },
-    ],
-    artifacts: [{ kind: "plan", payload: { assignments: { ui: ["check-1"] } } }],
-  };
-  assert.deepEqual(deriveFrontier(plannerDoneWithUi), ["ac", "ui"]);
-
-  const acDoneWithUi: TestingPolicyState = {
-    ...plannerDoneWithUi,
-    decisions: [
-      { kind: "satisfied", role: "atlassian" },
-      { kind: "satisfied", role: "planner" },
-      { kind: "satisfied", role: "ac" },
-    ],
-  };
-  assert.deepEqual(deriveFrontier(acDoneWithUi), ["ui"]);
+test("a completed dependency never impersonates a completed delegated task", () => {
+  assert.equal(
+    rootOutcome(
+      { ...base, decisions: [{ kind: "task_result", role: "atlassian", execution: "completed" }] },
+      0,
+    ),
+    "failed",
+  );
+  assert.equal(
+    rootOutcome(
+      { ...base, decisions: [{ kind: "task_result", role: "planner", execution: "completed" }] },
+      0,
+    ),
+    "completed",
+  );
 });
 
-test("phaseEligible checks task_result decision and dependencies", () => {
-  const state: TestingPolicyState = {
-    finished: false,
-    cancelRequested: false,
-    decisions: [
-      { kind: "satisfied", role: "atlassian" },
-      { kind: "task_result", role: "planner" },
-    ],
-    artifacts: [{ kind: "plan", payload: { assignments: { ui: ["check-1"] } } }],
-  };
-
-  assert.strictEqual(phaseEligible(state, "atlassian"), false);
-  assert.strictEqual(phaseEligible(state, "planner"), false);
-  assert.strictEqual(phaseEligible(state, "ac"), false);
-  assert.strictEqual(phaseEligible(state, "ui"), false);
-
-  const plannerSatisfied: TestingPolicyState = {
-    ...state,
-    decisions: [
-      { kind: "satisfied", role: "atlassian" },
-      { kind: "satisfied", role: "planner" },
-    ],
-  };
-  assert.strictEqual(phaseEligible(plannerSatisfied, "ac"), true);
-  assert.strictEqual(phaseEligible(plannerSatisfied, "ui"), true);
-
-  const uiNotRequired: TestingPolicyState = {
-    ...plannerSatisfied,
-    decisions: [...plannerSatisfied.decisions, { kind: "not_required", role: "ui" }],
-  };
-  assert.strictEqual(phaseEligible(uiNotRequired, "ui"), false);
-});
-
-test("rootOutcome determines completion, cancellation, timeout, and failure", () => {
-  const base: TestingPolicyState & { deadline: string } = {
-    finished: false,
-    cancelRequested: false,
-    decisions: [
-      { kind: "satisfied", role: "atlassian" },
-      { kind: "satisfied", role: "planner" },
-      { kind: "satisfied", role: "ac" },
-    ],
-    artifacts: [{ kind: "plan", payload: { assignments: {} } }],
-    deadline: new Date(Date.now() + 60000).toISOString(),
-  };
-
-  assert.strictEqual(rootOutcome(base, Date.now()), "completed");
-
-  const cancelled = { ...base, cancelRequested: true };
-  assert.strictEqual(rootOutcome(cancelled, Date.now()), "cancelled");
-
-  const timedOut = { ...base, deadline: new Date(Date.now() - 1000).toISOString() };
-  assert.strictEqual(rootOutcome(timedOut, Date.now()), "timed_out");
-
-  const missingRole = {
+test("cancellation and fixed deadlines override a late result", () => {
+  const state = {
     ...base,
-    decisions: [{ kind: "satisfied" as const, role: "atlassian" as const }],
+    decisions: [{ kind: "task_result", role: "planner" as const, execution: "completed" }],
   };
-  assert.strictEqual(rootOutcome(missingRole, Date.now()), "failed");
+  assert.equal(rootOutcome({ ...state, cancelRequested: true }, 0), "cancelled");
+  assert.equal(rootOutcome(state, Date.parse("2030-01-01T00:00:00Z")), "timed_out");
+  assert.equal(
+    rootOutcome(
+      { ...state, decisions: [{ kind: "task_result", role: "planner", execution: "timed_out" }] },
+      0,
+    ),
+    "timed_out",
+  );
 });
 
-test("predicates isSatisfied isNotRequired isStyleRequired isDecided behave consistently", () => {
-  const state: TestingPolicyState = {
-    finished: false,
-    cancelRequested: false,
-    decisions: [
-      { kind: "satisfied", role: "atlassian" },
-      { kind: "not_required", role: "ui" },
-      { kind: "task_result", role: "ac" },
-    ],
-    artifacts: [{ kind: "plan", payload: { assignments: { ui: ["style-1"] } } }],
-  };
-
-  assert.strictEqual(isSatisfied(state, "atlassian"), true);
-  assert.strictEqual(isSatisfied(state, "planner"), false);
-  assert.strictEqual(isNotRequired(state), true);
-  assert.strictEqual(isDecided(state, "ac"), true);
-  assert.strictEqual(isDecided(state, "ui"), false);
-  assert.strictEqual(isStyleRequired(state), true);
+test("legacy operations cannot enter the new task lifecycle", () => {
+  assert.throws(() => rootOutcome({ ...base, intent: {} }, 0), /maintenance/);
+  assert.equal(rootOutcome({ ...base, cancelRequested: true }, 0), "cancelled");
 });

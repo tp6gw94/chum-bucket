@@ -1,7 +1,6 @@
 import { Hono } from "hono";
 import { z } from "zod";
-import { testingRequestSchema } from "../shared/testing";
-import { cancel, problem, read, request } from "./harness/testing-service";
+import { cancel, problem, read } from "./harness/testing-service";
 
 const app = new Hono();
 
@@ -21,15 +20,12 @@ app.onError((error, c) => {
   return c.json({ error: "測試服務暫時無法使用" }, 503);
 });
 
-app.post("/", async (c) => {
-  const parsed = testingRequestSchema.safeParse(await c.req.json().catch(() => null));
-
-  if (!parsed.success) {
-    return c.json({ error: "Invalid testing request" }, 400);
-  }
-
-  return c.json(await request(parsed.data));
-});
+app.post("/", (c) =>
+  c.json(
+    { error: "Whole-pipeline testing is retired. Use delegate_task in the main conversation." },
+    410,
+  ),
+);
 
 app.post("/:runId/cancel", async (c) => {
   const body = z

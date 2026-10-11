@@ -8,15 +8,16 @@ import {
   type AgentSession,
 } from "./agent-loop";
 import { ContextOverflowError } from "./model-turn";
-import { RUN_TESTS_TOOL, withRunTools, type RunTools } from "./tools";
+import { agentRegistry } from "./agents";
+import { problem } from "./testing-service";
+import { DELEGATE_TASK_TOOL, withRunTools, type RunTools } from "./tools";
 import { drainTestingTransports } from "./testing-child";
-import { orchestrateAttachedTesting, reconcileTestingOperations } from "./testing-run";
+import { assertDelegationCutover, delegateTask, reconcileTestingOperations } from "./testing-run";
 import { prepareCompaction, publishCompaction } from "./compaction";
 import type { ConversationState } from "./conversation";
 import {
   BUILD,
   PREVIOUS_BUILD,
-  MODEL,
   assertExecution,
   beginSideDiscard,
   purgeSideChat,
@@ -60,7 +61,6 @@ async function compactConversation(
         operationId,
         messages: conversation.context,
         prompt: run.prompt,
-        model: run.model,
         tools,
         emit: (event) => emit(run.runId, event),
         reason,
@@ -108,18 +108,23 @@ function testingOrchestration(run: AcceptedRun): AgentOrchestration | undefined 
   }
 
   return async (call) => {
-    if (call.name !== RUN_TESTS_TOOL) {
+    if (call.name !== DELEGATE_TASK_TOOL) {
       return { state: "unhandled" };
     }
 
     try {
-      return { state: "handled", output: await orchestrateAttachedTesting(run, call) };
+      return { state: "handled", output: await delegateTask(run, call) };
     } catch (error) {
+      const rejection = problem(error);
+
       return {
         state: "handled",
         error: true,
         output: {
-          error: error instanceof Error ? error.message : "Testing delegation failed",
+          error:
+            rejection?.message ??
+            (error instanceof Error ? error.message : "Testing delegation failed"),
+          ...(rejection?.decisions ? { decisions: rejection.decisions } : {}),
         },
       };
     }
@@ -176,7 +181,7 @@ async function finishChatRun(
 export async function executeRun(run: AcceptedRun) {
   if (
     ![BUILD, PREVIOUS_BUILD].includes(run.build) ||
-    run.model !== MODEL ||
+    run.model !== agentRegistry.main.model ||
     (run.side && run.build !== BUILD)
   ) {
     throw new Error("Incompatible run build");
@@ -197,7 +202,7 @@ export async function executeRun(run: AcceptedRun) {
       }
     },
     signal,
-    run.side ? "ordinary" : "main",
+    run.side ? "side" : "main",
   );
 }
 
@@ -210,7 +215,7 @@ const executions = new Map<string, Execution>();
 const priorProcessQuiet = new Set<string>();
 
 export async function ensureStarted(run: AcceptedRun) {
-  if (![BUILD, PREVIOUS_BUILD].includes(run.build) || run.model !== MODEL) {
+  if (![BUILD, PREVIOUS_BUILD].includes(run.build) || run.model !== agentRegistry.main.model) {
     throw new RunRequestError(409, "Incompatible run build");
   }
 
@@ -381,7 +386,10 @@ export async function reconcileRuns() {
   const pending = await listPendingRuns();
 
   for (const run of pending) {
-    if (![BUILD, PREVIOUS_BUILD].includes(run.accepted.build) || run.accepted.model !== MODEL) {
+    if (
+      ![BUILD, PREVIOUS_BUILD].includes(run.accepted.build) ||
+      run.accepted.model !== agentRegistry.main.model
+    ) {
       continue;
     }
 
@@ -403,11 +411,20 @@ let stopReconciliation: AbortController | undefined;
 export async function launchChatRuntime() {
   DBOS.setConfig({
     name: "chum-bucket-chat",
-    applicationVersion: PREVIOUS_BUILD,
+    applicationVersion: BUILD,
     systemDatabaseUrl: process.env.DATABASE_URL,
   });
 
   try {
+    await assertDelegationCutover();
+    const pending = await listPendingRuns();
+
+    if (pending.some((run) => !run.accepted.side && run.accepted.build !== BUILD)) {
+      throw new Error(
+        "Legacy main runs are active. Maintenance is required before delegation cutover; no records were changed.",
+      );
+    }
+
     await abandonPriorProcessSides();
     await DBOS.launch();
 

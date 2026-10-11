@@ -277,7 +277,7 @@ test("planner keeps zero-binding codemode, rejects every native call, and never 
           ]) {
             await assert.rejects(
               () => tools.executeTool([], modelCall(name), context),
-              new RegExp(`not available to the planner role`),
+              new RegExp(`Unknown tool|not available to the planner role`),
             );
           }
 

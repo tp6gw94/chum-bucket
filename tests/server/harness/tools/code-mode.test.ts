@@ -10,7 +10,8 @@ import {
   composeCodeModeTurn,
   type CodeModePolicy,
 } from "../../../../server/harness/tools/code-mode";
-import { withRunTools, type RunTools } from "../../../../server/harness/tools/index";
+import type { RunTools } from "../../../../server/harness/tools/index";
+import { withCatalogTools as withRunTools } from "../../../fixtures/catalog-tools";
 import {
   coreTools,
   fakeToken,

@@ -150,6 +150,22 @@ function parseJson(content) {
   }
 }
 
+export const anchorScenarioSource = Array.from(
+  { length: 7 },
+  (_, index) => `AC-${index + 1}: Observable requirement ${index + 1} must hold.`,
+)
+  .join(" ")
+  .padEnd(456, ".");
+
+export const planningMixedPrompt =
+  "Plan CHUM-42 functional checks only. No execution URL or UI validation is needed.";
+export const planningMixedIntent = {
+  goal: "Verify checkout",
+  sources: [{ kind: "jira", issueKey: "CHUM-42" }],
+  criteria: { kind: "all" },
+  executionRoles: [],
+};
+
 export function scriptedEvents(options, control = {}) {
   const messages = options.messages ?? [];
   const { role, task } = parseTask(
@@ -159,11 +175,69 @@ export function scriptedEvents(options, control = {}) {
   const identity = eventIdentity(options, role);
 
   if (role === "main") {
-    if (toolOutputs.length === 0) {
-      return toolEvents(identity, "run_tests", control.intent);
+    if (control.ordinary) return textEvents(identity, "一般對話可用。");
+    const lastUser = messages.findLastIndex((message) => message.role === "user");
+    const results = messages.slice(lastUser + 1).filter((message) => message.role === "tool");
+    const intent = control.intent ?? {};
+    if (results.length === 0) {
+      return toolEvents(
+        identity,
+        "delegate_task",
+        intent.role
+          ? intent
+          : {
+              role: "atlassian",
+              summary: intent.summary ?? "Read checkout requirements",
+              goal: intent.goal,
+              sources: intent.sources,
+              criteria: intent.criteria,
+            },
+      );
     }
-
-    return textEvents(identity, "測試已提交。");
+    if (intent.role) {
+      return textEvents(identity, "委派任務已完成。");
+    }
+    const views = results.map((message) => parseJson(textOf(message)));
+    if (views.some((view) => !view || view.error)) {
+      return textEvents(identity, "委派任務遭拒。未啟動其他角色。");
+    }
+    const requirements = views.find((view) => view.task?.role === "atlassian")?.task?.result?.ref;
+    const planned = views.find((view) => view.task?.role === "planner");
+    const planRef = planned?.task?.result?.ref;
+    if (!planned) {
+      return toolEvents(identity, "delegate_task", {
+        role: "planner",
+        summary: "Plan checkout acceptance checks",
+        requirementsRef: requirements,
+        ...(intent.design ? { design: intent.design } : {}),
+      });
+    }
+    const nextRole = (intent.executionRoles ?? []).find(
+      (candidate) => !views.some((view) => view.task?.role === candidate),
+    );
+    if (nextRole) {
+      return toolEvents(identity, "delegate_task", {
+        role: nextRole,
+        summary: `Run ${nextRole} checkout checks`,
+        planRef,
+        targetUrl: intent.targetUrl,
+      });
+    }
+    if (control.planningMixed) {
+      const reply = [
+        "Here's the functional-only plan. Ordinary unresolved notes did not prevent planning.",
+        "",
+        "root = Stack([title, detail, continueButton])",
+        'title = TextContent("Functional plan ready")',
+        `detail = TextContent(${JSON.stringify(`Requirements ${requirements}; plan ${planRef}; no execution URL.`)})`,
+        'continueButton = Button("Continue", Action([@ToAssistant("Continue")]), "primary")',
+        "Middle prose. UI validation is not required.",
+        'root = Stack([TextContent("No UI child was started")])',
+        "Trailing prose. This was deterministic fixture replay, not live model or website validation.",
+      ].join("\n");
+      return textEvents(identity, reply, 24);
+    }
+    return textEvents(identity, "委派任務已完成。測試計畫與產物參照已保留，瀏覽器結果僅為模擬。");
   }
 
   if (role === "atlassian") {
@@ -188,6 +262,45 @@ export function scriptedEvents(options, control = {}) {
         ? sourceResponse.output
         : sourceResponse;
     const anchor = leaves(capturedOutput)[0];
+    const scenario =
+      control.atlassianScenario ?? (task.summary?.startsWith("anchor-") ? task.summary : undefined);
+    if (scenario) {
+      const feedback = messages
+        .filter((message) => message.role === "user")
+        .map(textOf)
+        .find((text) => text.startsWith("Private validation failed:"));
+      if (
+        scenario === "anchor-not-extractable" ||
+        scenario === "anchor-malformed-failure" ||
+        scenario === "anchor-incomplete-captures"
+      ) {
+        return textEvents(
+          identity,
+          JSON.stringify({
+            kind: "not_extractable",
+            unresolved:
+              scenario === "anchor-malformed-failure" && !feedback
+                ? []
+                : ["Synthetic source has no testable behavior"],
+          }),
+        );
+      }
+      const ref = sourceResponse?.sourceCapture?.anchorRefs?.find(
+        (item) => item.text === anchorScenarioSource,
+      );
+      const criteria = Array.from({ length: 7 }, (_, index) => ({
+        key: `AC-${index + 1}`,
+        statement: `Observable requirement ${index + 1} must hold`,
+        source: task.sources[0],
+        anchorId: ref?.id ?? "missing-host-anchor",
+      }));
+      if ((scenario === "anchor-repair" || scenario === "anchor-rejected") && !feedback) {
+        criteria[0].anchorId = "fake-anchor-id";
+        criteria[1].key = "AC-1";
+      }
+      if (scenario === "anchor-rejected" && feedback) criteria[0].anchorId = "still-fake";
+      return textEvents(identity, JSON.stringify({ criteria, unresolved: [] }));
+    }
 
     return textEvents(
       identity,
@@ -200,20 +313,39 @@ export function scriptedEvents(options, control = {}) {
             anchor,
           },
         ],
-        unresolved: [],
+        unresolved: control.planningMixed
+          ? [
+              "Price rule is not specified",
+              "Execution URL is not supplied",
+              "UI validation is not required",
+            ]
+          : [],
       }),
     );
   }
 
   if (role === "planner") {
-    const checks = [
-      {
-        id: "check-1",
-        criterionId: task.requirements?.criteria?.[0]?.id ?? "crit:missing",
-        kind: "functional",
-        expectedObservation: "UNIQUE-EXPECTED",
-      },
-    ];
+    const universe = task.requirements?.criteria ?? [];
+    const selected =
+      task.requirements?.selection?.kind === "selected"
+        ? universe.filter((criterion) => task.requirements.selection.keys.includes(criterion.key))
+        : universe;
+    const checks =
+      selected.length > 1 || task.requirements?.selection?.kind === "selected"
+        ? selected.map((criterion, index) => ({
+            id: `check-${index + 1}`,
+            criterionId: criterion.id,
+            kind: "functional",
+            expectedObservation: "UNIQUE-EXPECTED",
+          }))
+        : [
+            {
+              id: "check-1",
+              criterionId: selected[0]?.id ?? "crit:missing",
+              kind: "functional",
+              expectedObservation: "UNIQUE-EXPECTED",
+            },
+          ];
 
     if (task.design) {
       checks.push({
@@ -301,11 +433,15 @@ function toolEvents(identity, name, input) {
   ];
 }
 
-function textEvents(identity, text) {
+function textEvents(identity, text, chunkSize = text.length || 1) {
   return [
     { type: "RUN_STARTED", threadId: identity.threadId, runId: identity.runId },
     { type: "TEXT_MESSAGE_START", messageId: identity.messageId, role: "assistant" },
-    { type: "TEXT_MESSAGE_CONTENT", messageId: identity.messageId, delta: text },
+    ...Array.from({ length: Math.ceil(text.length / chunkSize) }, (_, index) => ({
+      type: "TEXT_MESSAGE_CONTENT",
+      messageId: identity.messageId,
+      delta: text.slice(index * chunkSize, (index + 1) * chunkSize),
+    })),
     { type: "TEXT_MESSAGE_END", messageId: identity.messageId },
     { type: "RUN_FINISHED", threadId: identity.threadId, runId: identity.runId },
   ];

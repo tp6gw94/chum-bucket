@@ -9,7 +9,8 @@ import { DBOS } from "@dbos-inc/dbos-sdk";
 import { createReadTool, createWriteTool, createEditTool } from "@earendil-works/pi-coding-agent";
 import { read } from "../../../server/harness/tools/fs";
 import type { ModelTool } from "../../../server/harness/tools/atlassian";
-import { withRunTools, type RunTools } from "../../../server/harness/tools";
+import type { RunTools } from "../../../server/harness/tools";
+import { withCatalogTools as withRunTools } from "../../fixtures/catalog-tools";
 import {
   mcpFixture,
   jiraSchema,
@@ -32,7 +33,8 @@ import {
   type StreamChunk,
   type UIMessage,
 } from "@tanstack/ai";
-import { acceptRun, reconcileRuns, executeRun } from "../../../server/harness/run";
+import { acceptRun, reconcileRuns, executeRun, ensureStarted } from "../../../server/harness/run";
+import { agentRegistry } from "../../../server/harness/agents";
 import { snapshot, streamModelTurn, type Turn } from "../../../server/harness/model-turn";
 import { COMPACT_TOKEN_THRESHOLD } from "../../../server/harness/compaction";
 import {
@@ -1708,8 +1710,29 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
     message: accepted.message,
   };
 
+  const admissionPrompt = mock.method(
+    agentRegistry.main,
+    "systemPrompt",
+    () => "Registry admission snapshot",
+  );
+  t.after(() => admissionPrompt.mock.restore());
+
   try {
     await assert.rejects(acceptRun(input), /Start unavailable/);
+    const persisted = runs.get(input.runId)!.accepted as AcceptedRun;
+    assert.equal(persisted.prompt, "Registry admission snapshot");
+    assert.equal(persisted.model, "deepseek-ai/DeepSeek-V4.1-Flash");
+    admissionPrompt.mock.restore();
+    const originalModel = agentRegistry.main.model;
+    Object.defineProperty(agentRegistry.main, "model", { value: "snapshot-model-mismatch" });
+    try {
+      await assert.rejects(ensureStarted(persisted), /Incompatible run build/);
+      await assert.rejects(executeRun(persisted), /Incompatible run build/);
+      await reconcileRuns();
+      assert.deepEqual(started, []);
+    } finally {
+      Object.defineProperty(agentRegistry.main, "model", { value: originalModel });
+    }
     assert.equal(statements[0], "begin");
     assert.ok(statements[1]?.includes("from side_chats"));
     assert.ok(statements[2]?.endsWith("from threads where id = $1 for update"));
@@ -1721,6 +1744,11 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
     assert.deepEqual(started, [accepted.runId]);
     const attached = await acceptRun(input);
     assert.equal(attached.messages[0]!.id, "user-1");
+    assert.equal(attached.prompt, "Registry admission snapshot");
+    assert.equal(
+      (runs.get(input.runId)!.accepted as AcceptedRun).prompt,
+      "Registry admission snapshot",
+    );
     await assert.rejects(
       acceptRun({ ...input, message: { id: "changed", text: "changed" } }),
       /collision/,
@@ -1884,10 +1912,14 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
       async function* (options: {
         tools?: { name: string; execute?: unknown; inputSchema?: unknown }[];
         messages: unknown;
+        model: string;
+        systemPrompts: string[];
       }) {
+        assert.equal(options.model, "deepseek-ai/DeepSeek-V4.1-Flash");
+        assert.equal(options.systemPrompts[0], nextRun.prompt);
         assert.deepEqual(
           options.tools?.map((tool) => tool.name),
-          ["get_figma", "read", "write", "edit", "run_tests", "codemode"],
+          ["get_figma", "read", "write", "edit", "delegate_task", "codemode"],
         );
         assert.ok(options.tools?.every((tool) => !("execute" in tool) && tool.inputSchema));
 
@@ -2198,7 +2230,7 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
         }) {
           assert.deepEqual(
             options.tools?.map((tool) => tool.name),
-            ["get_figma", "read", "write", "edit", "run_tests", "codemode"],
+            ["get_figma", "read", "write", "edit", "delegate_task", "codemode"],
           );
           assert.ok(options.tools?.every((tool) => !("execute" in tool) && tool.inputSchema));
 
@@ -2376,15 +2408,7 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
             if (!toolIds.length) {
               assert.deepEqual(
                 options.tools?.map((tool) => tool.name),
-                [
-                  "get_figma",
-                  "read",
-                  "write",
-                  "edit",
-                  "discover_atlassian_tools",
-                  "run_tests",
-                  "codemode",
-                ],
+                ["get_figma", "read", "write", "edit", "delegate_task", "codemode"],
               );
               yield {
                 type: EventType.TEXT_MESSAGE_START,
@@ -2406,22 +2430,7 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
             } else if (!toolIds.some((id) => nativeCalls.some((call) => call.id === id))) {
               assert.deepEqual(
                 options.tools?.map((tool) => tool.name),
-                [
-                  "get_figma",
-                  "read",
-                  "write",
-                  "edit",
-                  "jira_get_issue",
-                  "jira_search",
-                  "confluence_get_page",
-                  "discover_atlassian_tools",
-                  "run_tests",
-                  "codemode",
-                ],
-              );
-              assert.deepEqual(
-                options.tools?.find((tool) => tool.name === "jira_get_issue")?.inputSchema,
-                jiraSchema,
+                ["get_figma", "read", "write", "edit", "delegate_task", "codemode"],
               );
 
               for (const call of nativeCalls) {
@@ -2455,40 +2464,17 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
               results.map((event) => event.toolCallId),
               ["mcp-discovery", ...nativeCalls.map((call) => call.id)],
             );
-            assert.deepEqual(
-              (JSON.parse(results[0]!.content) as { tools: ModelTool[] }).tools.map(
-                (tool) => tool.name,
-              ),
-              discoveryInput.toolNames,
-            );
-            assert.deepEqual(JSON.parse(results[2]!.content), { issue: "TEST-1" });
-            assert.match(JSON.parse(results[3]!.content).error, /Atlassian MCP tool failed/);
-            assert.deepEqual(JSON.parse(results[4]!.content), {
-              error: "Tool data contains configured Atlassian credentials",
-            });
+
+            for (const result of results) {
+              assert.deepEqual(JSON.parse(result.content), { error: "Unknown tool" });
+            }
+
             assert.deepEqual(
               results.map((event) => event.metadata),
-              [
-                { tanstack: { state: "output-available" } },
-                { tanstack: { state: "output-available" } },
-                { tanstack: { state: "output-available" } },
-                { tanstack: { state: "output-error" } },
-                { tanstack: { state: "output-error" } },
-              ],
+              Array.from({ length: 5 }, () => ({ tanstack: { state: "output-error" } })),
             );
-            assert.deepEqual(
-              fixture.calls().map((request) => request.message!.params),
-              [
-                { name: "jira_search", arguments: { jql: "project = TEST" } },
-                {
-                  name: "jira_get_issue",
-                  arguments: { issue_key: "TEST-1", update_history: false },
-                },
-                { name: "jira_search", arguments: { jql: "invalid" } },
-                { name: "confluence_get_page", arguments: { page_id: "123" } },
-              ],
-            );
-            assert.equal(fixture.sessions.length, 3);
+            assert.deepEqual(fixture.calls(), []);
+            assert.equal(fixture.sessions.length, 0);
             assert.equal(nativeModelCalls, 3);
             assert.equal(runs.get(mcpRun.runId)!.state, "succeeded");
             assert.equal(threads.get(mcpThread)!.revision, 1);
@@ -2580,22 +2566,7 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
             assert.equal(cached.has("tool:0:0"), true);
             assert.equal(cached.has("tool:0:1"), false);
             await executeRun(gapRun);
-            assert.deepEqual(
-              fixture
-                .calls()
-                .slice(beforeGap)
-                .map((request) => request.message!.params),
-              [
-                {
-                  name: "jira_get_issue",
-                  arguments: { issue_key: "TEST-1", update_history: false },
-                },
-                {
-                  name: "jira_get_issue",
-                  arguments: { issue_key: "TEST-1", update_history: false },
-                },
-              ],
-            );
+            assert.equal(fixture.calls().length, beforeGap);
             const afterGap = fixture.requests.length;
             await executeRun(gapRun);
             assert.equal(fixture.requests.length, afterGap);
@@ -2654,8 +2625,8 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
           try {
             await assert.rejects(executeRun(limitRun), /Model iteration limit exceeded/);
             assert.equal(turns, 20);
-            assert.equal(limitFixture.calls().length, 20);
-            assert.equal(limitFixture.sessions.length, 1);
+            assert.equal(limitFixture.calls().length, 0);
+            assert.equal(limitFixture.sessions.length, 0);
             await limitFixture.assertClosed();
             assert.equal(cached.has("finish"), false);
             assert.equal(runs.get(limitRun.runId)!.state, "pending");

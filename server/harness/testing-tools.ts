@@ -20,10 +20,11 @@ import {
   type TestingRequestInput,
 } from "../../shared/testing";
 import type { ModelCall } from "./model-turn";
-import { capabilityToolNames, roleRegistry } from "./agents";
+import { allowsTool, capabilityToolNames, roleRegistry } from "./agents";
 import {
   checksForRole,
   digestOf,
+  sourceCaptureView,
   type CanonicalPlan,
   type Requirements,
   type SourceCapture,
@@ -34,7 +35,6 @@ import {
   type AtlassianScope,
   type ModelTool,
 } from "./tools/atlassian";
-import { atlassianTools } from "./tools/atlassian-policy";
 import { codeModeToolName, composeCodeModeTurn, type CodeModeTurn } from "./tools/code-mode";
 import { getFigma } from "./tools/get-figma";
 import {
@@ -113,16 +113,10 @@ type NativeDispatch = (
 
 type BrowserTool = ReturnType<typeof createUseBrowserTool>;
 
-const requiredAtlassianReadNames: readonly string[] = [...atlassianTools]
-  .filter(([, policy]) => policy.required)
-  .map(([name]) => name);
-
 export function testingRoleToolNames(role: RoleId): readonly string[] {
-  return roleRegistry[role].capabilities.flatMap((capability) => {
-    const name = capabilityToolNames[capability];
-
-    return name === null ? requiredAtlassianReadNames : [name];
-  });
+  return roleRegistry[role].capabilities.flatMap(
+    (capability: keyof typeof capabilityToolNames) => capabilityToolNames[capability],
+  );
 }
 
 function roleNativeNames(role: RoleId): ReadonlySet<string> {
@@ -162,6 +156,7 @@ function envelopeOf(value: unknown): TestingNativeEnvelope {
 }
 
 function roleRunTools(options: {
+  role: RoleId;
   definitions: (messages: readonly UIMessage[]) => Promise<readonly ModelTool[]>;
   dispatch: (messages: readonly UIMessage[]) => NativeDispatch;
   guard: (value: unknown) => void;
@@ -183,6 +178,11 @@ function roleRunTools(options: {
     (call: ModelCall, context: ToolExecutionContext, route: TestingNativeRoute) => {
       context.abortSignal?.throwIfAborted();
       options.signal?.throwIfAborted();
+
+      if (!allowsTool(options.role, call.name, route)) {
+        throw new Error("Unknown tool");
+      }
+
       const work = options.dispatch(messages)(call, contextFor(context), route);
       pending.add(work);
       void work.then(
@@ -313,6 +313,7 @@ async function atlassianRoleTools(
   const allowed = roleNativeNames("atlassian");
 
   return roleRunTools({
+    role: "atlassian",
     signal,
     guard: await scope.guard(),
     definitions: async (messages) => {
@@ -371,13 +372,14 @@ async function atlassianRoleTools(
         nativeReceipt: { receiptId: envelope.receiptId, outputDigest: envelope.outputDigest },
       });
 
-      return { output: envelope.output, sourceCapture };
+      return { output: envelope.output, sourceCapture: sourceCaptureView(sourceCapture) };
     },
   });
 }
 
 function plannerRoleTools(signal?: AbortSignal): RoleRun {
   return roleRunTools({
+    role: "planner",
     signal,
     guard: () => undefined,
     definitions: async () => [],
@@ -475,6 +477,7 @@ function acRoleTools(input: TestingRoleToolsInput, signal?: AbortSignal): RoleRu
   const definition = definitionOf(browser);
 
   return roleRunTools({
+    role: "ac",
     signal,
     guard: () => undefined,
     definitions: async () => [definition],
@@ -645,6 +648,7 @@ function uiRoleTools(input: TestingRoleToolsInput, signal?: AbortSignal): RoleRu
   };
 
   return roleRunTools({
+    role: "ui",
     signal,
     guard: () => undefined,
     definitions: async () => [

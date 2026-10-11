@@ -38,7 +38,8 @@ import {
   type TestingNativeReceiptReference,
 } from "./testing-tools";
 import { runAgentLoop, type AgentCheckpoint, type AgentSession } from "./agent-loop";
-import { roleFeedbackPrompt, roleSystemPrompt, roleTaskPrompt } from "./agents";
+import { roleRegistry, roleSystemPrompt } from "./agents";
+import { roleFeedbackPrompt, roleTaskPrompt } from "./prompts";
 import type { ConversationState } from "./conversation";
 import {
   browserOutputSchema,
@@ -185,11 +186,25 @@ async function settleTransport(workflowId: string, transport: Transport): Promis
   }
 }
 
-export function sourceAnchors(raw: unknown, limit = 24): readonly string[] {
-  const found: string[] = [];
+export function sourceAnchors(raw: unknown, limit = 24, nativeName?: string): readonly string[] {
+  if (nativeName === "jira_get_issue" && isRecord(raw) && typeof raw.result === "string") {
+    try {
+      const issue: unknown = JSON.parse(raw.result);
+
+      if (!isRecord(issue) || typeof issue.key !== "string" || !issue.key.trim()) {
+        return [];
+      }
+
+      raw = [issue.description, issue.key, issue.summary, issue];
+    } catch {
+      return [];
+    }
+  }
+
+  const found = new Set<string>();
 
   const visit = (value: unknown) => {
-    if (found.length >= limit) {
+    if (found.size >= limit) {
       return;
     }
 
@@ -197,7 +212,7 @@ export function sourceAnchors(raw: unknown, limit = 24): readonly string[] {
       const text = value.trim();
 
       if (text.length > 0 && text.length <= 512) {
-        found.push(text);
+        found.add(text);
       }
 
       return;
@@ -218,7 +233,7 @@ export function sourceAnchors(raw: unknown, limit = 24): readonly string[] {
 
   visit(raw);
 
-  return [...new Set(found)];
+  return [...found];
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -435,20 +450,35 @@ function validationIssues(validation: Validation<unknown>): string[] {
   return validation.kind === "rejected" ? [...validation.issues] : [];
 }
 
-function requirementsIssues(execution: TestingExecution, proposal: unknown): string[] {
+function requirementsReview(
+  execution: TestingExecution,
+  proposal: unknown,
+): Pick<ProposalReview, "issues" | "failureReason"> {
   const captures =
     execution.tasks
       .find((task) => task.frame.role === "atlassian")
       ?.receipts.filter((receipt) => receipt.nativeName === SOURCE_CAPTURE_NATIVE)
       .map((receipt) => receipt.output as SourceCapture) ?? [];
 
-  return validationIssues(
-    validateRequirements(proposal, {
-      goal: execution.intent.goal,
-      selection: execution.intent.criteria,
-      captures,
-    }),
+  const decision = validateRequirements(proposal, {
+    goal: execution.intent.goal,
+    selection: execution.intent.criteria,
+    captures,
+  });
+
+  if (decision.kind !== "not_extractable") {
+    return { issues: validationIssues(decision) };
+  }
+
+  const uncoveredSource = execution.intent.sources.some(
+    (source) => !captures.some((capture) => sameSource(capture.reference, source)),
   );
+
+  if (uncoveredSource) {
+    return { issues: ["task.sources: source captures do not cover the request"] };
+  }
+
+  return { issues: [], failureReason: "requirements_not_extractable" };
 }
 
 function planIssues(
@@ -520,10 +550,6 @@ function resultIssues(
 }
 
 function proposalIssues(role: RoleId, execution: TestingExecution, proposal: unknown): string[] {
-  if (role === "atlassian") {
-    return requirementsIssues(execution, proposal);
-  }
-
   const requirements = pinnedRequirements(execution);
 
   if (!requirements) {
@@ -795,7 +821,7 @@ function drained(deliveries: readonly DeliveryRecord[], taskId: string): boolean
   );
 }
 
-async function acknowledgeDrain(input: TestingChildInput): Promise<void> {
+export async function acknowledgeDrain(input: TestingChildInput): Promise<void> {
   for (let attempt = 0; attempt < 8; attempt += 1) {
     await advanceDeliveries(await readStartCancelDeliveries(input.operationId), input.taskId);
 
@@ -1020,7 +1046,7 @@ async function captureSourceReceipt(
     native.input,
     run.execution.intent.sources,
   );
-  const anchors = sourceAnchors(output);
+  const anchors = sourceAnchors(output, 24, native.nativeName);
 
   if (!authorized || !sameSource(authorized, capture.reference) || anchors.length === 0) {
     throw new Error("Source capture is not linked to the requested source");
@@ -1122,7 +1148,11 @@ function childHost(run: ChildRun): TestingNativeHost {
   };
 }
 
-type ProposalReview = { proposal: unknown; issues: string[] };
+type ProposalReview = {
+  proposal: unknown;
+  issues: string[];
+  failureReason?: "requirements_not_extractable";
+};
 
 function reviewProposal(
   input: TestingChildInput,
@@ -1136,7 +1166,9 @@ function reviewProposal(
       try {
         const proposal = extractJson(assistantText(conversation));
 
-        return { proposal, issues: proposalIssues(input.role, latest, proposal) };
+        return input.role === "atlassian"
+          ? { proposal, ...requirementsReview(latest, proposal) }
+          : { proposal, issues: proposalIssues(input.role, latest, proposal) };
       } catch (error) {
         return {
           proposal: null,
@@ -1171,7 +1203,7 @@ async function runRoleLoops(run: ChildRun, tools: RunTools): Promise<TestingChil
     runAgentLoop({
       session,
       conversation,
-      model: execution.runtime.model,
+      model: roleRegistry[input.role].model,
       prompt: run.systemPrompt,
       compaction: { kind: "bounded", maxTurn },
       checkpoint: prefixed(checkpoint, prefix),
@@ -1180,12 +1212,20 @@ async function runRoleLoops(run: ChildRun, tools: RunTools): Promise<TestingChil
   const first = await loop(initial, Math.min(6, execution.runtime.limits.turns), "a");
   const decision = await reviewProposal(input, first.conversation, "proposal");
 
+  if (decision.failureReason) {
+    return { state: "failed", reason: decision.failureReason };
+  }
+
   if (decision.issues.length === 0) {
     return { state: "proposed", proposal: decision.proposal };
   }
 
   const second = await loop(feedbackConversation(first.conversation, decision.issues), 2, "b");
   const again = await reviewProposal(input, second.conversation, "proposal-2");
+
+  if (again.failureReason) {
+    return { state: "failed", reason: again.failureReason };
+  }
 
   return again.issues.length === 0
     ? { state: "proposed", proposal: again.proposal }
@@ -1333,10 +1373,11 @@ function childSession(
         body: { kind: "attempt_started", activity: "model", at: new Date().toISOString() },
       });
       const { deepinfra } = await import("./provider");
-      const { MODEL } = await import("./run-store");
 
-      if (execution.runtime.model !== MODEL) {
-        throw new Error("Testing runtime model is not the host resolver");
+      const model = roleRegistry[input.role].model;
+
+      if (execution.runtime.model !== model) {
+        throw new Error("Testing role model is incompatible with the common runtime snapshot");
       }
 
       let release: () => void = () => undefined;
@@ -1365,7 +1406,7 @@ function childSession(
       };
 
       try {
-        const stream = await deepinfra(MODEL).chatStream(options);
+        const stream = await deepinfra(model).chatStream(options);
 
         return observeStream(stream, settle, signal);
       } catch (error) {

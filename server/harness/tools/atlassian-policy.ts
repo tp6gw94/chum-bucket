@@ -1,16 +1,8 @@
+import { atlassianToolNames } from "../agents";
+
+export { atlassianToolNames };
+
 export type Environment = Readonly<Record<string, string | undefined>>;
-
-export type AtlassianToolPolicy = Readonly<{ required: boolean }>;
-
-export const atlassianTools: ReadonlyMap<string, AtlassianToolPolicy> = new Map([
-  ["jira_get_issue", { required: true }],
-  ["jira_search", { required: false }],
-  ["confluence_get_page", { required: true }],
-  ["confluence_search", { required: false }],
-  ["confluence_get_comments", { required: false }],
-]);
-
-export const atlassianToolNames: readonly string[] = [...atlassianTools.keys()];
 
 export const defaultAtlassianEndpoint = "http://127.0.0.1:8000/mcp";
 

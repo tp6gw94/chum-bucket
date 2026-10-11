@@ -32,6 +32,8 @@ import {
   type PublicEvidence,
   type PublicPlan,
   type PublicTestReport,
+  type PublicTaskArtifact,
+  type ArtifactKind,
   type RequirementCriterion,
   type RoleId,
   type Source,
@@ -110,7 +112,7 @@ export function requirementsScopeDigest(
 export function planScopeDigest(
   input: Readonly<{
     goal: string;
-    targetUrl: string;
+    targetUrl: string | null;
     design: DesignReference | null;
     requirementsDigest: string;
   }>,
@@ -130,6 +132,21 @@ export const sourceCaptureSchema = z.strictObject({
   capturedAt: z.string().trim().min(1).max(64),
 });
 export type SourceCapture = Readonly<z.infer<typeof sourceCaptureSchema>>;
+
+export function sourceCaptureView(capture: SourceCapture) {
+  return {
+    ...capture,
+    anchorRefs: capture.anchors.map((anchor) => ({
+      id: digestOf({
+        namespace: "requirements-anchor-v1",
+        reference: capture.reference,
+        digest: capture.digest,
+        anchor,
+      }),
+      text: anchor,
+    })),
+  };
+}
 
 export type Requirements = Readonly<{
   goal: string;
@@ -172,16 +189,51 @@ function selectedCriteria(
 const requirementsProposalSchema = z.strictObject({
   criteria: z
     .array(
-      z.strictObject({
-        key: z.string().trim().min(1).max(128),
-        statement: z.string().trim().min(1).max(2_000),
-        source: sourceSchema,
-        anchor: z.string().trim().min(1).max(512),
-      }),
+      z
+        .strictObject({
+          key: z.string().trim().min(1).max(128),
+          statement: z.string().trim().min(1).max(2_000),
+          source: sourceSchema,
+          anchor: z.string().trim().min(1).max(512).optional(),
+          anchorId: z.string().trim().min(1).max(128).optional(),
+        })
+        .refine(
+          (criterion) => (criterion.anchor === undefined) !== (criterion.anchorId === undefined),
+          {
+            path: ["anchorId"],
+            message: "exactly one of anchorId or legacy anchor is required",
+          },
+        ),
     )
     .min(1),
   unresolved: z.array(z.string().trim().min(1).max(512)).max(50),
 });
+
+const notExtractableSchema = z.strictObject({
+  kind: z.literal("not_extractable"),
+  unresolved: z.array(z.string().trim().min(1).max(512)).min(1).max(50),
+});
+
+export type RequirementsDecision =
+  | Validation<Requirements>
+  | Readonly<{
+      kind: "not_extractable";
+      unresolved: readonly string[];
+    }>;
+
+function requirementsSchemaIssues(error: z.ZodError): Validation<never> {
+  const issues = error.issues.map((issue) => {
+    const path = issue.path.reduce<string>(
+      (text, part) =>
+        typeof part === "number" ? `${text}[${part}]` : `${text}${text ? "." : ""}${String(part)}`,
+      "",
+    );
+
+    return `${path || "proposal"}: ${issue.message}`;
+  });
+
+  return rejected(issues[0] ?? "requirements rejected", ...issues.slice(1));
+}
 
 export type RequirementsContext = Readonly<{
   goal: string;
@@ -201,56 +253,107 @@ export function sameSource(left: Source, right: Source): boolean {
   return false;
 }
 
+type RequirementProposal = z.infer<typeof requirementsProposalSchema>["criteria"][number];
+
+function resolveRequirementCriterion(
+  proposal: RequirementProposal,
+  captures: readonly SourceCapture[],
+  index: number,
+): Validation<RequirementCriterion> {
+  const capture = captures.find((item) => sameSource(item.reference, proposal.source));
+
+  if (!capture) {
+    return rejected(
+      `criteria[${index}].source: criterion ${proposal.key} references an uncaptured source`,
+    );
+  }
+
+  const anchor =
+    proposal.anchorId === undefined
+      ? proposal.anchor
+      : sourceCaptureView(capture).anchorRefs.find((ref) => ref.id === proposal.anchorId)?.text;
+
+  if (anchor === undefined || !capture.anchors.includes(anchor)) {
+    return rejected(
+      proposal.anchorId === undefined
+        ? `criteria[${index}].anchor: criterion ${proposal.key} references an unknown anchor for this source capture`
+        : `criteria[${index}].anchorId: unknown anchor for host-selected capture ${capture.digest}; use anchorRefs ids ${sourceCaptureView(
+            capture,
+          )
+            .anchorRefs.slice(0, 3)
+            .map((ref) => ref.id)
+            .join(", ")}. Later reads do not replace this capture.`,
+    );
+  }
+
+  return accepted({
+    id: `crit:${proposal.key}`,
+    key: proposal.key,
+    statement: proposal.statement,
+    sourceDigest: capture.digest,
+    anchor,
+  });
+}
+
+function extractRequirementCriteria(
+  proposals: readonly RequirementProposal[],
+  captures: readonly SourceCapture[],
+) {
+  const issues: string[] = [];
+  const keys = new Set<string>();
+  const criteria: RequirementCriterion[] = [];
+
+  for (const [index, proposal] of proposals.entries()) {
+    const duplicate = keys.has(proposal.key);
+
+    if (duplicate) {
+      issues.push(`criteria[${index}].key: duplicate criterion key ${proposal.key}`);
+    }
+
+    keys.add(proposal.key);
+    const resolved = resolveRequirementCriterion(proposal, captures, index);
+
+    if (resolved.kind === "rejected") {
+      issues.push(...resolved.issues);
+    } else if (!duplicate) {
+      criteria.push(resolved.value);
+    }
+  }
+
+  return { criteria, issues };
+}
+
 export function validateRequirements(
   raw: unknown,
   context: RequirementsContext,
-): Validation<Requirements> {
+): RequirementsDecision {
   if (context.captures.length === 0) {
     return rejected("requirements need at least one source capture");
+  }
+
+  if (typeof raw === "object" && raw !== null && "kind" in raw && raw.kind === "not_extractable") {
+    const failure = notExtractableSchema.safeParse(raw);
+
+    return failure.success
+      ? { kind: "not_extractable", unresolved: failure.data.unresolved }
+      : requirementsSchemaIssues(failure.error);
   }
 
   const parsed = requirementsProposalSchema.safeParse(raw);
 
   if (!parsed.success) {
-    return rejected(parsed.error.issues.map((issue) => issue.message).join("; "));
+    return requirementsSchemaIssues(parsed.error);
   }
 
-  const issues: string[] = [];
-  const keys = new Set<string>();
-  const criteria: RequirementCriterion[] = [];
-
-  for (const proposal of parsed.data.criteria) {
-    if (keys.has(proposal.key)) {
-      issues.push(`duplicate criterion key ${proposal.key}`);
-      continue;
-    }
-
-    keys.add(proposal.key);
-    const capture = context.captures.find((item) => sameSource(item.reference, proposal.source));
-
-    if (!capture) {
-      issues.push(`criterion ${proposal.key} references an uncaptured source`);
-      continue;
-    }
-
-    if (!capture.anchors.includes(proposal.anchor)) {
-      issues.push(`criterion ${proposal.key} references an unknown anchor`);
-      continue;
-    }
-
-    criteria.push({
-      id: `crit:${proposal.key}`,
-      key: proposal.key,
-      statement: proposal.statement,
-      sourceDigest: capture.digest,
-      anchor: proposal.anchor,
-    });
-  }
+  const { criteria, issues } = extractRequirementCriteria(parsed.data.criteria, context.captures);
 
   const selected = selectedCriteria(criteria, context.selection);
 
   for (const key of selected.missingKeys) {
-    issues.push(`selected criterion ${key} is missing from the extraction`);
+    const index = context.selection.kind === "selected" ? context.selection.keys.indexOf(key) : 0;
+    issues.push(
+      `task.criteria.keys[${index}]: selected criterion ${key} is missing from the extraction`,
+    );
   }
 
   if (issues.length > 0) {
@@ -272,7 +375,7 @@ export type PlanContext = Readonly<{
   requirements: Requirements;
   requirementsDigest: string;
   goal: string;
-  targetUrl: string;
+  targetUrl: string | null;
   design: DesignReference | null;
   bounds: Readonly<{ maxCases: number; maxChecks: number; maxChecksPerCase: number }>;
 }>;
@@ -280,7 +383,7 @@ export type PlanContext = Readonly<{
 export type CanonicalPlan = Readonly<{
   requirementsDigest: string;
   goal: string;
-  targetUrl: string;
+  targetUrl: string | null;
   design: DesignReference | null;
   cases: readonly PlanCase[];
   assignments: Readonly<{ ac: readonly string[]; ui: readonly string[] }>;
@@ -831,7 +934,7 @@ export type ReuseContext =
       planContext: PlanContext;
     }>;
 
-const requirementsPayloadSchema = z.strictObject({
+export const requirementsPayloadSchema = z.strictObject({
   goal: z.string().min(1).max(2_000),
   selection: criteriaSelectionSchema,
   criteria: z.array(requirementCriterionSchema).min(1),
@@ -839,10 +942,10 @@ const requirementsPayloadSchema = z.strictObject({
   captures: z.array(sourceCaptureSchema).min(1),
 });
 
-const planPayloadSchema = z.strictObject({
+export const planPayloadSchema = z.strictObject({
   requirementsDigest: z.string().min(1).max(128),
   goal: z.string().min(1).max(2_000),
-  targetUrl: z.string().min(1).max(2_048),
+  targetUrl: z.string().min(1).max(2_048).nullable(),
   design: designReferenceSchema.nullable(),
   cases: z.array(planCaseSchema).min(1),
   assignments: z.strictObject({
@@ -1254,6 +1357,26 @@ function publicRequirements(requirements: Requirements | null): PublicTestReport
         unresolved: requirements.unresolved,
       }
     : null;
+}
+
+export function publicTaskArtifact(
+  artifact: Readonly<{ ref: string; kind: ArtifactKind; payload: unknown }>,
+): PublicTaskArtifact {
+  const ref = artifactRefSchema.parse(artifact.ref);
+
+  switch (artifact.kind) {
+    case "requirements":
+      return {
+        ref,
+        kind: artifact.kind,
+        payload: publicRequirements(artifact.payload as Requirements)!,
+      };
+    case "plan":
+      return { ref, kind: artifact.kind, payload: publicPlan(artifact.payload as CanonicalPlan)! };
+    case "ac-result":
+    case "ui-result":
+      return { ref, kind: artifact.kind, payload: publicResults(artifact.payload as Results) };
+  }
 }
 
 export function deriveReport(input: ReportInput): PublicTestReport {

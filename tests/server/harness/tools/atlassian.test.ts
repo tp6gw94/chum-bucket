@@ -9,7 +9,11 @@ import type { ToolExecutionContext, UIMessage } from "@tanstack/ai";
 import type { ModelCall } from "../../../../server/harness/model-turn";
 import { withAtlassianScope, type ModelTool } from "../../../../server/harness/tools/atlassian";
 import { read } from "../../../../server/harness/tools/fs";
-import { withRunTools, type RunTools } from "../../../../server/harness/tools/index";
+import {
+  withRunTools as withConversationTools,
+  type RunTools,
+} from "../../../../server/harness/tools/index";
+import { withCatalogTools as withRunTools } from "../../../fixtures/catalog-tools";
 import {
   allTools,
   coreTools,
@@ -276,6 +280,35 @@ test("unconfigured runs expose local tools and execute filesystem reads without 
     false,
     fixture,
   );
+});
+
+test("main scope never initializes the remote catalog and denies Atlassian on every entry", async () => {
+  const fixture = mcpFixture();
+  await withMcpEnvironment(
+    () =>
+      withConversationTools(
+        async (tools) => {
+          assert.deepEqual(
+            (await modelTools(tools, [])).map((tool) => tool.name),
+            [...advertised(localNames).slice(0, -1), "delegate_task", codeModeName],
+          );
+          const forged = await discover(tools, ["jira_get_issue"]).catch(() => [] as UIMessage[]);
+          await assert.rejects(
+            tools.executeTool(forged, jiraCall, context),
+            /Unknown tool|not available/,
+          );
+          await assert.rejects(
+            tools.executeTool([], discoveryCall(["jira_get_issue"]), context),
+            /Unknown tool|not available/,
+          );
+        },
+        undefined,
+        "main",
+      ),
+    true,
+    fixture,
+  );
+  assert.deepEqual(fixture.requests, []);
 });
 
 test("partial, malformed, and endpoint-only configuration fails closed before local or remote work", async () => {

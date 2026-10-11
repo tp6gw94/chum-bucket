@@ -91,18 +91,26 @@ test("explicit bad refs and cross-run results reject without dropping any ref", 
   );
 });
 
-test("old agent profile artifacts are incompatible even when their requirements remain valid", () => {
+test("planner accepts grounded unresolved requirements with false completeness while retaining snapshot guards", () => {
   const source = { kind: "jira" as const, issueKey: "CHUM-42" };
   const intent: TestingRequestInput = {
     goal: "Verify checkout",
     sources: [source],
     criteria: { kind: "all" },
-    targetUrl: "https://preview.example.test/checkout",
+    targetUrl: null,
+    task: {
+      version: 2,
+      input: {
+        role: "planner",
+        summary: "Plan functional checks",
+        requirementsRef: artifactRefSchema.parse("requirements-profile-artifact"),
+      },
+    },
   };
   const requirements = validateRequirements(
     {
       criteria: [{ key: "AC-1", statement: "Receipt appears", source, anchor: "AC-1" }],
-      unresolved: [],
+      unresolved: ["Price rule is not specified", "Execution URL is not supplied"],
     },
     {
       goal: intent.goal,
@@ -136,7 +144,7 @@ test("old agent profile artifacts are incompatible even when their requirements 
     attempt: 1,
     inputDigest: "input",
     outputDigest: digestOf(requirements.value),
-    complete: true,
+    complete: false,
   };
   const artifact = row({
     ref,
@@ -159,6 +167,37 @@ test("old agent profile artifacts are incompatible even when their requirements 
       host,
     });
   assert.equal(decide(artifact)[0]?.kind, "accepted");
+  assert.deepEqual(
+    closureDecisions({
+      threadId: "thread-1",
+      intent: { ...intent, task: undefined },
+      refs: [ref],
+      rows: new Map([[ref, artifact]]),
+      host,
+    }),
+    [{ ref, kind: "rejected", reason: "incomplete" }],
+  );
+  const rejections: [StoredArtifactRow, string][] = [
+    [{ ...artifact, threadId: "foreign-thread" }, "not_accessible"],
+    [{ ...artifact, origin: { ...artifact.origin, role: "planner" } }, "untrusted_producer"],
+    [{ ...artifact, payloadDigest: "tampered" }, "invalid_evidence"],
+    [{ ...artifact, scopeDigest: "tampered" }, "scope_mismatch"],
+    [
+      {
+        ...artifact,
+        payload: { ...requirements.value, captures: [] },
+        payloadDigest: digestOf({ ...requirements.value, captures: [] }),
+      },
+      "incomplete",
+    ],
+    [
+      { ...artifact, dependencies: [artifactRefSchema.parse("missing-dependency")] },
+      "dependency_rejected",
+    ],
+  ];
+  for (const [candidate, reason] of rejections) {
+    assert.deepEqual(decide(candidate), [{ ref, kind: "rejected", reason }]);
+  }
   assert.deepEqual(
     decide({
       ...artifact,

@@ -1,10 +1,12 @@
 import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
-import { and, asc, desc, eq, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
 import type { StreamChunk } from "@tanstack/ai";
-import { testingProjectionEvent } from "../../shared/testing-event";
+import { parseTestView, testingProjectionEvent } from "../../shared/testing-event";
 import { z } from "zod";
 import {
+  chatEventsTable,
+  chatRunsTable,
   testingArtifactsTable,
   testingDecisionsTable,
   testingDeliveriesTable,
@@ -20,7 +22,9 @@ import {
   TestingRequestError,
   artifactRefSchema,
   testRunIdSchema,
-  testingRequestInputSchema,
+  testingIntentSchema,
+  delegationInputSchema,
+  type DelegationInput,
   browserOutputSchema,
   designCaptureSchema,
   type ArtifactKind,
@@ -32,8 +36,8 @@ import {
   type RootRunOutcome,
   type Source,
   type TaskOutcome,
+  type TaskMessageOrigin,
   type TestView,
-  type TestingRequest,
   type TestingRequestInput,
 } from "../../shared/testing";
 import {
@@ -42,7 +46,10 @@ import {
   deriveReport,
   digestOf,
   planScopeDigest,
+  planPayloadSchema,
+  requirementsPayloadSchema,
   projectProgress,
+  publicTaskArtifact,
   requirementsScopeDigest,
   sameSource,
   sourceCaptureSchema,
@@ -58,6 +65,7 @@ import {
   type Validation,
 } from "./testing-domain";
 import { roleRegistry } from "./agents";
+import { readProjection } from "./conversation";
 
 export const TESTING_WORKFLOW_VERSION = "testing-child-v1";
 const TESTING_SCHEMA_VERSION = "supervised-testing-schema-v1";
@@ -519,7 +527,12 @@ function snapshotRejection(
     return "dependency_rejected";
   }
 
-  return reusableSnapshot(row) ? null : "incomplete";
+  return reusableSnapshot(
+    row,
+    input.intent.task?.input.role === "planner" ? "planning" : "execution",
+  )
+    ? null
+    : "incomplete";
 }
 
 function storedRowRejection(
@@ -555,10 +568,21 @@ function classifyRef(ref: string, input: ClassifyInput): ReuseDecision {
   return reusePlan(parsedRef.data, row, input.threadId, input.intent, input.rows, input.host);
 }
 
-function reusableSnapshot(row: StoredArtifactRow): boolean {
+function reusableSnapshot(
+  row: StoredArtifactRow,
+  purpose: "planning" | "execution" = "execution",
+): boolean {
   const metadata = metadataSchema.safeParse(row.metadata);
 
-  if (!metadata.success || metadata.data.complete !== true) {
+  if (!metadata.success) {
+    return false;
+  }
+
+  if (row.kind === "requirements" && purpose === "planning") {
+    return true;
+  }
+
+  if (metadata.data.complete !== true) {
     return false;
   }
 
@@ -622,12 +646,13 @@ function reusePlan(
     return rejectedDecision(ref, "dependency_rejected");
   }
 
+  const targetUrl = intent.task ? storedPlanTarget(row.payload) : intent.targetUrl;
   const validation = validateReuse(storedPayload(row), {
     requested: "plan",
     threadId,
     expectedScopeDigest: planScopeDigest({
       goal: intent.goal,
-      targetUrl: intent.targetUrl,
+      targetUrl,
       design: intent.design ?? null,
       requirementsDigest: requirements.payloadDigest,
     }),
@@ -635,13 +660,17 @@ function reusePlan(
       requirements: requirementsValidation.value.payload,
       requirementsDigest: digestOf(requirementsValidation.value.payload),
       goal: intent.goal,
-      targetUrl: intent.targetUrl,
+      targetUrl,
       design: intent.design ?? null,
       bounds: host.bounds,
     },
   });
 
   return decisionFromValidation(ref, validation);
+}
+
+function storedPlanTarget(payload: unknown): string | null {
+  return planPayloadSchema.safeParse(payload).data?.targetUrl ?? null;
 }
 
 function storedPayload(row: StoredArtifactRow): unknown {
@@ -787,7 +816,7 @@ export async function admitAttachedInTransaction(
 ): Promise<TestingAdmission> {
   assertHostRuntime(runtime);
   const callId = callKeySchema.safeParse(mainModelCallId);
-  const parsed = testingRequestInputSchema.safeParse(intent);
+  const parsed = delegationInputSchema.safeParse(intent);
 
   if (!callId.success || !parsed.success) {
     throw new TestingPersistenceError(400, "Invalid testing intent");
@@ -797,77 +826,122 @@ export async function admitAttachedInTransaction(
   const existing = await lockOperation(tx, operationId);
 
   if (existing) {
-    return reloadAdmission(tx, existing, parsed.data);
+    const stored = testingIntentSchema.parse(existing.intent);
+
+    if (!isDeepStrictEqual(stored.task?.input, parsed.data)) {
+      throw new TestingPersistenceError(409, "Delegation call identity collision");
+    }
+
+    return reloadAdmission(tx, existing, stored);
   }
 
-  const prepared = await prepareClosure(tx, threadId, parsed.data, runtime);
+  const normalized = await delegationIntent(tx, threadId, parsed.data);
+  const prepared = await prepareClosure(tx, threadId, normalized, runtime);
 
   return insertOperation(tx, {
     id: operationId,
     parentRunId,
     threadId,
     requestKey: callId.data,
-    intent: parsed.data,
+    intent: normalized,
     runtime,
     mode: "attached",
     prepared,
   });
 }
 
-function testingIntent(request: TestingRequest): TestingRequestInput {
-  return {
-    goal: request.goal,
-    sources: request.sources,
-    criteria: request.criteria,
-    targetUrl: request.targetUrl,
-    ...(request.design ? { design: request.design } : {}),
-    ...(request.existingArtifacts ? { existingArtifacts: request.existingArtifacts } : {}),
-  };
-}
-
-export async function findStandaloneAdmission(
+async function delegationIntent(
   tx: Transaction,
-  request: TestingRequest,
-): Promise<TestingAdmission | null> {
-  const [existing] = await tx
-    .select()
-    .from(testingOperationsTable)
-    .where(eq(testingOperationsTable.id, request.requestId))
-    .for("update");
+  threadId: string,
+  input: DelegationInput,
+): Promise<TestingRequestInput> {
+  const task = { version: 2 as const, input };
 
-  if (!existing) {
-    return null;
+  if (input.role === "atlassian") {
+    return {
+      goal: input.goal,
+      sources: input.sources,
+      criteria: input.criteria,
+      targetUrl: null,
+      task,
+    };
   }
 
-  return reloadAdmission(tx, existing, testingIntent(request));
-}
+  const ref = input.role === "planner" ? input.requirementsRef : input.planRef;
+  const rows = await loadClosure(tx, threadId, [ref]);
+  const expected = input.role === "planner" ? "requirements" : "plan";
+  const artifact = requireDependency(rows, ref, expected);
+  const requirements =
+    expected === "requirements"
+      ? artifact
+      : requireDependency(rows, artifact.dependencies[0] ?? "", "requirements");
 
-export async function prepareStandaloneClosure(
-  tx: Transaction,
-  request: TestingRequest,
-  runtime: HostTestingRuntime,
-): Promise<PreparedClosure> {
-  assertHostRuntime(runtime);
+  const source = requirementsPayloadSchema.safeParse(requirements.payload);
 
-  return prepareClosure(tx, request.threadId, request, runtime);
-}
+  if (!source.success) {
+    throw new TestingRequestError([
+      rejectedDecision(artifactRefSchema.parse(requirements.ref), "incomplete"),
+    ]);
+  }
 
-export async function insertStandaloneOperation(
-  tx: Transaction,
-  request: TestingRequest,
-  runtime: HostTestingRuntime,
-  prepared: PreparedClosure,
-): Promise<TestingAdmission> {
-  return insertOperation(tx, {
-    id: request.requestId,
-    parentRunId: request.requestId,
-    threadId: request.threadId,
-    requestKey: request.requestId,
-    intent: testingIntent(request),
-    runtime,
-    mode: "standalone",
-    prepared,
+  let context;
+
+  if (input.role === "planner") {
+    context = { targetUrl: null, design: input.design };
+  } else {
+    const plan = planPayloadSchema.safeParse(artifact.payload);
+
+    if (!plan.success) {
+      throw new TestingRequestError([
+        rejectedDecision(artifactRefSchema.parse(artifact.ref), "incomplete"),
+      ]);
+    }
+
+    context = resultTaskContext(plan.data, input);
+  }
+
+  return testingIntentSchema.parse({
+    goal: source.data.goal,
+    sources: source.data.captures.map((capture) => capture.reference),
+    criteria: source.data.selection,
+    ...context,
+    existingArtifacts: [...rows.keys()],
+    task,
   });
+}
+
+function requireDependency(
+  rows: ReadonlyMap<string, StoredArtifactRow>,
+  ref: string,
+  kind: "requirements" | "plan",
+) {
+  const artifact = rows.get(ref);
+
+  if (!artifact || artifact.kind !== kind) {
+    throw new TestingRequestError([
+      rejectedDecision(
+        artifactRefSchema.parse(ref || "invalid-ref"),
+        artifact ? "wrong_kind" : "not_accessible",
+      ),
+    ]);
+  }
+
+  return artifact;
+}
+
+function resultTaskContext(
+  plan: CanonicalPlan,
+  input: Extract<DelegationInput, { role: "ac" | "ui" }>,
+) {
+  if (plan.targetUrl !== null && plan.targetUrl !== input.targetUrl) {
+    throw new TestingPersistenceError(400, "Plan target URL is incompatible");
+  }
+
+  if (plan.assignments[input.role].length === 0) {
+    throw new TestingPersistenceError(400, "Plan has no checks for the delegated role");
+  }
+
+  return { targetUrl: input.targetUrl, design: plan.design ?? undefined };
 }
 
 async function prepareClosure(
@@ -1161,17 +1235,24 @@ function frozenRuntime(
   return { ...runtime, mode: runtime.mode === "standalone" ? "standalone" : "attached" };
 }
 
-export async function reserveRoleTasksInTransaction(
+export async function reserveRoleTaskInTransaction(
   tx: Transaction,
   operationId: string,
   ownerRunId: string,
-  frontier: readonly Readonly<{ role: RoleId; input: unknown }>[],
-): Promise<readonly RoleFrame[]> {
+  role: RoleId,
+  input: unknown,
+): Promise<RoleFrame | null> {
   const operation = await requireOperation(tx, operationId);
   assertOwner(operation, ownerRunId);
 
   if (operation.finished_at) {
     throw new TestingPersistenceError(409, "Testing operation is terminal");
+  }
+
+  const intent = testingIntentSchema.parse(operation.intent);
+
+  if (!intent.task || role !== intent.task.input.role) {
+    throw new TestingPersistenceError(409, "Only the explicitly delegated role can be reserved");
   }
 
   const decisions = await readDecisions(tx, operation.id);
@@ -1180,73 +1261,61 @@ export async function reserveRoleTasksInTransaction(
     .from(testingTasksTable)
     .where(eq(testingTasksTable.operation_id, operation.id))
     .orderBy(asc(testingTasksTable.created_at));
-  const ordered = [...frontier].sort(
-    (left, right) => ROLE_IDS.indexOf(left.role) - ROLE_IDS.indexOf(right.role),
-  );
-  const frames: RoleFrame[] = [];
-
-  for (const task of existing) {
-    frames.push(frameFrom(task));
-  }
+  const prior = existing.find((task) => task.role === role);
+  const digest = digestOf(input);
 
   if (operation.cancel_accepted_at) {
     await ensureCancelDeliveries(tx, operation.id, existing);
 
-    return frames;
+    return prior ? frameFrom(prior) : null;
   }
 
-  for (const reservation of ordered) {
-    const prior = existing.find((task) => task.role === reservation.role);
-    const digest = digestOf(reservation.input);
-
-    if (prior) {
-      if (prior.input_digest !== digest) {
-        throw new TestingPersistenceError(409, "Reserved task input collision");
-      }
-
-      continue;
+  if (prior) {
+    if (prior.input_digest !== digest) {
+      throw new TestingPersistenceError(409, "Reserved task input collision");
     }
 
-    assertReservable(reservation.role, decisions);
-    const taskId = `task-${reservation.role}-${createHash("sha256")
-      .update(`${operation.id}\0${reservation.role}`)
-      .digest("hex")
-      .slice(0, 24)}`;
-    const childWorkflowId = testingChildWorkflowId(operation.id, reservation.role);
-    const [inserted] = await tx
-      .insert(testingTasksTable)
-      .values({
-        id: taskId,
-        operation_id: operation.id,
-        role: reservation.role,
-        child_workflow_id: childWorkflowId,
-        attempt_nonce: 1,
-        input_digest: digest,
-        input: reservation.input,
-        runtime: operation.runtime,
-      })
-      .returning();
+    return frameFrom(prior);
+  }
 
-    if (!inserted) {
-      throw new TestingPersistenceError(409, "Reserved task identity collision");
-    }
-
-    await tx.insert(testingDeliveriesTable).values({
-      delivery_key: `start:${taskId}`,
+  assertReservable(role, decisions);
+  const taskId = `task-${role}-${createHash("sha256")
+    .update(`${operation.id}\0${role}`)
+    .digest("hex")
+    .slice(0, 24)}`;
+  const childWorkflowId = testingChildWorkflowId(operation.id, role);
+  const [inserted] = await tx
+    .insert(testingTasksTable)
+    .values({
+      id: taskId,
       operation_id: operation.id,
-      task_id: taskId,
-      kind: "start",
-    });
-    await appendDecision(tx, operation, `dispatch:${reservation.role}`, {
-      kind: "dispatch",
-      role: reservation.role,
-      taskId,
-      childWorkflowId,
-    });
-    frames.push(frameFrom(inserted));
+      role,
+      child_workflow_id: childWorkflowId,
+      attempt_nonce: 1,
+      input_digest: digest,
+      input,
+      runtime: operation.runtime,
+    })
+    .returning();
+
+  if (!inserted) {
+    throw new TestingPersistenceError(409, "Reserved task identity collision");
   }
 
-  return frames.sort((left, right) => ROLE_IDS.indexOf(left.role) - ROLE_IDS.indexOf(right.role));
+  await tx.insert(testingDeliveriesTable).values({
+    delivery_key: `start:${taskId}`,
+    operation_id: operation.id,
+    task_id: taskId,
+    kind: "start",
+  });
+  await appendDecision(tx, operation, `dispatch:${role}`, {
+    kind: "dispatch",
+    role,
+    taskId,
+    childWorkflowId,
+  });
+
+  return frameFrom(inserted);
 }
 
 function assertReservable(role: RoleId, decisions: readonly DecisionBody[]) {
@@ -1624,7 +1693,7 @@ export async function readTestingExecutionInTransaction(
 
   const { mode, ...runtime } = frozenRuntime(operation);
   assertHostRuntime(runtime);
-  const intent = testingRequestInputSchema.parse(operation.intent);
+  const intent = testingIntentSchema.parse(operation.intent);
   const decisions = await readDecisions(tx, operation.id);
   const artifacts = await pinnedArtifacts(tx, operation, runtime);
   const tasks = await taskSnapshots(tx, operation, runtime, decisions);
@@ -1764,7 +1833,12 @@ async function assertDerivedLink(
       ),
     );
 
-  if (!native || native.output_digest !== bindings.nativeOutputDigest) {
+  if (
+    !native ||
+    native.output_digest !== bindings.nativeOutputDigest ||
+    native.output_digest !== digestOf(native.output) ||
+    native.input_digest !== digestOf(native.input)
+  ) {
     throw new TestingPersistenceError(409, "Derived receipt is not linked to its native response");
   }
 }
@@ -1981,19 +2055,45 @@ async function replayCandidate(
   priorRef: string,
 ): Promise<{ ref: ArtifactRef; kind: ArtifactKind }> {
   const runtime = frozenRuntime(operation);
-  const again = await validateCandidate(tx, operation, task, proposal, runtime);
   const artifact = await artifactByRef(tx, priorRef);
   const metadata = metadataSchema.safeParse(artifact.metadata);
+  const snapshot =
+    task.role === "atlassian" ? requirementsPayloadSchema.safeParse(artifact.payload) : null;
 
-  if (
-    again.digest !== artifact.payload_digest ||
-    !metadata.success ||
-    !snapshotMatches(metadata.data, runtime, PRODUCER_KEYS)
-  ) {
+  if (artifact.payload_digest !== digestOf(artifact.payload) || (snapshot && !snapshot.success)) {
+    throw new TestingPersistenceError(409, "Task result version mismatch");
+  }
+
+  const again = snapshot?.success
+    ? await requirementsCandidate(
+        tx,
+        task,
+        testingIntentSchema.parse(operation.intent),
+        proposal,
+        snapshot.data.captures,
+      )
+    : await validateCandidate(tx, operation, task, proposal, runtime);
+
+  if (!replayedCandidateMatches(again, artifact, metadata, runtime)) {
     throw new TestingPersistenceError(409, "Task result version mismatch");
   }
 
   return { ref: artifactRefSchema.parse(priorRef), kind: again.kind };
+}
+
+function replayedCandidateMatches(
+  candidate: Candidate,
+  artifact: ArtifactRow,
+  metadata: ReturnType<typeof metadataSchema.safeParse>,
+  runtime: HostTestingRuntime,
+): boolean {
+  return (
+    candidate.kind === artifact.kind &&
+    candidate.digest === artifact.payload_digest &&
+    metadata.success &&
+    metadata.data.outputDigest === artifact.payload_digest &&
+    snapshotMatches(metadata.data, runtime, PRODUCER_KEYS)
+  );
 }
 
 async function storeCandidate(
@@ -2115,8 +2215,9 @@ async function requirementsCandidate(
   task: TaskRow,
   intent: TestingRequestInput,
   proposal: unknown,
+  priorCaptures?: readonly SourceCapture[],
 ): Promise<Candidate> {
-  const captures = await sourceCaptures(tx, task);
+  const captures = await sourceCaptures(tx, task, priorCaptures);
 
   if (missingSourceCaptures(intent.sources, captures).length > 0) {
     throw new TestingPersistenceError(409, "Source captures do not cover the request");
@@ -2127,13 +2228,20 @@ async function requirementsCandidate(
 
     return capture ? [capture] : [];
   });
-  const payload = acceptedOrThrow(
-    validateRequirements(proposal, {
-      goal: intent.goal,
-      selection: intent.criteria,
-      captures: orderedCaptures,
-    }),
-  );
+  const decision = validateRequirements(proposal, {
+    goal: intent.goal,
+    selection: intent.criteria,
+    captures: orderedCaptures,
+  });
+
+  if (decision.kind === "not_extractable") {
+    throw new TestingPersistenceError(
+      400,
+      "requirements_not_extractable cannot create an artifact",
+    );
+  }
+
+  const payload = acceptedOrThrow(decision);
 
   return {
     kind: "requirements",
@@ -2229,7 +2337,7 @@ async function validateCandidate(
   proposal: unknown,
   runtime: HostTestingRuntime,
 ): Promise<Candidate> {
-  const intent = testingRequestInputSchema.parse(operation.intent);
+  const intent = testingIntentSchema.parse(operation.intent);
 
   if (task.role === "atlassian") {
     return requirementsCandidate(tx, task, intent, proposal);
@@ -2244,36 +2352,74 @@ async function validateCandidate(
   return resultsCandidate(tx, operation, task, proposal);
 }
 
-async function sourceCaptures(tx: Transaction, task: TaskRow): Promise<SourceCapture[]> {
+async function sourceCaptures(
+  tx: Transaction,
+  task: TaskRow,
+  priorCaptures?: readonly SourceCapture[],
+): Promise<SourceCapture[]> {
   const rows = await tx
     .select()
     .from(testingReceiptsTable)
     .where(
       and(
         eq(testingReceiptsTable.task_id, task.id),
+        priorCaptures ? undefined : eq(testingReceiptsTable.attempt, task.attempt_nonce),
         eq(testingReceiptsTable.native_name, SOURCE_CAPTURE_NATIVE),
       ),
-    );
+    )
+    .orderBy(asc(testingReceiptsTable.slot), asc(testingReceiptsTable.native_name));
+  const selectedRows = selectSourceReceipts(rows, priorCaptures);
   const captures: SourceCapture[] = [];
 
-  for (const row of rows) {
-    const parsed = sourceCaptureSchema.safeParse(row.output);
-    const bindings = receiptBindingsSchema.safeParse(row.bindings);
-
-    if (
-      !parsed.success ||
-      !bindings.success ||
-      row.output_digest !== digestOf(row.output) ||
-      parsed.data.digest !== bindings.data.nativeOutputDigest
-    ) {
-      throw new TestingPersistenceError(409, "Source receipt is not a host capture");
-    }
-
-    await assertDerivedLink(tx, task, row.slot, bindings.data);
-    captures.push(parsed.data);
+  for (const row of selectedRows) {
+    const { capture, bindings } = trustedSourceReceipt(row, task.role);
+    await assertDerivedLink(tx, { ...task, attempt_nonce: row.attempt }, row.slot, bindings);
+    captures.push(capture);
   }
 
   return captures;
+}
+
+function selectSourceReceipts(
+  rows: ReceiptRow[],
+  priorCaptures?: readonly SourceCapture[],
+): ReceiptRow[] {
+  if (!priorCaptures) {
+    return rows;
+  }
+
+  return priorCaptures.map((capture) => {
+    const row = rows.find((item) => {
+      const parsed = sourceCaptureSchema.safeParse(item.output);
+
+      return parsed.success && isDeepStrictEqual(parsed.data, capture);
+    });
+
+    if (!row) {
+      throw new TestingPersistenceError(409, "Prior source capture has no trusted receipt");
+    }
+
+    return row;
+  });
+}
+
+function trustedSourceReceipt(row: ReceiptRow, role: TaskRow["role"]) {
+  const parsed = sourceCaptureSchema.safeParse(row.output);
+  const bindings = receiptBindingsSchema.safeParse(row.bindings);
+
+  if (
+    !parsed.success ||
+    !bindings.success ||
+    row.route !== "direct" ||
+    role !== "atlassian" ||
+    row.input_digest !== digestOf(row.input) ||
+    row.output_digest !== digestOf(row.output) ||
+    parsed.data.digest !== bindings.data.nativeOutputDigest
+  ) {
+    throw new TestingPersistenceError(409, "Source receipt is not a host capture");
+  }
+
+  return { capture: parsed.data, bindings: bindings.data };
 }
 
 async function artifactComplete(
@@ -2486,12 +2632,10 @@ async function publishOperation(
   const version = latest ? latest.version + 1 : 0;
   const snapshot = await projectionSnapshot(tx, operation, forcedOutcome, version);
 
-  if (latest && isDeepStrictEqual(latest.cursors, snapshot.cursors)) {
-    return latest.view as TestView;
-  }
+  const retained = retainedPublication(latest, operation, snapshot);
 
-  if (operation.finished_at && latest && (latest.cursors as { finished?: boolean }).finished) {
-    return latest.view as TestView;
+  if (retained) {
+    return retained;
   }
 
   const key = `testing:${operation.id}:v${version}`;
@@ -2511,6 +2655,26 @@ async function publishOperation(
     .where(eq(testingOperationsTable.id, operation.id));
 
   return snapshot.view;
+}
+
+function retainedPublication(
+  latest: typeof testingPublicationsTable.$inferSelect | undefined,
+  operation: OperationRow,
+  snapshot: { view: TestView; cursors: Record<string, unknown> },
+): TestView | null {
+  const view = latest ? parseTestView(latest.view) : null;
+
+  if (!latest || !view) {
+    return null;
+  }
+
+  const finished = operation.finished_at && (latest.cursors as { finished?: boolean }).finished;
+
+  if (finished || isDeepStrictEqual(latest.cursors, snapshot.cursors)) {
+    return enrichTaskOrigin(view, snapshot.view.task?.origin ?? null);
+  }
+
+  return null;
 }
 
 async function taskObservations(
@@ -2570,27 +2734,27 @@ async function projectionSnapshot(
   const finished = Boolean(operation.finished_at);
   const cancelling = Boolean(operation.cancel_accepted_at) && !finished;
   const outcomes = roleOutcomes(decisions, tasks, observations, cancelling || finished);
-  const runId = testRunIdSchema.parse(operation.parent_run_id);
-  const report = finished
-    ? deriveReport({
-        runId,
-        rootOutcome: (forcedOutcome ?? operation.terminal_outcome ?? "failed") as RootRunOutcome,
-        requirements,
-        plan,
-        acResults: artifactPayload(artifacts, "ac-result") as Results | null,
-        uiResults: artifactPayload(artifacts, "ui-result") as Results | null,
-        unresolvedSources: unresolvedFrom(requirements, operation.intent),
-        artifacts: artifacts.map((artifact) => artifactRefSchema.parse(artifact.ref)),
-        progressVersion: version,
-        outcomes,
-      })
-    : null;
+  const intent = testingIntentSchema.parse(operation.intent);
+  const runId = testRunIdSchema.parse(intent.task ? operation.id : operation.parent_run_id);
+  const report = completedProjectionReport(operation, intent, forcedOutcome, {
+    runId,
+    requirements,
+    plan,
+    artifacts,
+    version,
+    outcomes,
+  });
+  const origins = intent.task
+    ? await taskOrigins(tx, [operation])
+    : new Map<string, TaskMessageOrigin | null>();
   const view: TestView = {
     runId,
     progress: projectProgress(version, outcomes, plan),
     reuse,
     availableArtifacts: available,
-    ...lifecycle(report, cancelling),
+    ...(intent.task
+      ? taskProjection(intent.task, artifacts, operation, origins.get(operation.id) ?? null)
+      : lifecycle(report, cancelling)),
   };
 
   return {
@@ -2605,6 +2769,68 @@ async function projectionSnapshot(
   };
 }
 
+function completedProjectionReport(
+  operation: OperationRow,
+  intent: TestingRequestInput,
+  forcedOutcome: string | null,
+  snapshot: {
+    runId: TestView["runId"];
+    requirements: Requirements | null;
+    plan: CanonicalPlan | null;
+    artifacts: ArtifactRow[];
+    version: number;
+    outcomes: ReturnType<typeof roleOutcomes>;
+  },
+): PublicTestReport | null {
+  if (!operation.finished_at || intent.task) {
+    return null;
+  }
+
+  return deriveReport({
+    runId: snapshot.runId,
+    rootOutcome: (forcedOutcome ?? operation.terminal_outcome ?? "failed") as RootRunOutcome,
+    requirements: snapshot.requirements,
+    plan: snapshot.plan,
+    acResults: artifactPayload(snapshot.artifacts, "ac-result") as Results | null,
+    uiResults: artifactPayload(snapshot.artifacts, "ui-result") as Results | null,
+    unresolvedSources: unresolvedFrom(snapshot.requirements, operation.intent),
+    artifacts: snapshot.artifacts.map((artifact) => artifactRefSchema.parse(artifact.ref)),
+    progressVersion: snapshot.version,
+    outcomes: snapshot.outcomes,
+  });
+}
+
+function taskProjection(
+  task: NonNullable<TestingRequestInput["task"]>,
+  artifacts: readonly ArtifactRow[],
+  operation: OperationRow,
+  origin: TaskMessageOrigin | null,
+) {
+  return {
+    task: {
+      version: 2 as const,
+      origin,
+      role: task.input.role,
+      summary: task.input.summary,
+      result: taskArtifact(artifacts, task.input.role, operation.id),
+    },
+    state: operation.finished_at
+      ? ("finished" as const)
+      : operation.cancel_accepted_at
+        ? ("cancelling" as const)
+        : ("active" as const),
+    report: null,
+  };
+}
+
+function taskArtifact(artifacts: readonly ArtifactRow[], role: RoleId, operationId: string) {
+  const artifact = artifacts.find(
+    (item) => item.role === role && item.original_operation_id === operationId,
+  );
+
+  return artifact ? publicTaskArtifact({ ...artifact, kind: artifact.kind as ArtifactKind }) : null;
+}
+
 function artifactPayload(
   artifacts: readonly (typeof testingArtifactsTable.$inferSelect)[],
   kind: ArtifactKind,
@@ -2617,7 +2843,7 @@ function unresolvedFrom(requirements: Requirements | null, intent: unknown): rea
     return [];
   }
 
-  const parsed = testingRequestInputSchema.safeParse(intent);
+  const parsed = testingIntentSchema.safeParse(intent);
 
   return parsed.success ? parsed.data.sources : [];
 }
@@ -2875,7 +3101,7 @@ async function ensureCancelDeliveries(
 function operationScope(threadId: string, runId: string) {
   return and(
     eq(testingOperationsTable.thread_id, threadId),
-    sql`(${testingOperationsTable.id} = ${runId} or ${testingOperationsTable.parent_run_id} = ${runId})`,
+    sql`(${testingOperationsTable.id} = ${runId} or (${testingOperationsTable.parent_run_id} = ${runId} and ${testingOperationsTable.intent}->'task' is null))`,
   );
 }
 
@@ -2908,6 +3134,137 @@ export async function selectTestingCancellation(
     : { kind: "live", parentRunId: target.parentRunId, operationId: target.id };
 }
 
+type OriginOperation = Readonly<{ id: string; parent_run_id: string; request_key: string }>;
+
+const delegationStartSchema = z.object({
+  type: z.literal("TOOL_CALL_START"),
+  toolCallName: z.literal("delegate_task"),
+  toolCallId: z.string().min(1),
+  parentMessageId: z.string().min(1).optional(),
+});
+
+async function taskOrigins(
+  tx: Transaction,
+  operations: readonly OriginOperation[],
+): Promise<Map<string, TaskMessageOrigin | null>> {
+  const origins = new Map<string, TaskMessageOrigin | null>();
+  const runIds = [...new Set(operations.map((operation) => operation.parent_run_id))];
+
+  if (runIds.length === 0) {
+    return origins;
+  }
+
+  const [runs, events] = await Promise.all([
+    tx
+      .select({
+        id: chatRunsTable.id,
+        accepted: chatRunsTable.accepted,
+        projection: chatRunsTable.projection,
+      })
+      .from(chatRunsTable)
+      .where(inArray(chatRunsTable.id, runIds)),
+    tx
+      .select({ run_id: chatEventsTable.run_id, payload: chatEventsTable.payload })
+      .from(chatEventsTable)
+      .where(
+        and(
+          inArray(chatEventsTable.run_id, runIds),
+          sql`${chatEventsTable.payload}->>'type' = 'TOOL_CALL_START'`,
+          sql`${chatEventsTable.payload}->>'toolCallName' = 'delegate_task'`,
+        ),
+      ),
+  ]);
+  const evidence = delegationEvidence(events);
+  const owners = new Map(runs.map((run) => [run.id, delegationOwners(run)]));
+
+  for (const operation of operations) {
+    const parents = evidence.get(operation.parent_run_id)?.get(operation.request_key);
+    const surviving = owners.get(operation.parent_run_id)?.get(operation.request_key);
+    const parentMessageId = delegationParent(parents, surviving);
+
+    origins.set(
+      operation.id,
+      parentMessageId
+        ? {
+            parentRunId: operation.parent_run_id,
+            requestKey: operation.request_key,
+            parentMessageId,
+          }
+        : null,
+    );
+  }
+
+  return origins;
+}
+
+function delegationEvidence(events: readonly { run_id: string; payload: unknown }[]) {
+  const evidence = new Map<string, Map<string, Set<string>>>();
+
+  for (const event of events) {
+    const parsed = delegationStartSchema.safeParse(event.payload);
+
+    if (!parsed.success) {
+      continue;
+    }
+
+    const starts = evidence.get(event.run_id) ?? new Map<string, Set<string>>();
+    const parents = starts.get(parsed.data.toolCallId) ?? new Set<string>();
+
+    if (parsed.data.parentMessageId) {
+      parents.add(parsed.data.parentMessageId);
+    }
+
+    starts.set(parsed.data.toolCallId, parents);
+    evidence.set(event.run_id, starts);
+  }
+
+  return evidence;
+}
+
+function delegationOwners(run: Pick<typeof chatRunsTable.$inferSelect, "accepted" | "projection">) {
+  const baseline = new Set(run.accepted.messages.map((message) => message.id));
+  const calls = new Map<string, Set<string>>();
+
+  for (const message of readProjection(run.projection).display) {
+    if (message.role !== "assistant" || baseline.has(message.id)) {
+      continue;
+    }
+
+    for (const callId of message.parts.flatMap((part) =>
+      part.type === "tool-call" && part.name === "delegate_task" ? [part.id] : [],
+    )) {
+      const messages = calls.get(callId) ?? new Set<string>();
+      messages.add(message.id);
+      calls.set(callId, messages);
+    }
+  }
+
+  return calls;
+}
+
+function delegationParent(
+  parents: Set<string> | undefined,
+  surviving: Set<string> | undefined,
+): string | null {
+  if (!parents || parents.size > 1) {
+    return null;
+  }
+
+  if (parents.size === 1) {
+    const parent = [...parents][0]!;
+
+    return surviving?.has(parent) ? parent : null;
+  }
+
+  return surviving?.size === 1 ? [...surviving][0]! : null;
+}
+
+function enrichTaskOrigin(view: TestView, origin: TaskMessageOrigin | null): TestView {
+  return view.task && !view.task.origin && origin
+    ? { ...view, task: { ...view.task, origin } }
+    : view;
+}
+
 async function selectPublished(
   tx: Transaction,
   threadId: string,
@@ -2916,8 +3273,11 @@ async function selectPublished(
   const rows = await tx
     .select({
       operation_id: testingPublicationsTable.operation_id,
+      version: testingPublicationsTable.version,
       view: testingPublicationsTable.view,
       thread_id: testingOperationsTable.thread_id,
+      parent_run_id: testingOperationsTable.parent_run_id,
+      request_key: testingOperationsTable.request_key,
     })
     .from(testingPublicationsTable)
     .innerJoin(
@@ -2925,17 +3285,45 @@ async function selectPublished(
       eq(testingPublicationsTable.operation_id, testingOperationsTable.id),
     )
     .where(runId ? operationScope(threadId, runId) : eq(testingOperationsTable.thread_id, threadId))
-    .orderBy(desc(testingPublicationsTable.public_sequence));
+    .orderBy(
+      desc(testingOperationsTable.created_at),
+      desc(testingOperationsTable.id),
+      desc(testingPublicationsTable.version),
+    );
   const seen = new Set<string>();
-  const views: TestView[] = [];
-
-  for (const row of rows) {
+  const latestRows = rows.filter((row) => {
     if (row.thread_id !== threadId || seen.has(row.operation_id)) {
-      continue;
+      return false;
     }
 
     seen.add(row.operation_id);
-    views.push(row.view as TestView);
+
+    return true;
+  });
+  const origins = await taskOrigins(
+    tx,
+    latestRows.map((row) => ({ ...row, id: row.operation_id })),
+  );
+  const views: TestView[] = [];
+
+  for (const row of latestRows) {
+    const parsed = parseTestView(row.view);
+    const view = parsed ? enrichTaskOrigin(parsed, origins.get(row.operation_id) ?? null) : null;
+    const identity = testRunIdSchema.safeParse(row.operation_id);
+
+    if (!view || !identity.success) {
+      console.warn("Invalid testing publication", {
+        operationId: row.operation_id,
+        threadId: row.thread_id,
+        version: row.version,
+      });
+      continue;
+    }
+
+    const runId = identity.data;
+    views.push(
+      view.report ? { ...view, runId, report: { ...view.report, runId } } : { ...view, runId },
+    );
   }
 
   return views;
@@ -3064,6 +3452,7 @@ export function testingFinishOutcome(code: string, succeeded: boolean): RootRunO
 }
 
 const roleFailureSchema = z.enum([
+  "requirements_not_extractable",
   "proposal_rejected",
   "child_failed",
   "cancelled",
@@ -3076,6 +3465,7 @@ const roleFailureSchema = z.enum([
 export type RoleFailureCode = z.infer<typeof roleFailureSchema>;
 
 export type PendingTestingOperation = Readonly<{
+  delegated: boolean;
   operationId: string;
   parentRunId: string;
   threadId: string;
@@ -3160,6 +3550,9 @@ export async function listPendingTestingOperations(): Promise<readonly PendingTe
     const runtime = row.runtime as { mode?: string };
 
     return {
+      delegated:
+        testingIntentSchema.safeParse(row.intent).success &&
+        Boolean((row.intent as TestingRequestInput).task),
       operationId: row.id,
       parentRunId: row.parent_run_id,
       threadId: row.thread_id,

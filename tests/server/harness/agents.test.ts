@@ -1,12 +1,16 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  MODEL,
+  agentRegistry,
+  allowsTool,
   capabilityToolNames,
-  roleFeedbackPrompt,
+  providerModels,
   roleRegistry,
   roleSystemPrompt,
-  roleTaskPrompt,
+  toolNamesFor,
 } from "../../../server/harness/agents";
+import { roleFeedbackPrompt, roleTaskPrompt } from "../../../server/harness/prompts";
 import type { CanonicalPlan, Requirements } from "../../../server/harness/testing-domain";
 import { ROLE_IDS, type TestingRequestInput } from "../../../shared/testing";
 
@@ -74,12 +78,13 @@ test("role definitions keep distinct responsibilities within their capabilities"
     [["atlassian_read"], [], ["browser_mock"], ["browser_mock", "figma_read"]],
   );
   assert.deepEqual(capabilityToolNames, {
-    atlassian_read: null,
-    browser_mock: "use_browser",
-    figma_read: "get_figma",
+    workspace: ["read", "write", "edit"],
+    figma_read: ["get_figma"],
+    browser_mock: ["use_browser"],
+    atlassian_read: ["jira_get_issue", "confluence_get_page"],
   });
   assert.equal(new Set(ROLE_IDS.map((role) => roleRegistry[role].systemPrompt)).size, 4);
-  assert.match(roleRegistry.atlassian.systemPrompt, /sourceCapture\.anchors/);
+  assert.match(roleRegistry.atlassian.systemPrompt, /sourceCapture\.anchorRefs/);
   assert.match(roleRegistry.atlassian.systemPrompt, /unresolved instead of silently resolving/);
   assert.match(
     roleRegistry.planner.systemPrompt,
@@ -145,6 +150,7 @@ test("task messages contain data and bounds without copying system instructions"
   assert.equal(marker, "testing-task:");
   assert.deepEqual(extra, []);
   assert.deepEqual(JSON.parse(raw!), {
+    summary: goal,
     goal,
     sources: intent.sources,
     criteria: intent.criteria,
@@ -182,4 +188,51 @@ test("role feedback reports every private validation issue", () => {
     roleFeedbackPrompt(["missing check c-1", "unknown receipt r-2"]),
     "Private validation failed: missing check c-1; unknown receipt r-2",
   );
+});
+
+test("one registry owns every model and the provider derives its model list", () => {
+  assert.equal(MODEL, "deepseek-ai/DeepSeek-V4.1-Flash");
+  assert.deepEqual(providerModels, [MODEL]);
+  assert.deepEqual(Object.keys(agentRegistry), ["main", "atlassian", "planner", "ac", "ui"]);
+  assert.equal(new Set(Object.values(agentRegistry).map((agent) => agent.model)).size, 1);
+  assert.deepEqual(
+    ROLE_IDS.map((role) => agentRegistry[role].capabilities),
+    [["atlassian_read"], [], ["browser_mock"], ["browser_mock", "figma_read"]],
+  );
+  assert.deepEqual(
+    ROLE_IDS.map((role) => agentRegistry[role].profile),
+    ["requirements-v2", "planning-v2", "functional-v2", "style-v2"],
+  );
+});
+
+test("main cannot reach Atlassian through any route and owns conversation tools", () => {
+  for (const route of ["direct", "codemode"] as const) {
+    assert.equal(allowsTool("main", "jira_get_issue", route), false);
+    assert.equal(allowsTool("main", "confluence_get_page", route), false);
+    assert.equal(allowsTool("main", "discover_atlassian_tools", route), false);
+  }
+
+  assert.deepEqual([...toolNamesFor("main")].sort(), ["edit", "get_figma", "read", "write"]);
+  assert.equal(toolNamesFor("main").includes("jira_get_issue"), false);
+  assert.equal(allowsTool("main", "read", "direct"), true);
+  assert.equal(allowsTool("main", "get_figma", "codemode"), true);
+  assert.equal(allowsTool("main", "codemode", "direct"), true);
+  assert.equal(allowsTool("main", "codemode", "codemode"), false);
+  assert.equal(allowsTool("main", "delegate_task", "direct"), true);
+  assert.equal(allowsTool("main", "delegate_task", "codemode"), false);
+});
+
+test("QA roles keep their capability policy inside the shared registry", () => {
+  assert.deepEqual([...toolNamesFor("atlassian")].sort(), [
+    "confluence_get_page",
+    "jira_get_issue",
+  ]);
+  assert.equal(allowsTool("atlassian", "discover_atlassian_tools", "direct"), true);
+  assert.equal(allowsTool("atlassian", "jira_search", "direct"), false);
+  assert.deepEqual(toolNamesFor("planner"), []);
+  assert.equal(allowsTool("planner", "use_browser", "direct"), false);
+  assert.deepEqual(toolNamesFor("ac"), ["use_browser"]);
+  assert.equal(allowsTool("ac", "jira_get_issue", "direct"), false);
+  assert.deepEqual([...toolNamesFor("ui")].sort(), ["get_figma", "use_browser"]);
+  assert.equal(allowsTool("ui", "use_browser", "codemode"), true);
 });

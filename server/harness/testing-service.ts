@@ -1,18 +1,5 @@
-import {
-  TestingRequestError,
-  testingRequestSchema,
-  type ReuseDecision,
-  type TestingRequest,
-  type TestView,
-} from "../../shared/testing";
-import {
-  admitStandaloneTesting,
-  cancelPublishedTesting,
-  publishProjection,
-  readPublishedTesting,
-  RunRequestError,
-} from "./run-store";
-import { ensureTestingRoot } from "./testing-run";
+import { TestingRequestError, type ReuseDecision, type TestView } from "../../shared/testing";
+import { cancelPublishedTesting, readPublishedTesting, RunRequestError } from "./run-store";
 import { TestingPersistenceError } from "./testing-store";
 
 export type TestingProblem = Readonly<{
@@ -20,14 +7,6 @@ export type TestingProblem = Readonly<{
   message: string;
   decisions?: readonly ReuseDecision[];
 }>;
-
-export async function request(input: TestingRequest): Promise<TestView> {
-  const parsed = testingRequestSchema.parse(input);
-  const admission = await admitStandaloneTesting(parsed);
-  await ensureTestingRoot(admission.parentRunId, admission.operationId);
-
-  return publishProjection(admission.parentRunId, admission.operationId);
-}
 
 export async function read(threadId: string, runId: string): Promise<TestView> {
   const view = await readPublishedTesting(threadId, runId);

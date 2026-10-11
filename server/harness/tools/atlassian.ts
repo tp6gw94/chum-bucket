@@ -7,11 +7,8 @@ import {
 import { createMCPClient, type MCPClient } from "@tanstack/ai-mcp";
 import { z } from "zod";
 import type { ModelCall } from "../model-turn";
-import {
-  atlassianTools,
-  readAtlassianConfiguration,
-  type AtlassianConfiguration,
-} from "./atlassian-policy";
+import { atlassianTools } from "../agents";
+import { readAtlassianConfiguration, type AtlassianConfiguration } from "./atlassian-policy";
 
 export type ModelTool = Readonly<{
   name: string;

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { after, test } from "node:test";
+import { after, mock, test } from "node:test";
 import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { tmpdir } from "node:os";
@@ -8,10 +8,9 @@ import { eq, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { migrate } from "drizzle-orm/node-postgres/migrator";
 import pg from "pg";
-import { z } from "zod";
 import {
   browserOutputSchema,
-  testingRequestSchema,
+  delegationInputSchema,
   TestingRequestError,
 } from "../../../shared/testing";
 import {
@@ -33,13 +32,13 @@ import {
   readStartCancelDeliveries,
   hostTestingRuntime,
 } from "../../../server/harness/testing-store";
-import { digestOf } from "../../../server/harness/testing-domain";
+import { digestOf, sourceCaptureView } from "../../../server/harness/testing-domain";
+import { assertDelegationCutover } from "../../../server/harness/testing-run";
 import { createUseBrowserTool } from "../../../server/harness/tools/use-browser";
+import { MODEL } from "../../../server/harness/agents";
 import {
   BUILD,
-  MODEL,
   admitAttachedTesting,
-  admitStandaloneTesting,
   acceptRoleCandidate,
   cancelPublishedTesting,
   cancelTesting,
@@ -48,12 +47,12 @@ import {
   finishRun,
   guardActualIO,
   hydrateThread,
-  listPendingRuns,
   persistRun,
+  emit,
   publishProjection,
   readPublishedTesting,
   readTestingExecution,
-  reserveRoleTasks,
+  reserveRoleTask,
 } from "../../../server/harness/run-store";
 
 const enabled = process.env.TESTING_STORE_DATABASE_URL;
@@ -77,18 +76,26 @@ function hostFixture() {
   };
 }
 
-function testingRequest(threadId: string, revision: number, existingArtifacts?: readonly string[]) {
-  return testingRequestSchema.parse({
+const sourceInput = {
+  role: "atlassian",
+  summary: "Read checkout requirements",
+  goal,
+  sources: [source],
+  criteria: { kind: "all" },
+} as const;
+
+async function parentRun(threadId: string) {
+  const persisted = await persistRun({
     threadId,
-    expectedRevision: revision,
-    requestId: `req-${randomUUID()}`,
-    goal,
-    sources: [source],
-    criteria: { kind: "all" as const },
-    targetUrl,
-    design,
-    ...(existingArtifacts ? { existingArtifacts: [...existingArtifacts] } : {}),
+    runId: `run-${randomUUID()}`,
+    baseRevision: 0,
+    message: { id: `msg-${randomUUID()}`, text: "Delegate checkout requirements" },
   });
+  return persisted.run;
+}
+
+async function admitSource(threadId: string, now = new Date()) {
+  return admitAttachedTesting(await parentRun(threadId), "source", sourceInput, now);
 }
 
 async function integrationMigrationsFolder() {
@@ -208,6 +215,40 @@ async function linkSourceCapture(task: { taskId: string; attemptNonce: number })
   return capture;
 }
 
+async function linkVersionedCapture(task: { taskId: string; attemptNonce: number }, slot: string) {
+  const output = { summary: "AC-1", revision: `${task.attemptNonce}:${slot}` };
+  const capture = {
+    reference: source,
+    digest: digestOf(output),
+    anchors: ["AC-1"],
+    capturedAt: "2026-10-11T00:00:00.000Z",
+  };
+  await appendTrustedReceipt({
+    id: `jira-${task.taskId}-${task.attemptNonce}-${slot}`,
+    taskId: task.taskId,
+    attemptNonce: task.attemptNonce,
+    slot,
+    nativeName: "jira_get_issue",
+    route: "direct",
+    input: { issue_key: source.issueKey },
+    output,
+    bindings: {},
+  });
+  await appendTrustedReceipt({
+    id: `cap-${task.taskId}-${task.attemptNonce}-${slot}`,
+    taskId: task.taskId,
+    attemptNonce: task.attemptNonce,
+    slot,
+    nativeName: "source_capture",
+    route: "direct",
+    input: { source },
+    output: capture,
+    bindings: { nativeName: "jira_get_issue", nativeOutputDigest: capture.digest },
+  });
+
+  return capture;
+}
+
 async function taskBudget(taskId: string) {
   const db = await database();
   const [task] = await db
@@ -270,394 +311,24 @@ test(
 );
 
 test(
-  "explicit bad refs reject before a standalone claim or testing rows",
-  { skip: !enabled, timeout: 60_000 },
-  async () => {
-    await ensureDatabase();
-    const thread = await createThread();
-    const before = await countForThread(thread.id);
-    await assert.rejects(
-      () => admitStandaloneTesting(testingRequest(thread.id, 0, ["missing-a", "missing-b"])),
-      (error: unknown) => {
-        assert.ok(error instanceof TestingRequestError);
-        assert.equal(error.decisions.length, 2);
-        assert.deepEqual(
-          error.decisions.map((decision) => decision.kind === "rejected" && decision.reason),
-          ["not_accessible", "not_accessible"],
-        );
-
-        return true;
-      },
-    );
-    assert.deepEqual(await countForThread(thread.id), before);
-  },
-);
-
-test(
-  "standalone admission pins closure, publishes fenced views, and does not renew deadline",
-  { skip: !enabled, timeout: 120_000 },
-  async () => {
-    await ensureDatabase();
-    const thread = await createThread();
-    const admittedAt = new Date();
-    const admission = await admitStandaloneTesting(testingRequest(thread.id, 0), admittedAt);
-    const again = await admitStandaloneTesting(
-      { ...testingRequest(thread.id, 4), requestId: admission.operationId },
-      new Date("2026-10-11T00:00:00.000Z"),
-    );
-    assert.equal(again.operationId, admission.operationId);
-    assert.equal(again.deadline, admission.deadline);
-    assert.equal((await countForThread(thread.id)).runs, 1);
-    const rootDb = await database();
-    const [root] = await rootDb
-      .select({ accepted: chatRunsTable.accepted })
-      .from(chatRunsTable)
-      .where(eq(chatRunsTable.id, admission.parentRunId));
-    assert.ok(root);
-    assert.equal(z.object({ build: z.string() }).parse(root.accepted).build, "testing-root-v1");
-    assert.equal((await hydrateThread(thread.id)).activeRun?.runId, admission.parentRunId);
-    const pending = await listPendingRuns();
-    assert.equal(
-      pending.some((run) => run.id === admission.parentRunId),
-      false,
-    );
-
-    const frames = await reserveRoleTasks(admission.parentRunId, admission.operationId, [
-      { role: "atlassian", input: { goal } },
-    ]);
-    assert.equal(frames.length, 1);
-    const frame = frames[0]!;
-    const same = await reserveRoleTasks(admission.parentRunId, admission.operationId, [
-      { role: "atlassian", input: { goal } },
-    ]);
-    assert.equal(same[0]?.taskId, frame.taskId);
-    await assert.rejects(
-      () =>
-        reserveRoleTasks(admission.parentRunId, admission.operationId, [
-          { role: "atlassian", input: { goal: "other" } },
-        ]),
-      /collision/,
-    );
-    assert.deepEqual(
-      await claimActualTask({
-        taskId: frame.taskId,
-        attemptNonce: frame.attemptNonce + 1,
-        childWorkflowId: frame.childWorkflowId,
-        parentRunId: admission.parentRunId,
-      }),
-      { state: "denied", reason: "nonce" },
-    );
-    assert.deepEqual(
-      await claimActualTask({
-        taskId: frame.taskId,
-        attemptNonce: frame.attemptNonce,
-        childWorkflowId: "other-child",
-        parentRunId: admission.parentRunId,
-      }),
-      { state: "denied", reason: "scope" },
-    );
-    assert.deepEqual(
-      await guardActualIO({
-        taskId: frame.taskId,
-        parentRunId: admission.parentRunId,
-        attemptNonce: frame.attemptNonce,
-        childWorkflowId: frame.childWorkflowId,
-        kind: "model",
-        step: "model-turn-1",
-      }),
-      { state: "allowed", slot: `${frame.taskId}-io-1` },
-    );
-    await claimActualTask({
-      taskId: frame.taskId,
-      attemptNonce: frame.attemptNonce,
-      childWorkflowId: frame.childWorkflowId,
-      parentRunId: admission.parentRunId,
-    });
-    assert.deepEqual(
-      await guardActualIO({
-        taskId: frame.taskId,
-        parentRunId: admission.parentRunId,
-        attemptNonce: frame.attemptNonce,
-        childWorkflowId: frame.childWorkflowId,
-        kind: "model",
-        step: "model-turn-1",
-      }),
-      { state: "allowed", slot: `${frame.taskId}-io-2` },
-    );
-
-    await assert.rejects(
-      () =>
-        appendTrustedObservation({
-          taskId: frame.taskId,
-          attemptNonce: frame.attemptNonce,
-          key: "minted-capture",
-          body: {
-            kind: "tool_started",
-            toolName: "source_capture",
-            route: "codemode",
-            at: privateMarker,
-          },
-        }),
-      /minted/,
-    );
-    await assert.rejects(
-      () =>
-        appendTrustedReceipt({
-          id: `cap-${randomUUID()}`,
-          taskId: frame.taskId,
-          attemptNonce: frame.attemptNonce,
-          slot: "raw",
-          nativeName: "source_capture",
-          route: "direct",
-          input: { source },
-          output: {
-            reference: source,
-            digest: "x",
-            anchors: ["AC-1"],
-            capturedAt: "2026-10-09T00:00:00.000Z",
-            raw: rawMarker,
-          },
-          bindings: {},
-        }),
-      /private host receipt/,
-    );
-    const capture = await linkSourceCapture(frame);
-    const requirements = await acceptRoleCandidate(admission.parentRunId, frame.taskId, {
-      criteria: [{ key: "AC-1", statement: "Checkout succeeds", source, anchor: "AC-1" }],
-      unresolved: ["price rule"],
-    });
-    const recovered = await acceptRoleCandidate(admission.parentRunId, frame.taskId, {
-      criteria: [{ key: "AC-1", statement: "Checkout succeeds", source, anchor: "AC-1" }],
-      unresolved: ["price rule"],
-    });
-    assert.deepEqual(recovered, requirements);
-
-    const planner = await reserveRoleTasks(admission.parentRunId, admission.operationId, [
-      { role: "planner", input: { goal } },
-    ]);
-    const plannerFrame = planner.find((task) => task.role === "planner")!;
-    const planCase = {
-      id: "case-1",
-      title: "Checkout",
-      preconditions: [] as string[],
-      actions: [{ kind: "navigate" as const, path: "/checkout" }],
-      checks: [
-        {
-          id: "check-1",
-          criterionId: "crit:AC-1",
-          kind: "functional" as const,
-          expectedObservation: "Order confirmation is visible",
-        },
-        {
-          id: "check-style",
-          criterionId: "crit:AC-1",
-          kind: "style" as const,
-          design,
-          property: "padding-left",
-          tolerance: { kind: "exact" as const },
-        },
-      ],
-    };
-    const plan = await acceptRoleCandidate(admission.parentRunId, plannerFrame.taskId, {
-      cases: [planCase],
-    });
-    const ac = await reserveRoleTasks(admission.parentRunId, admission.operationId, [
-      { role: "ac", input: { plan: plan.ref } },
-    ]);
-    const acFrame = ac.find((task) => task.role === "ac")!;
-    const fixture = hostFixture();
-    const tool = createUseBrowserTool({
-      role: "ac",
-      cases: [planCase],
-      checks: [planCase.checks[0]!],
-      fixture,
-      figmaProperties: null,
-      designCapture: null,
-    });
-    const output = browserOutputSchema.parse(await tool.execute!({ checkId: "check-1" }));
-    const drifted = { ...output, ignored: undefined };
-    const receipt = await appendTrustedReceipt({
-      id: `browser-${randomUUID()}`,
-      taskId: acFrame.taskId,
-      attemptNonce: acFrame.attemptNonce,
-      slot: "browser",
-      nativeName: "use_browser",
-      route: "direct",
-      input: { checkId: "check-1", unused: undefined },
-      output: drifted,
-      bindings: { fixture: fixture.identity, adapterVersion: fixture.adapterVersion },
-    });
-    const duplicate = await appendTrustedReceipt({
-      id: `browser-${randomUUID()}`,
-      taskId: acFrame.taskId,
-      attemptNonce: acFrame.attemptNonce,
-      slot: "browser-2",
-      nativeName: "use_browser",
-      route: "direct",
-      input: { checkId: "check-1" },
-      output,
-      bindings: { fixture: fixture.identity, adapterVersion: fixture.adapterVersion },
-    });
-    assert.equal(receipt.outputDigest, digestOf(output));
-    assert.equal(duplicate.outputDigest, receipt.outputDigest);
-    assert.equal(duplicate.duplicate, false);
-    await acceptRoleCandidate(admission.parentRunId, acFrame.taskId, {
-      checks: [
-        {
-          caseId: output.evidence.caseId,
-          checkId: output.checkId,
-          judgment: "simulated_blocked",
-          evidence: [{ receiptId: `browser-placeholder`, digest: receipt.outputDigest }],
-        },
-      ],
-    }).catch(() => undefined);
-    const storedReceiptId = await receiptIdFor(acFrame.taskId);
-    const acResult = await acceptRoleCandidate(admission.parentRunId, acFrame.taskId, {
-      checks: [
-        {
-          caseId: output.evidence.caseId,
-          checkId: output.checkId,
-          judgment: output.evidence.outcome === "blocked" ? "simulated_blocked" : "simulated_fail",
-          evidence: [{ receiptId: storedReceiptId, digest: receipt.outputDigest }],
-        },
-      ],
-    });
-    const execution = await readTestingExecution(admission.parentRunId, admission.operationId);
-    assert.equal(execution.intent.goal, goal);
-    assert.equal(execution.mode, "standalone");
-    assert.equal(execution.runtime.versions.model, MODEL);
-    assert.deepEqual(
-      execution.artifacts.map((artifact) => artifact.ref).sort(),
-      [requirements.ref, plan.ref, acResult.ref].sort(),
-    );
-    assert.equal(
-      execution.artifacts.find((artifact) => artifact.ref === plan.ref)?.provenance.producerTaskId,
-      plannerFrame.taskId,
-    );
-    const executionAc = execution.tasks.find((task) => task.frame.taskId === acFrame.taskId);
-    assert.deepEqual(executionAc?.receipts[0]?.output, output);
-    assert.deepEqual(executionAc?.receipts[0]?.input, { checkId: "check-1" });
-    const executionAtlassian = execution.tasks.find((task) => task.frame.taskId === frame.taskId);
-    assert.deepEqual(
-      executionAtlassian?.receipts.find((receipt) => receipt.nativeName === "source_capture")
-        ?.output,
-      capture,
-    );
-    await appendTrustedObservation({
-      taskId: acFrame.taskId,
-      attemptNonce: acFrame.attemptNonce,
-      key: "private-note",
-      body: { kind: "attempt_started", activity: "model", at: privateMarker },
-    });
-    const published = await publishProjection(admission.parentRunId, admission.operationId);
-    assert.equal(JSON.stringify(published).includes(privateMarker), false);
-    assert.equal(JSON.stringify(published).includes(rawMarker), false);
-    const reread = await readPublishedTesting(thread.id, admission.parentRunId);
-    assert.deepEqual(reread, published);
-    const againPublished = await publishProjection(admission.parentRunId, admission.operationId);
-    assert.deepEqual(againPublished, published);
-    const db = await database();
-    const events = await db
-      .select({
-        sequence: chatEventsTable.sequence,
-        payload: chatEventsTable.payload,
-        publicSequence: testingPublicationsTable.public_sequence,
-      })
-      .from(testingPublicationsTable)
-      .innerJoin(
-        testingOperationsTable,
-        eq(testingPublicationsTable.operation_id, testingOperationsTable.id),
-      )
-      .innerJoin(
-        chatEventsTable,
-        sql`${chatEventsTable.run_id} = ${testingOperationsTable.parent_run_id} and ${chatEventsTable.sequence} = ${testingPublicationsTable.public_sequence}`,
-      )
-      .where(eq(testingPublicationsTable.operation_id, admission.operationId));
-    assert.equal(events.length, 1);
-    assert.equal(events[0]?.sequence, events[0]?.publicSequence);
-    assert.equal(events[0]?.payload.type, "CUSTOM");
-    assert.equal(events[0]?.payload.name, "testing.projection");
-    const closed = await closeTesting(admission.parentRunId, admission.operationId, "failed");
-    assert.equal(closed.state, "finished");
-    assert.ok(closed.report);
-    assert.equal(closed.report.requirements?.unresolved[0], "price rule");
-    assert.equal(closed.report.plan?.cases[0]?.id, "case-1");
-    assert.equal(closed.report.results.ac[0]?.judgment, "simulated_blocked");
-    assert.equal(closed.report.results.ac[0]?.evidence[0]?.caseId, output.evidence.caseId);
-    assert.equal(closed.report.results.ui.length, 0);
-    assert.equal(closed.report.acceptance.verdict, "blocked");
-    assert.equal(closed.report.acceptance.reasons.includes("root_failed"), true);
-    assert.equal(closed.report.acceptance.reasons.includes("ui_results_missing"), true);
-    assert.equal(closed.availableArtifacts.includes(requirements.ref), true);
-    assert.equal(closed.availableArtifacts.includes(plan.ref), true);
-    assert.equal(closed.report.artifacts.includes(requirements.ref), true);
-    assert.equal(
-      closed.availableArtifacts.some((ref) => ref !== requirements.ref && ref !== plan.ref),
-      false,
-    );
-    assert.equal(JSON.stringify(closed).includes(privateMarker), false);
-    const hydrated = await hydrateThread(thread.id);
-    assert.equal(hydrated.activeRun, null);
-    assert.deepEqual(hydrated.publishedTesting, closed);
-    assert.equal(hydrated.revision, 0);
-    await assert.rejects(
-      () =>
-        appendTrustedObservation({
-          taskId: frame.taskId,
-          attemptNonce: frame.attemptNonce,
-          key: "late",
-          body: { kind: "attempt_settled", outcome: "completed", at: "late" },
-        }),
-      /terminal/,
-    );
-
-    const beforeReuse = await countForThread(thread.id);
-    await assert.rejects(
-      () => admitStandaloneTesting(testingRequest(thread.id, 0, [plan.ref])),
-      (error: unknown) => {
-        assert.ok(error instanceof TestingRequestError);
-        assert.equal(
-          error.decisions.some((decision) => decision.kind === "rejected"),
-          true,
-        );
-
-        return true;
-      },
-    );
-    assert.deepEqual(await countForThread(thread.id), beforeReuse);
-  },
-);
-
-async function receiptIdFor(taskId: string) {
-  const db = await database();
-  const rows = await db.execute<{ id: string }>(sql`
-    select id from testing_receipts where task_id = ${taskId} and native_name = 'use_browser' order by id
-  `);
-  const id = rows.rows[0]?.id;
-
-  if (!id) {
-    throw new Error("browser receipt was not stored");
-  }
-
-  return id;
-}
-
-test(
   "cancel freezes IO without renewing deadline and records delivery acks",
   { skip: !enabled, timeout: 60_000 },
   async () => {
     await ensureDatabase();
     const thread = await createThread();
-    const admission = await admitStandaloneTesting(testingRequest(thread.id, 0));
+    const admission = await admitSource(thread.id);
     const db = await database();
     const [before] = await db
       .select({ deadline: testingOperationsTable.deadline })
       .from(testingOperationsTable)
       .where(eq(testingOperationsTable.id, admission.operationId));
-    const frames = await reserveRoleTasks(admission.parentRunId, admission.operationId, [
-      { role: "atlassian", input: { goal } },
-    ]);
-    const budgetBeforeCancel = await taskBudget(frames[0]!.taskId);
+    const frame = (await reserveRoleTask(
+      admission.parentRunId,
+      admission.operationId,
+      "atlassian",
+      { goal },
+    ))!;
+    const budgetBeforeCancel = await taskBudget(frame.taskId);
     const view = await cancelTesting(admission.parentRunId, admission.operationId);
     assert.equal(view.state, "cancelling");
     const [after] = await db
@@ -677,187 +348,19 @@ test(
     await assert.rejects(() => ackDelivery(cancel.key, "quiet"), /not allowed/);
     assert.deepEqual(
       await guardActualIO({
-        taskId: frames[0]!.taskId,
+        taskId: frame.taskId,
         parentRunId: admission.parentRunId,
-        attemptNonce: frames[0]!.attemptNonce,
-        childWorkflowId: frames[0]!.childWorkflowId,
+        attemptNonce: frame.attemptNonce,
+        childWorkflowId: frame.childWorkflowId,
         kind: "tool",
       }),
       { state: "denied", reason: "cancel_requested" },
     );
-    assert.deepEqual(await taskBudget(frames[0]!.taskId), budgetBeforeCancel);
+    assert.deepEqual(await taskBudget(frame.taskId), budgetBeforeCancel);
     await assert.rejects(
-      () => acceptRoleCandidate(admission.parentRunId, frames[0]!.taskId, { criteria: [] }),
+      () => acceptRoleCandidate(admission.parentRunId, frame.taskId, { criteria: [] }),
       /fence/,
     );
-  },
-);
-
-test(
-  "attached finish closes unfinished testing before releasing the parent claim",
-  { skip: !enabled, timeout: 60_000 },
-  async () => {
-    await ensureDatabase();
-    const thread = await createThread();
-    const persisted = await persistRun({
-      kind: "chat",
-      threadId: thread.id,
-      runId: `run-${randomUUID()}`,
-      baseRevision: 0,
-      message: { id: `msg-${randomUUID()}`, text: "run tests" },
-    });
-    const before = await countForThread(thread.id);
-    const admission = await admitAttachedTesting(persisted.run, "call-1", {
-      goal,
-      sources: [source],
-      criteria: { kind: "all" },
-      targetUrl,
-      design,
-    });
-    assert.equal(admission.mode, "attached");
-    assert.equal(admission.parentRunId, persisted.run.runId);
-    assert.deepEqual(await countForThread(thread.id), {
-      runs: before.runs,
-      operations: before.operations + 1,
-    });
-    await finishRun(persisted.run.runId);
-    const hydrated = await hydrateThread(thread.id);
-    assert.equal(hydrated.activeRun, null);
-    assert.equal(hydrated.publishedTesting?.state, "finished");
-    assert.equal(hydrated.publishedTesting?.report?.acceptance.verdict, "blocked");
-    assert.equal(
-      hydrated.publishedTesting?.report?.acceptance.reasons.includes("root_failed"),
-      true,
-    );
-    assert.equal(hydrated.publishedTesting?.report?.requirements, null);
-    const db = await database();
-    const [operation] = await db
-      .select({ outcome: testingOperationsTable.terminal_outcome })
-      .from(testingOperationsTable)
-      .where(eq(testingOperationsTable.id, admission.operationId));
-    assert.equal(operation?.outcome, "failed");
-  },
-);
-
-test(
-  "cross-run results and conflicting requirements do not open a claim",
-  { skip: !enabled, timeout: 60_000 },
-  async () => {
-    await ensureDatabase();
-    const thread = await createThread();
-    const first = await admitStandaloneTesting(testingRequest(thread.id, 0));
-    const frame = (
-      await reserveRoleTasks(first.parentRunId, first.operationId, [
-        { role: "atlassian", input: { goal } },
-      ])
-    )[0]!;
-    await linkSourceCapture(frame);
-    const requirements = await acceptRoleCandidate(first.parentRunId, frame.taskId, {
-      criteria: [{ key: "AC-1", statement: "Checkout succeeds", source, anchor: "AC-1" }],
-      unresolved: [],
-    });
-    await closeTesting(first.parentRunId, first.operationId, "failed");
-    const second = await admitStandaloneTesting(testingRequest(thread.id, 0));
-    const secondFrame = (
-      await reserveRoleTasks(second.parentRunId, second.operationId, [
-        { role: "atlassian", input: { goal } },
-      ])
-    )[0]!;
-    await linkSourceCapture(secondFrame);
-    const other = await acceptRoleCandidate(second.parentRunId, secondFrame.taskId, {
-      criteria: [{ key: "AC-1", statement: "Checkout succeeds", source, anchor: "AC-1" }],
-      unresolved: [],
-    });
-    await closeTesting(second.parentRunId, second.operationId, "failed");
-    const before = await countForThread(thread.id);
-    await assert.rejects(
-      () => admitStandaloneTesting(testingRequest(thread.id, 0, [requirements.ref, other.ref])),
-      (error: unknown) => {
-        assert.ok(error instanceof TestingRequestError);
-        assert.equal(
-          error.decisions.some(
-            (decision) =>
-              decision.kind === "rejected" && decision.reason === "conflicting_reference",
-          ),
-          true,
-        );
-
-        return true;
-      },
-    );
-    assert.deepEqual(await countForThread(thread.id), before);
-  },
-);
-
-test(
-  "a plan without style checks marks UI not required and pins profile versions",
-  { skip: !enabled, timeout: 60_000 },
-  async () => {
-    await ensureDatabase();
-    const thread = await createThread();
-    const admission = await admitStandaloneTesting(testingRequest(thread.id, 0));
-    const frame = (
-      await reserveRoleTasks(admission.parentRunId, admission.operationId, [
-        { role: "atlassian", input: { goal } },
-      ])
-    )[0]!;
-    await linkSourceCapture(frame);
-    await acceptRoleCandidate(admission.parentRunId, frame.taskId, {
-      criteria: [{ key: "AC-1", statement: "Checkout succeeds", source, anchor: "AC-1" }],
-      unresolved: [],
-    });
-    const planner = (
-      await reserveRoleTasks(admission.parentRunId, admission.operationId, [
-        { role: "planner", input: { goal } },
-      ])
-    ).find((task) => task.role === "planner")!;
-    await acceptRoleCandidate(admission.parentRunId, planner.taskId, {
-      cases: [
-        {
-          id: "case-1",
-          title: "Checkout",
-          preconditions: [],
-          actions: [{ kind: "navigate", path: "/checkout" }],
-          checks: [
-            {
-              id: "check-1",
-              criterionId: "crit:AC-1",
-              kind: "functional",
-              expectedObservation: "Order confirmation is visible",
-            },
-          ],
-        },
-      ],
-    });
-    await assert.rejects(
-      () =>
-        reserveRoleTasks(admission.parentRunId, admission.operationId, [
-          { role: "ui", input: { goal } },
-        ]),
-      /not required/,
-    );
-    const view = await publishProjection(admission.parentRunId, admission.operationId);
-    assert.equal(view.progress.rows.ui.status, "not_required");
-    const db = await database();
-    const pins = await db
-      .select({ metadata: testingArtifactsTable.metadata })
-      .from(testingPinsTable)
-      .innerJoin(testingArtifactsTable, eq(testingPinsTable.ref, testingArtifactsTable.ref))
-      .where(eq(testingPinsTable.operation_id, admission.operationId));
-    assert.equal(pins.length >= 2, true);
-
-    for (const pin of pins) {
-      const metadata = pin.metadata as {
-        profiles?: { atlassian?: string };
-        registration?: { atlassian?: string };
-        versions?: { model?: string };
-      };
-      assert.equal(metadata.profiles?.atlassian, "requirements-v2");
-      assert.equal(typeof metadata.registration?.atlassian, "string");
-      assert.equal(metadata.versions?.model, MODEL);
-    }
-
-    await closeTesting(admission.parentRunId, admission.operationId, "missing");
   },
 );
 
@@ -867,15 +370,13 @@ test(
   async () => {
     await ensureDatabase();
     const thread = await createThread();
-    const admission = await admitStandaloneTesting(
-      testingRequest(thread.id, 0),
-      new Date("2000-01-01T00:00:00.000Z"),
-    );
-    const frame = (
-      await reserveRoleTasks(admission.parentRunId, admission.operationId, [
-        { role: "atlassian", input: { goal } },
-      ])
-    )[0]!;
+    const admission = await admitSource(thread.id, new Date("2000-01-01T00:00:00.000Z"));
+    const frame = (await reserveRoleTask(
+      admission.parentRunId,
+      admission.operationId,
+      "atlassian",
+      { goal },
+    ))!;
     const budgetBeforeDeadline = await taskBudget(frame.taskId);
     assert.deepEqual(
       await guardActualIO({
@@ -898,12 +399,13 @@ test(
   async () => {
     await ensureDatabase();
     const thread = await createThread();
-    const admission = await admitStandaloneTesting(testingRequest(thread.id, 0));
-    const frame = (
-      await reserveRoleTasks(admission.parentRunId, admission.operationId, [
-        { role: "atlassian", input: { goal } },
-      ])
-    )[0]!;
+    const admission = await admitSource(thread.id);
+    const frame = (await reserveRoleTask(
+      admission.parentRunId,
+      admission.operationId,
+      "atlassian",
+      { goal },
+    ))!;
     const db = await database();
     const receiptsBefore = await db
       .select({ id: testingReceiptsTable.id })
@@ -1035,12 +537,13 @@ test(
   async () => {
     await ensureDatabase();
     const thread = await createThread();
-    const admission = await admitStandaloneTesting(testingRequest(thread.id, 0));
-    const frame = (
-      await reserveRoleTasks(admission.parentRunId, admission.operationId, [
-        { role: "atlassian", input: { goal } },
-      ])
-    )[0]!;
+    const admission = await admitSource(thread.id);
+    const frame = (await reserveRoleTask(
+      admission.parentRunId,
+      admission.operationId,
+      "atlassian",
+      { goal },
+    ))!;
     const input = {
       taskId: frame.taskId,
       parentRunId: admission.parentRunId,
@@ -1079,12 +582,12 @@ test(
 );
 
 test(
-  "published cancellation matches operation or parent ids only while empty reads stay thread-wide",
+  "published cancellation requires operation identity and keeps foreign threads isolated",
   { skip: !enabled, timeout: 60_000 },
   async () => {
     await ensureDatabase();
     const thread = await createThread();
-    const admission = await admitStandaloneTesting(testingRequest(thread.id, 0));
+    const admission = await admitSource(thread.id);
     const published = await publishProjection(admission.parentRunId, admission.operationId);
     const missing = { status: 404, message: "Testing run was not found" };
 
@@ -1115,5 +618,1034 @@ test(
       .from(testingOperationsTable)
       .where(eq(testingOperationsTable.id, admission.operationId));
     assert.notEqual(accepted?.accepted, null);
+  },
+);
+
+test(
+  "explicit dependencies fail before admission and do not launch helpers",
+  { skip: !enabled },
+  async () => {
+    await ensureDatabase();
+    const thread = await createThread();
+    const parent = await parentRun(thread.id);
+    const before = await countForThread(thread.id);
+    for (const input of [
+      { role: "planner", summary: "Plan", requirementsRef: "foreign-ref" },
+      { role: "ac", summary: "Execute", planRef: "missing-ref", targetUrl },
+      { role: "ui", summary: "Style", planRef: "missing-ref", targetUrl },
+      { role: "planner", summary: "Plan", requirements: {} },
+    ]) {
+      await assert.rejects(
+        () => admitAttachedTesting(parent, randomUUID(), input),
+        /reference|intent/,
+      );
+    }
+    assert.deepEqual(await countForThread(thread.id), before);
+    const source = await admitAttachedTesting(parent, "source", sourceInput);
+    assert.equal(source.mode, "attached");
+    assert.equal((await countForThread(thread.id)).operations, 1);
+  },
+);
+
+test(
+  "child-selected current-attempt lexical capture IDs pass store and replay the same ref",
+  { skip: !enabled },
+  async () => {
+    await ensureDatabase();
+    for (const historicalAttempt of [false, true]) {
+      const thread = await createThread();
+      const parent = await parentRun(thread.id);
+      const admission = await admitAttachedTesting(parent, "capture-order", sourceInput);
+      const first = await reserveRoleTask(
+        parent.runId,
+        admission.operationId,
+        "atlassian",
+        sourceInput,
+      );
+      assert.ok(first);
+      const db = await database();
+      if (historicalAttempt) {
+        await linkVersionedCapture(first, "io-1");
+        await db
+          .update(testingTasksTable)
+          .set({ attempt_nonce: 2 })
+          .where(eq(testingTasksTable.id, first.taskId));
+      }
+      const task = { ...first, attemptNonce: historicalAttempt ? 2 : 1 };
+      const later = await linkVersionedCapture(task, "io-2");
+      const selected = await linkVersionedCapture(task, "io-10");
+      const execution = await readTestingExecution(parent.runId, admission.operationId);
+      const captures = execution.tasks[0]!.receipts.filter(
+        (receipt) => receipt.nativeName === "source_capture",
+      );
+      assert.deepEqual(
+        captures.map((receipt) => receipt.output),
+        [selected, later],
+      );
+      const proposal = {
+        criteria: [
+          {
+            key: "AC-1",
+            statement: "Checkout succeeds",
+            source,
+            anchorId: sourceCaptureView(selected).anchorRefs[0]!.id,
+          },
+        ],
+        unresolved: [],
+      };
+      await assert.rejects(
+        () =>
+          acceptRoleCandidate(parent.runId, task.taskId, {
+            ...proposal,
+            criteria: [
+              { ...proposal.criteria[0], anchorId: sourceCaptureView(later).anchorRefs[0]!.id },
+            ],
+          }),
+        /anchorId.*unknown anchor/,
+      );
+      const accepted = await acceptRoleCandidate(parent.runId, task.taskId, proposal);
+      assert.deepEqual(await acceptRoleCandidate(parent.runId, task.taskId, proposal), accepted);
+      const [artifact] = await db
+        .select()
+        .from(testingArtifactsTable)
+        .where(eq(testingArtifactsTable.ref, accepted.ref));
+      assert.deepEqual((artifact!.payload as { captures: unknown[] }).captures, [selected]);
+    }
+  },
+);
+
+test(
+  "legacy alternate capture snapshots replay bit-exact only with authenticated receipts and proposals",
+  { skip: !enabled },
+  async () => {
+    await ensureDatabase();
+    for (const historicalAttempt of [false, true]) {
+      const thread = await createThread();
+      const parent = await parentRun(thread.id);
+      const admission = await admitAttachedTesting(parent, "legacy-capture", sourceInput);
+      const task = await reserveRoleTask(
+        parent.runId,
+        admission.operationId,
+        "atlassian",
+        sourceInput,
+      );
+      assert.ok(task);
+      const legacyCapture = await linkVersionedCapture(task, "io-2");
+      const proposal = {
+        criteria: [{ key: "AC-1", statement: "Checkout succeeds", source, anchor: "AC-1" }],
+        unresolved: [],
+      };
+      const accepted = await acceptRoleCandidate(parent.runId, task.taskId, proposal);
+      const db = await database();
+      const [original] = await db
+        .select()
+        .from(testingArtifactsTable)
+        .where(eq(testingArtifactsTable.ref, accepted.ref));
+      assert.ok(original);
+      if (historicalAttempt) {
+        await db
+          .update(testingTasksTable)
+          .set({ attempt_nonce: 2 })
+          .where(eq(testingTasksTable.id, task.taskId));
+      }
+      const alternate = await linkVersionedCapture(
+        { ...task, attemptNonce: historicalAttempt ? 2 : 1 },
+        "io-10",
+      );
+      assert.deepEqual(await acceptRoleCandidate(parent.runId, task.taskId, proposal), accepted);
+      assert.deepEqual(
+        await acceptRoleCandidate(parent.runId, task.taskId, {
+          ...proposal,
+          criteria: [
+            {
+              key: "AC-1",
+              statement: "Checkout succeeds",
+              source,
+              anchorId: sourceCaptureView(legacyCapture).anchorRefs[0]!.id,
+            },
+          ],
+        }),
+        accepted,
+      );
+      await assert.rejects(
+        () =>
+          acceptRoleCandidate(parent.runId, task.taskId, {
+            ...proposal,
+            unresolved: ["Forged proposal"],
+          }),
+        /version mismatch/,
+      );
+      for (const capture of [
+        { ...legacyCapture, digest: "forged" },
+        { ...legacyCapture, capturedAt: "forged" },
+        { ...legacyCapture, reference: { kind: "jira", issueKey: "OTHER-1" } },
+        alternate,
+      ]) {
+        const forged = { ...(original.payload as Record<string, unknown>), captures: [capture] };
+        await db
+          .update(testingArtifactsTable)
+          .set({ payload: forged, payload_digest: digestOf(forged) })
+          .where(eq(testingArtifactsTable.ref, accepted.ref));
+        await assert.rejects(
+          () => acceptRoleCandidate(parent.runId, task.taskId, proposal),
+          /capture|version mismatch/,
+        );
+      }
+      await db
+        .update(testingArtifactsTable)
+        .set({ payload: original.payload, payload_digest: original.payload_digest })
+        .where(eq(testingArtifactsTable.ref, accepted.ref));
+      assert.deepEqual(await acceptRoleCandidate(parent.runId, task.taskId, proposal), accepted);
+      const [replayed] = await db
+        .select()
+        .from(testingArtifactsTable)
+        .where(eq(testingArtifactsTable.ref, accepted.ref));
+      assert.deepEqual(replayed, original);
+      const receiptId = `cap-${task.taskId}-1-io-2`;
+      const [receipt] = await db
+        .select()
+        .from(testingReceiptsTable)
+        .where(eq(testingReceiptsTable.id, receiptId));
+      assert.ok(receipt);
+      await db
+        .update(testingReceiptsTable)
+        .set({ bindings: { nativeName: "jira_get_issue", nativeOutputDigest: "forged" } })
+        .where(eq(testingReceiptsTable.id, receiptId));
+      await assert.rejects(
+        () => acceptRoleCandidate(parent.runId, task.taskId, proposal),
+        /host capture/,
+      );
+      await db
+        .update(testingReceiptsTable)
+        .set({ bindings: receipt.bindings })
+        .where(eq(testingReceiptsTable.id, receiptId));
+      const nativeId = `jira-${task.taskId}-1-io-2`;
+      const [native] = await db
+        .select()
+        .from(testingReceiptsTable)
+        .where(eq(testingReceiptsTable.id, nativeId));
+      assert.ok(native);
+      await db
+        .update(testingReceiptsTable)
+        .set({ output: { summary: "Forged native response" } })
+        .where(eq(testingReceiptsTable.id, nativeId));
+      await assert.rejects(
+        () => acceptRoleCandidate(parent.runId, task.taskId, proposal),
+        /native response/,
+      );
+      await db
+        .update(testingReceiptsTable)
+        .set({ output: native.output })
+        .where(eq(testingReceiptsTable.id, nativeId));
+      const metadata = original.metadata as { versions: Record<string, string> };
+      await db
+        .update(testingArtifactsTable)
+        .set({
+          metadata: { ...metadata, versions: { ...metadata.versions, model: "forged-model" } },
+        })
+        .where(eq(testingArtifactsTable.ref, accepted.ref));
+      await assert.rejects(
+        () => acceptRoleCandidate(parent.runId, task.taskId, proposal),
+        /version mismatch/,
+      );
+      await db
+        .update(testingArtifactsTable)
+        .set({ metadata: original.metadata })
+        .where(eq(testingArtifactsTable.ref, accepted.ref));
+      assert.deepEqual(await acceptRoleCandidate(parent.runId, task.taskId, proposal), accepted);
+    }
+  },
+);
+
+test(
+  "single-role admissions preserve retries, sealed dependencies, receipts and all history",
+  { skip: !enabled, timeout: 120_000 },
+  async () => {
+    await ensureDatabase();
+    const thread = await createThread();
+    const parent = await parentRun(thread.id);
+    const sourceAdmission = await admitAttachedTesting(parent, "source", sourceInput);
+    const again = await admitAttachedTesting(parent, "source", sourceInput, new Date("2030-01-01"));
+    assert.deepEqual(again, sourceAdmission);
+    await assert.rejects(
+      () => admitAttachedTesting(parent, "source", { ...sourceInput, summary: "Changed" }),
+      /collision/,
+    );
+    const sourceTask = await reserveRoleTask(
+      parent.runId,
+      sourceAdmission.operationId,
+      "atlassian",
+      sourceInput,
+    );
+    assert.ok(sourceTask);
+    await assert.rejects(
+      () => reserveRoleTask(parent.runId, sourceAdmission.operationId, "planner", {}),
+      /explicitly delegated/,
+    );
+    await assert.rejects(
+      () =>
+        reserveRoleTask(parent.runId, sourceAdmission.operationId, "atlassian", { altered: true }),
+      /collision/,
+    );
+    await assert.rejects(
+      () =>
+        appendTrustedObservation({
+          taskId: sourceTask.taskId,
+          attemptNonce: 1,
+          key: "forged",
+          body: {
+            kind: "tool_started",
+            toolName: "source_capture",
+            route: "direct",
+            at: privateMarker,
+          },
+        }),
+      /minted/,
+    );
+    await assert.rejects(
+      () =>
+        appendTrustedReceipt({
+          id: "forged",
+          taskId: sourceTask.taskId,
+          attemptNonce: 1,
+          slot: "forged",
+          nativeName: "source_capture",
+          route: "direct",
+          input: { source },
+          output: {
+            reference: source,
+            digest: "forged",
+            anchors: ["AC-1"],
+            capturedAt: "today",
+            raw: rawMarker,
+          },
+          bindings: {},
+        }),
+      /private host receipt/,
+    );
+    const capture = await linkSourceCapture(sourceTask);
+    const proposal = {
+      criteria: [{ key: "AC-1", statement: "Checkout succeeds", source, anchor: "AC-1" }],
+      unresolved: [],
+    };
+    await assert.rejects(
+      () =>
+        acceptRoleCandidate(parent.runId, sourceTask.taskId, {
+          kind: "not_extractable",
+          unresolved: ["No extractable behavior"],
+        }),
+      /requirements_not_extractable/,
+    );
+    const idProposal = {
+      criteria: [
+        {
+          key: "AC-1",
+          statement: "Checkout succeeds",
+          source,
+          anchorId: sourceCaptureView(capture).anchorRefs[0]!.id,
+        },
+      ],
+      unresolved: [],
+    };
+    await assert.rejects(
+      () =>
+        acceptRoleCandidate(parent.runId, sourceTask.taskId, {
+          ...idProposal,
+          criteria: [{ ...idProposal.criteria[0], anchorId: "forged" }],
+        }),
+      /anchorId.*unknown anchor/,
+    );
+    const requirements = await acceptRoleCandidate(parent.runId, sourceTask.taskId, proposal);
+    assert.deepEqual(
+      await acceptRoleCandidate(parent.runId, sourceTask.taskId, proposal),
+      requirements,
+    );
+    assert.deepEqual(
+      await acceptRoleCandidate(parent.runId, sourceTask.taskId, idProposal),
+      requirements,
+    );
+    await ackDelivery(`start:${sourceTask.taskId}`, "quiet");
+    const firstView = await closeTesting(parent.runId, sourceAdmission.operationId, "completed");
+    assert.equal(firstView.runId, sourceAdmission.operationId);
+    assert.equal(firstView.progress.rows.atlassian.status, "terminal");
+    assert.equal(firstView.task?.result?.kind, "requirements");
+    assert.equal(
+      firstView.task?.result?.kind === "requirements" &&
+        firstView.task.result.payload.criteria[0]?.statement,
+      "Checkout succeeds",
+    );
+    assert.equal(firstView.report, null);
+
+    const plannerInput = delegationInputSchema.parse({
+      role: "planner",
+      summary: "Plan checkout",
+      requirementsRef: requirements.ref,
+      design,
+    });
+    const planning = await admitAttachedTesting(parent, "plan", plannerInput);
+    const planner = await reserveRoleTask(
+      parent.runId,
+      planning.operationId,
+      "planner",
+      plannerInput,
+    );
+    assert.ok(planner);
+    const planCase = {
+      id: "case-1",
+      title: "Checkout",
+      preconditions: [],
+      actions: [{ kind: "navigate" as const, path: "/checkout" }],
+      checks: [
+        {
+          id: "check-1",
+          criterionId: "crit:AC-1",
+          kind: "functional" as const,
+          expectedObservation: "Order confirmation is visible",
+        },
+      ],
+    };
+    const plan = await acceptRoleCandidate(parent.runId, planner.taskId, { cases: [planCase] });
+    const execution = await readTestingExecution(parent.runId, planning.operationId);
+    assert.equal(execution.intent.targetUrl, null);
+    assert.equal(execution.tasks.length, 1);
+    assert.equal(execution.tasks[0]?.frame.role, "planner");
+    assert.equal(
+      (execution.artifacts.find((item) => item.ref === plan.ref)?.payload as { targetUrl: unknown })
+        .targetUrl,
+      null,
+    );
+    await ackDelivery(`start:${planner.taskId}`, "quiet");
+    await closeTesting(parent.runId, planning.operationId, "completed");
+
+    await assert.rejects(
+      () =>
+        admitAttachedTesting(parent, "wrong-role", {
+          role: "planner",
+          summary: "Wrong",
+          requirementsRef: plan.ref,
+        }),
+      /wrong_kind/,
+    );
+    await assert.rejects(
+      () =>
+        admitAttachedTesting(parent, "no-style", {
+          role: "ui",
+          summary: "Style",
+          planRef: plan.ref,
+          targetUrl,
+        }),
+      /no checks/,
+    );
+    const foreignThread = await createThread();
+    const foreignParent = await parentRun(foreignThread.id);
+    await assert.rejects(
+      () => admitAttachedTesting(foreignParent, "foreign", plannerInput),
+      /not_accessible/,
+    );
+
+    const acInput = delegationInputSchema.parse({
+      role: "ac",
+      summary: "Check checkout",
+      planRef: plan.ref,
+      targetUrl,
+    });
+    const checking = await admitAttachedTesting(parent, "ac", acInput);
+    const ac = await reserveRoleTask(parent.runId, checking.operationId, "ac", acInput);
+    assert.ok(ac);
+    const fixture = hostFixture();
+    const tool = createUseBrowserTool({
+      role: "ac",
+      cases: [planCase],
+      checks: planCase.checks,
+      fixture,
+      figmaProperties: null,
+      designCapture: null,
+    });
+    const output = browserOutputSchema.parse(await tool.execute!({ checkId: "check-1" }));
+    const receiptId = `browser-${randomUUID()}`;
+    const receipt = await appendTrustedReceipt({
+      id: receiptId,
+      taskId: ac.taskId,
+      attemptNonce: 1,
+      slot: "browser",
+      nativeName: "use_browser",
+      route: "direct",
+      input: { checkId: "check-1" },
+      output,
+      bindings: { fixture: fixture.identity, adapterVersion: fixture.adapterVersion },
+    });
+    const resultProposal = {
+      checks: [
+        {
+          caseId: "case-1",
+          checkId: "check-1",
+          judgment: "simulated_blocked",
+          evidence: [{ receiptId, digest: receipt.outputDigest }],
+        },
+      ],
+    };
+    await assert.rejects(
+      () =>
+        acceptRoleCandidate(parent.runId, ac.taskId, {
+          checks: [
+            {
+              ...resultProposal.checks[0],
+              evidence: [{ receiptId: "forged", digest: receipt.outputDigest }],
+            },
+          ],
+        }),
+      /receipt/,
+    );
+    const result = await acceptRoleCandidate(parent.runId, ac.taskId, resultProposal);
+    await ackDelivery(`start:${ac.taskId}`, "quiet");
+    const lastView = await closeTesting(parent.runId, checking.operationId, "completed");
+    assert.equal(
+      lastView.task?.result?.kind === "ac-result" && lastView.task.result.payload[0]?.judgment,
+      "simulated_blocked",
+    );
+    assert.equal(lastView.task?.result?.ref, result.ref);
+    assert.equal(lastView.report, null);
+    assert.equal(JSON.stringify(lastView).includes(rawMarker), false);
+    assert.equal(JSON.stringify(lastView).includes(privateMarker), false);
+    assert.deepEqual(await readPublishedTesting(thread.id, checking.operationId), lastView);
+    assert.deepEqual(await publishProjection(parent.runId, checking.operationId), lastView);
+    const hydrated = await hydrateThread(thread.id);
+    assert.deepEqual(
+      hydrated.publishedTasks.map((view) => view.task?.role),
+      ["atlassian", "planner", "ac"],
+    );
+    assert.equal(new Set(hydrated.publishedTasks.map((view) => view.runId)).size, 3);
+    const storedSource = await readTestingExecution(parent.runId, sourceAdmission.operationId);
+    assert.deepEqual(
+      storedSource.tasks[0]?.receipts.find((item) => item.nativeName === "source_capture")?.output,
+      capture,
+    );
+    const db = await database();
+    const pins = await db
+      .select({ metadata: testingArtifactsTable.metadata })
+      .from(testingPinsTable)
+      .innerJoin(testingArtifactsTable, eq(testingPinsTable.ref, testingArtifactsTable.ref))
+      .where(eq(testingPinsTable.operation_id, checking.operationId));
+    assert.equal(pins.length, 3);
+    for (const pin of pins) {
+      assert.equal((pin.metadata as { versions: { model: string } }).versions.model, MODEL);
+    }
+    await finishRun(parent.runId);
+    assert.equal((await hydrateThread(thread.id)).activeRun, null);
+  },
+);
+
+test(
+  "cancel isolates a task, preserves live activity, and fences late proposals",
+  { skip: !enabled },
+  async () => {
+    await ensureDatabase();
+    const thread = await createThread();
+    const parent = await parentRun(thread.id);
+    const first = await admitAttachedTesting(parent, "first", sourceInput);
+    const second = await admitAttachedTesting(parent, "second", sourceInput);
+    const task = await reserveRoleTask(parent.runId, first.operationId, "atlassian", sourceInput);
+    assert.ok(task);
+    await appendTrustedObservation({
+      taskId: task.taskId,
+      attemptNonce: 1,
+      key: "tool",
+      body: {
+        kind: "tool_started",
+        toolName: "jira_get_issue",
+        route: "direct",
+        at: "2026-01-01T00:00:00Z",
+      },
+    });
+    const cancelled = await cancelPublishedTesting(thread.id, first.operationId);
+    assert.deepEqual(cancelled.progress.rows.atlassian, {
+      status: "cancelling",
+      active: [{ toolName: "jira_get_issue", route: "direct", startedAt: "2026-01-01T00:00:00Z" }],
+    });
+    assert.equal(
+      (await readTestingExecution(parent.runId, second.operationId)).cancelRequested,
+      false,
+    );
+    assert.equal((await hydrateThread(thread.id)).activeRun?.runId, parent.runId);
+    await assert.rejects(() => acceptRoleCandidate(parent.runId, task.taskId, {}), /fence/);
+    await assert.rejects(() => cancelPublishedTesting(thread.id, parent.runId), /not found/);
+  },
+);
+
+test(
+  "malformed dependency payloads are rejected before admitting work",
+  { skip: !enabled },
+  async () => {
+    await ensureDatabase();
+    const thread = await createThread();
+    const parent = await parentRun(thread.id);
+    const admission = await admitAttachedTesting(parent, "source", sourceInput);
+    const task = await reserveRoleTask(
+      parent.runId,
+      admission.operationId,
+      "atlassian",
+      sourceInput,
+    );
+    assert.ok(task);
+    await linkSourceCapture(task);
+    const requirements = await acceptRoleCandidate(parent.runId, task.taskId, {
+      criteria: [{ key: "AC-1", statement: "Checkout succeeds", source, anchor: "AC-1" }],
+      unresolved: [],
+    });
+    const db = await database();
+    const [storedRequirements] = await db
+      .select()
+      .from(testingArtifactsTable)
+      .where(eq(testingArtifactsTable.ref, requirements.ref));
+    assert.ok(storedRequirements);
+    for (const payload of [
+      null,
+      {},
+      { ...(storedRequirements.payload as object), goal: "Tampered goal" },
+    ]) {
+      await db
+        .update(testingArtifactsTable)
+        .set({ payload: sql`${JSON.stringify(payload)}::jsonb` })
+        .where(eq(testingArtifactsTable.ref, requirements.ref));
+      await assert.rejects(
+        () =>
+          admitAttachedTesting(parent, `bad-requirements-${randomUUID()}`, {
+            role: "planner",
+            summary: "Plan",
+            requirementsRef: requirements.ref,
+          }),
+        TestingRequestError,
+      );
+      assert.equal((await countForThread(thread.id)).operations, 1);
+    }
+    await db
+      .update(testingArtifactsTable)
+      .set({ payload: storedRequirements.payload })
+      .where(eq(testingArtifactsTable.ref, requirements.ref));
+    const plannerInput = {
+      role: "planner",
+      summary: "Plan",
+      requirementsRef: requirements.ref,
+    } as const;
+    const planning = await admitAttachedTesting(parent, "plan", plannerInput);
+    const planner = await reserveRoleTask(
+      parent.runId,
+      planning.operationId,
+      "planner",
+      plannerInput,
+    );
+    assert.ok(planner);
+    const plan = await acceptRoleCandidate(parent.runId, planner.taskId, {
+      cases: [
+        {
+          id: "case-1",
+          title: "Checkout",
+          preconditions: [],
+          actions: [{ kind: "navigate", path: "/checkout" }],
+          checks: [
+            {
+              id: "check-1",
+              criterionId: "crit:AC-1",
+              kind: "functional",
+              expectedObservation: "Checkout succeeds",
+            },
+          ],
+        },
+      ],
+    });
+    for (const payload of [null, {}, { targetUrl, assignments: null }]) {
+      await db
+        .update(testingArtifactsTable)
+        .set({ payload: sql`${JSON.stringify(payload)}::jsonb` })
+        .where(eq(testingArtifactsTable.ref, plan.ref));
+      await assert.rejects(
+        () =>
+          admitAttachedTesting(parent, `bad-plan-${randomUUID()}`, {
+            role: "ac",
+            summary: "Check",
+            planRef: plan.ref,
+            targetUrl,
+          }),
+        TestingRequestError,
+      );
+      assert.equal((await countForThread(thread.id)).operations, 2);
+    }
+  },
+);
+
+test(
+  "run-scoped origins survive old finished publication reads without rewriting rows",
+  { skip: !enabled },
+  async () => {
+    await ensureDatabase();
+    const thread = await createThread();
+    const db = await database();
+    for (const messageId of ["origin-first", "origin-second"]) {
+      const parent = await parentRun(thread.id);
+      const callId = "reused-call";
+      const assistant = {
+        id: messageId,
+        role: "assistant" as const,
+        parts: [
+          {
+            type: "tool-call" as const,
+            id: callId,
+            name: "delegate_task",
+            arguments: "{}",
+            state: "input-complete" as const,
+          },
+        ],
+      };
+      const display = [...parent.messages, assistant];
+      await emit(
+        parent.runId,
+        {
+          type: "TOOL_CALL_START",
+          timestamp: 1,
+          toolCallId: callId,
+          toolCallName: "delegate_task",
+          ...(messageId === "origin-first" ? { parentMessageId: messageId } : {}),
+        },
+        { display, context: display },
+      );
+      const admission = await admitAttachedTesting(parent, callId, sourceInput);
+      const active = await publishProjection(parent.runId, admission.operationId);
+      const origin = { parentRunId: parent.runId, requestKey: callId, parentMessageId: messageId };
+      assert.deepEqual(active.task?.origin, origin);
+      assert.deepEqual(
+        (await cancelPublishedTesting(thread.id, admission.operationId)).task?.origin,
+        origin,
+      );
+      const terminal = await closeTesting(parent.runId, admission.operationId, "missing");
+      assert.deepEqual(terminal.task?.origin, origin);
+      assert.ok(terminal.task);
+      const { origin: _origin, ...task } = terminal.task;
+      await db
+        .update(testingPublicationsTable)
+        .set({ view: { ...terminal, task } })
+        .where(eq(testingPublicationsTable.operation_id, admission.operationId));
+      const before = await db
+        .select()
+        .from(testingPublicationsTable)
+        .where(eq(testingPublicationsTable.operation_id, admission.operationId));
+      assert.deepEqual(
+        (await publishProjection(parent.runId, admission.operationId)).task?.origin,
+        origin,
+      );
+      assert.deepEqual(
+        (await readPublishedTesting(thread.id, admission.operationId))?.task?.origin,
+        origin,
+      );
+      assert.deepEqual(
+        (await hydrateThread(thread.id)).publishedTasks.find(
+          (view) => view.runId === admission.operationId,
+        )?.task?.origin,
+        origin,
+      );
+      assert.deepEqual(
+        await db
+          .select()
+          .from(testingPublicationsTable)
+          .where(eq(testingPublicationsTable.operation_id, admission.operationId)),
+        before,
+      );
+      await finishRun(parent.runId, { display, context: display });
+      await db.update(threadsTable).set({ revision: 0 }).where(eq(threadsTable.id, thread.id));
+    }
+    const hydrated = await hydrateThread(thread.id);
+    assert.deepEqual(
+      new Set(hydrated.publishedTasks.map((view) => view.task?.origin?.parentMessageId)),
+      new Set(["origin-first", "origin-second"]),
+    );
+  },
+);
+
+test(
+  "origin fallback requires a unique new run owner and never overrides conflicting events",
+  { skip: !enabled },
+  async () => {
+    await ensureDatabase();
+    const thread = await createThread();
+    const db = await database();
+    for (const [label, parents, owners, expected] of [
+      ["missing-parent", [null], ["survivor"], "survivor"],
+      ["ambiguous", [null], ["one", "two"], null],
+      ["conflicting", ["abandoned", "survivor"], ["survivor"], null],
+      ["abandoned", [null, null], ["survivor"], "survivor"],
+      ["wrong-owner", ["abandoned"], ["survivor"], null],
+      ["no-event", [], ["survivor"], null],
+    ] as const) {
+      const parent = await parentRun(thread.id);
+      const display = [
+        ...parent.messages,
+        ...owners.map((id) => ({
+          id: `${label}-${id}`,
+          role: "assistant" as const,
+          parts: [
+            {
+              type: "tool-call" as const,
+              id: label,
+              name: "delegate_task",
+              arguments: "{}",
+              state: "input-complete" as const,
+            },
+          ],
+        })),
+      ];
+      await db
+        .update(chatRunsTable)
+        .set({ projection: { version: 1, display, context: display } })
+        .where(eq(chatRunsTable.id, parent.runId));
+      for (const [sequence, parentMessageId] of parents.entries()) {
+        await db.insert(chatEventsTable).values({
+          run_id: parent.runId,
+          sequence: sequence + 100,
+          event_key: `${label}-${sequence}`,
+          payload: {
+            type: "TOOL_CALL_START",
+            timestamp: 1,
+            toolCallId: label,
+            toolCallName: "delegate_task",
+            ...(parentMessageId === null ? {} : { parentMessageId: `${label}-${parentMessageId}` }),
+          },
+        });
+      }
+      const admission = await admitAttachedTesting(parent, label, sourceInput);
+      const view = await publishProjection(parent.runId, admission.operationId);
+      assert.deepEqual(
+        view.task?.origin ?? null,
+        expected === null
+          ? null
+          : {
+              parentRunId: parent.runId,
+              requestKey: label,
+              parentMessageId: `${label}-${expected}`,
+            },
+        label,
+      );
+      await closeTesting(parent.runId, admission.operationId, "missing");
+      await finishRun(parent.runId, { display, context: display });
+      await db.update(threadsTable).set({ revision: 0 }).where(eq(threadsTable.id, thread.id));
+    }
+  },
+);
+
+test(
+  "planner reuses unresolved requirements without a URL while execution stays blocked",
+  { skip: !enabled },
+  async () => {
+    await ensureDatabase();
+    const thread = await createThread();
+    const parent = await parentRun(thread.id);
+    const admission = await admitAttachedTesting(parent, "source", sourceInput);
+    const task = await reserveRoleTask(
+      parent.runId,
+      admission.operationId,
+      "atlassian",
+      sourceInput,
+    );
+    assert.ok(task);
+    await linkSourceCapture(task);
+    const requirements = await acceptRoleCandidate(parent.runId, task.taskId, {
+      criteria: [{ key: "AC-1", statement: "Checkout succeeds", source, anchor: "AC-1" }],
+      unresolved: ["price rule"],
+    });
+    const planning = await admitAttachedTesting(parent, "planner", {
+      role: "planner",
+      summary: "Plan",
+      requirementsRef: requirements.ref,
+    });
+    const planner = await reserveRoleTask(parent.runId, planning.operationId, "planner", {
+      role: "planner",
+      summary: "Plan",
+      requirementsRef: requirements.ref,
+    });
+    assert.ok(planner);
+    const plan = await acceptRoleCandidate(parent.runId, planner.taskId, {
+      cases: [
+        {
+          id: "case-1",
+          title: "Checkout",
+          preconditions: [],
+          actions: [{ kind: "navigate", path: "/checkout" }],
+          checks: [
+            {
+              id: "check-1",
+              criterionId: "crit:AC-1",
+              kind: "functional",
+              expectedObservation: "Checkout succeeds",
+            },
+          ],
+        },
+      ],
+    });
+    const execution = await readTestingExecution(parent.runId, planning.operationId);
+    assert.equal(execution.intent.targetUrl, null);
+    assert.deepEqual(
+      execution.tasks.map((entry) => entry.frame.role),
+      ["planner"],
+    );
+    const storedPlan = execution.artifacts.find((artifact) => artifact.ref === plan.ref);
+    assert.deepEqual((storedPlan?.payload as { assignments: unknown }).assignments, {
+      ac: ["check-1"],
+      ui: [],
+    });
+    const db = await database();
+    const [planRow] = await db
+      .select({ metadata: testingArtifactsTable.metadata })
+      .from(testingArtifactsTable)
+      .where(eq(testingArtifactsTable.ref, plan.ref));
+    assert.equal((planRow?.metadata as { complete: boolean }).complete, false);
+    await assert.rejects(
+      () =>
+        admitAttachedTesting(parent, "execute", {
+          role: "ac",
+          summary: "Execute",
+          planRef: plan.ref,
+          targetUrl,
+        }),
+      (error: unknown) =>
+        error instanceof TestingRequestError &&
+        error.decisions.some(
+          (decision) => decision.kind === "rejected" && decision.reason === "dependency_rejected",
+        ),
+    );
+    assert.equal((await countForThread(thread.id)).operations, 2);
+  },
+);
+
+test(
+  "an invalid newest publication omits finished work without reviving its older active card",
+  { skip: !enabled, timeout: 60_000 },
+  async () => {
+    await ensureDatabase();
+    const thread = await createThread();
+    const parent = await parentRun(thread.id);
+    const invalid = await admitAttachedTesting(parent, "invalid-latest", sourceInput);
+    const older = await publishProjection(parent.runId, invalid.operationId);
+    const newest = await closeTesting(parent.runId, invalid.operationId, "missing");
+    const healthy = await admitAttachedTesting(parent, "healthy", sourceInput);
+    const healthyView = await closeTesting(parent.runId, healthy.operationId, "missing");
+    const db = await database();
+    const publications = await db
+      .select({ version: testingPublicationsTable.version, view: testingPublicationsTable.view })
+      .from(testingPublicationsTable)
+      .where(eq(testingPublicationsTable.operation_id, invalid.operationId))
+      .orderBy(testingPublicationsTable.version);
+    assert.deepEqual(publications, [
+      { version: older.progress.version, view: older },
+      { version: newest.progress.version, view: newest },
+    ]);
+    assert.equal(older.state, "active");
+    assert.equal(newest.state, "finished");
+    assert.equal((await readTestingExecution(parent.runId, invalid.operationId)).finished, true);
+    await finishRun(parent.runId, { display: parent.messages, context: parent.context });
+    const before = await hydrateThread(thread.id);
+    assert.ok(before.messages.length > 0);
+    assert.equal(before.activeRun, null);
+    await db.update(testingPublicationsTable).set({ view: { raw: privateMarker } }).where(sql`
+        ${testingPublicationsTable.operation_id} = ${invalid.operationId}
+        and ${testingPublicationsTable.version} = ${newest.progress.version}
+      `);
+    const diagnostic = mock.method(console, "warn", () => undefined);
+    try {
+      const hydrated = await hydrateThread(thread.id);
+      assert.deepEqual(hydrated.messages, before.messages);
+      assert.equal(hydrated.activeRun, null);
+      assert.deepEqual(
+        diagnostic.mock.calls.map((call) => call.arguments),
+        [
+          [
+            "Invalid testing publication",
+            {
+              operationId: invalid.operationId,
+              threadId: thread.id,
+              version: newest.progress.version,
+            },
+          ],
+        ],
+      );
+      assert.equal(JSON.stringify(diagnostic.mock.calls).includes(privateMarker), false);
+      assert.deepEqual(hydrated.publishedTasks, [healthyView]);
+      assert.deepEqual(hydrated.publishedTesting, healthyView);
+    } finally {
+      diagnostic.mock.restore();
+    }
+  },
+);
+
+test(
+  "legacy cards with one parent hydrate as distinct operations and cutover fails without mutations",
+  { skip: !enabled },
+  async () => {
+    await ensureDatabase();
+    const thread = await createThread();
+    const parent = await parentRun(thread.id);
+    const ids = [];
+    const db = await database();
+    for (const callId of ["old-one", "old-two"]) {
+      const admission = await admitAttachedTesting(parent, callId, sourceInput);
+      const view = await publishProjection(parent.runId, admission.operationId);
+      const { task: _task, ...legacy } = view;
+      await db
+        .update(testingPublicationsTable)
+        .set({ view: { ...legacy, runId: parent.runId } })
+        .where(eq(testingPublicationsTable.operation_id, admission.operationId));
+      await db
+        .update(testingOperationsTable)
+        .set({ intent: { goal, sources: [source], criteria: { kind: "all" }, targetUrl } })
+        .where(eq(testingOperationsTable.id, admission.operationId));
+      ids.push(admission.operationId);
+    }
+    const before = await db
+      .select()
+      .from(testingOperationsTable)
+      .where(eq(testingOperationsTable.thread_id, thread.id));
+    await assert.rejects(() => assertDelegationCutover(), /Maintenance.*no records were changed/);
+    assert.deepEqual(
+      await db
+        .select()
+        .from(testingOperationsTable)
+        .where(eq(testingOperationsTable.thread_id, thread.id)),
+      before,
+    );
+    const messages = (await hydrateThread(thread.id)).messages;
+    const invalidIds = [];
+    for (const view of [null, 3, { raw: privateMarker }]) {
+      const admission = await admitAttachedTesting(
+        parent,
+        `invalid-${invalidIds.length}`,
+        sourceInput,
+      );
+      await publishProjection(parent.runId, admission.operationId);
+      await db
+        .update(testingPublicationsTable)
+        .set({ view: sql`${JSON.stringify(view)}::jsonb` })
+        .where(eq(testingPublicationsTable.operation_id, admission.operationId));
+      invalidIds.push(admission.operationId);
+    }
+    const diagnostic = mock.method(console, "warn", () => undefined);
+    let hydrated;
+    try {
+      hydrated = await hydrateThread(thread.id);
+      assert.equal(diagnostic.mock.calls.length, 3);
+      assert.deepEqual(
+        diagnostic.mock.calls.map((call) => call.arguments[1].operationId).sort(),
+        [...invalidIds].sort(),
+      );
+      assert.equal(JSON.stringify(diagnostic.mock.calls).includes(privateMarker), false);
+    } finally {
+      diagnostic.mock.restore();
+    }
+    assert.deepEqual(hydrated.messages, messages);
+    const views = hydrated.publishedTasks;
+    assert.deepEqual(
+      views.map((view) => view.runId),
+      ids,
+    );
+    assert.equal(
+      views.every((view) => view.state === "active" && !view.task),
+      true,
+    );
   },
 );

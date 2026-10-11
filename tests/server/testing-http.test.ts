@@ -3,14 +3,16 @@ import { test } from "node:test";
 import app from "../../server/testing";
 
 for (const body of ["{}", "null", "{", JSON.stringify({ threadId: "invalid", unexpected: true })]) {
-  test(`the original request entry rejects ${body} with 400`, async () => {
+  test(`the retired whole-pipeline entry rejects ${body} with 410`, async () => {
     const response = await app.request("/", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body,
     });
-    assert.equal(response.status, 400);
-    assert.deepEqual(await response.json(), { error: "Invalid testing request" });
+    assert.equal(response.status, 410);
+    assert.deepEqual(await response.json(), {
+      error: "Whole-pipeline testing is retired. Use delegate_task in the main conversation.",
+    });
   });
 }
 

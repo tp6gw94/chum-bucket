@@ -14,6 +14,7 @@ import {
 import {
   TESTING_PROJECTION_EVENT,
   parsePublishedTesting,
+  parsePublishedTasks,
   parseTestingProjectionEvent,
   testingProjectionEvent,
 } from "../../shared/testing-event";
@@ -248,7 +249,7 @@ test("private child fields never reach the parsed view or its report", () => {
     report: { ...report, privateChildToken: "report-secret" },
   };
   const parsedReport = parseTestingProjectionEvent(chunk(withPrivateReport));
-  assert.ok(parsedReport && parsedReport.state === "finished");
+  assert.ok(parsedReport && parsedReport.state === "finished" && parsedReport.report);
   assert.equal("privateChildToken" in parsedReport.report, false);
   assert.equal(JSON.stringify(parsedReport).includes("report-secret"), false);
 });
@@ -263,6 +264,54 @@ test("private fields nested in strict shared shapes reject the whole event", () 
     },
   };
   assert.equal(parseTestingProjectionEvent(chunk(withPrivateCase)), null);
+});
+
+test("hydration retains every individual task and legacy view", () => {
+  const first = {
+    ...activeView,
+    runId: testRunIdSchema.parse("operation-one"),
+    task: { version: 2 as const, role: "planner" as const, summary: "Plan checkout", result: null },
+  };
+  const second = { ...finishedView, runId: testRunIdSchema.parse("operation-two") };
+  assert.deepEqual(parsePublishedTasks({ publishedTasks: [first, second] }), [first, second]);
+  assert.deepEqual(parsePublishedTasks({ publishedTesting: finishedView }), [finishedView]);
+  assert.deepEqual(parseTestingProjectionEvent(testingProjectionEvent(first)), first);
+});
+
+test("task origin survives stream and hydration parsing while private evidence is stripped", () => {
+  const origin = {
+    parentRunId: "parent-one",
+    requestKey: "call-one",
+    parentMessageId: "assistant-one",
+  };
+  const view = {
+    ...activeView,
+    task: {
+      version: 2 as const,
+      role: "planner" as const,
+      summary: "Plan checkout",
+      result: null,
+      origin,
+    },
+  };
+  assert.deepEqual(parseTestingProjectionEvent(testingProjectionEvent(view)), view);
+  assert.deepEqual(parsePublishedTasks({ publishedTasks: [view] }), [view]);
+  const privateOrigin = {
+    ...view,
+    task: { ...view.task, origin: { ...origin, rawEvent: "secret" } },
+  };
+  assert.deepEqual(parseTestingProjectionEvent(chunk(privateOrigin)), view);
+  for (const invalid of [
+    { ...origin, parentMessageId: "" },
+    { ...origin, parentRunId: 3 },
+  ]) {
+    assert.equal(
+      parseTestingProjectionEvent(chunk({ ...view, task: { ...view.task, origin: invalid } })),
+      null,
+    );
+  }
+  const unresolved = { ...view, task: { ...view.task, origin: null } };
+  assert.deepEqual(parseTestingProjectionEvent(chunk(unresolved)), unresolved);
 });
 
 test("hydration payloads expose only a structurally valid published view", () => {

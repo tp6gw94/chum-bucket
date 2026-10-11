@@ -12,10 +12,10 @@ import {
   type CodeModeToolResult,
   type IsolateContext,
   type IsolateDriver,
-  type ToolBinding,
 } from "@tanstack/ai-code-mode";
 import { createQuickJSIsolateDriver } from "@tanstack/ai-isolate-quickjs";
 import { z } from "zod";
+import { codeModeDescription, codeModeSystemPrompt } from "../prompts";
 import type { ModelCall } from "../model-turn";
 import { discoveryToolName, ToolBoundaryError, type ModelTool } from "./atlassian";
 
@@ -67,43 +67,6 @@ const defaultPolicy: CodeModePolicy = {
 };
 
 const quickjsDriver: IsolateDriver = createQuickJSIsolateDriver();
-
-function codeModeDescription(bindings: Record<string, ToolBinding>): string {
-  const names = Object.keys(bindings);
-  const available =
-    names.length > 0
-      ? `The code can call these async external functions: ${names.join(", ")}.`
-      : "No external functions are available in this execution.";
-  const asyncNote = names.length > 0 ? " All external_* calls must be awaited." : "";
-
-  return `Execute TypeScript in a secure sandbox. Pass the program as JSON \`{"code": "<typescript>"}\`. ${available}${asyncNote} Return a value to pass results back. Use console.log() for debugging.`;
-}
-
-function codeModeSystemPrompt(bindings: Record<string, ToolBinding>): string {
-  const entries = Object.entries(bindings);
-  const catalog = entries
-    .map(([name, binding]) => `- \`${name}(input)\`: ${binding.description}`)
-    .join("\n");
-  const apiDocumentation =
-    entries.length > 0
-      ? `Inside the code, these async functions are available:\n\n${catalog}\n\n### Type Definitions\n\n\`\`\`typescript\n${generateTypeStubs(bindings)}\n\`\`\``
-      : "No external functions are available in this execution.";
-  const asyncNote =
-    entries.length > 0 ? "- All `external_*` calls are async and must be awaited.\n" : "";
-
-  return `## Code Execution Tool
-
-Call \`${codeModeToolName}\` with JSON \`{ "code": "<typescript>" }\`. The \`code\` field runs in a sandboxed environment.
-
-${apiDocumentation}
-
-### Notes
-
-${asyncNote}- Return a value to pass results back.
-- \`console.log()\` output is captured.
-- The sandbox is isolated with no network or filesystem access.
-- Each execution is independent.`;
-}
 
 type Finish = (result: CodeModeToolResult, phase: string) => CodeModeToolResult;
 type Attempt<T> =
@@ -770,7 +733,11 @@ export function composeCodeModeTurn(input: {
         })
       : undefined;
   const bindings = toolsToBindings(sandboxTools, "external_");
-  const systemPrompt = codeModeSystemPrompt(bindings);
+  const entries = Object.entries(bindings);
+  const systemPrompt = codeModeSystemPrompt({
+    functions: entries.map(([name, binding]) => ({ name, description: binding.description })),
+    typeDefinitions: generateTypeStubs(bindings),
+  });
   guarded(boundary, systemPrompt);
   const inputSchema = convertSchemaToJsonSchema(codeModeInputSchema);
 
@@ -781,7 +748,7 @@ export function composeCodeModeTurn(input: {
   return {
     definition: {
       name: codeModeToolName,
-      description: codeModeDescription(bindings),
+      description: codeModeDescription(Object.keys(bindings)),
       inputSchema,
     },
     systemPrompt,

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { cancel, problem, read, request } from "../../server/harness/testing-service";
+import { cancel, problem, read } from "../../server/harness/testing-service";
 import { artifactRefSchema, TestingRequestError, type ReuseDecision } from "../../shared/testing";
 import { TestingPersistenceError } from "../../server/harness/testing-store";
 import { RunRequestError } from "../../server/harness/run-store";
@@ -9,21 +9,16 @@ test("problem maps TestingRequestError to 400 with decisions", () => {
   const ref = artifactRefSchema.parse("ref-1");
   const decisions: readonly ReuseDecision[] = [
     {
-      kind: "accepted",
+      kind: "rejected",
       ref,
-      artifactKind: "plan",
-      provenance: {
-        originalRunId: "run-1" as any,
-        role: "planner" as const,
-        issuedAt: "2026-01-01T00:00:00.000Z",
-      },
+      reason: "not_accessible",
     },
   ];
   const err = new TestingRequestError(decisions as any);
   const result = problem(err);
   assert.deepEqual(result, {
     status: 400,
-    message: "Testing request has invalid artifact references",
+    message: "Testing request has invalid artifact references: ref-1 (not_accessible)",
     decisions,
   });
 });
@@ -93,6 +88,12 @@ test("cancel throws RunRequestError 400 for invalid threadId UUID", async () => 
   );
 });
 
-test("request rejects invalid request input through schema validation", async () => {
-  await assert.rejects(() => request({} as any));
+test("delegation validation errors remain ordinary structured tool problems", () => {
+  assert.deepEqual(
+    problem(new TestingPersistenceError(400, "Explicit plan reference is missing")),
+    {
+      status: 400,
+      message: "Explicit plan reference is missing",
+    },
+  );
 });

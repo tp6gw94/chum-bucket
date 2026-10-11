@@ -14,6 +14,7 @@ import {
   planScopeDigest,
   projectProgress,
   requirementsScopeDigest,
+  sourceCaptureView,
   validateRequirements,
   validateResults,
   validateReuse,
@@ -26,16 +27,17 @@ import {
   type Validation,
 } from "../../../server/harness/testing-domain";
 
-function accept<T>(validation: Validation<T>): T {
+function accept<T>(
+  validation: Validation<T> | Readonly<{ kind: "not_extractable"; unresolved: readonly string[] }>,
+): T {
   if (validation.kind !== "accepted") {
-    throw new Error(`setup failed: ${validation.issues.join(", ")}`);
+    throw new Error(
+      `setup failed: ${validation.kind === "rejected" ? validation.issues.join(", ") : "not extractable"}`,
+    );
   }
 
   return validation.value;
 }
-
-const runOne = testRunIdSchema.parse("run-1");
-const requirementsRef = artifactRefSchema.parse("artifact-req");
 
 const capture: SourceCapture = {
   reference: { kind: "jira", issueKey: "CHUM-42" },
@@ -43,6 +45,225 @@ const capture: SourceCapture = {
   anchors: ["AC-1", "AC-2"],
   capturedAt: "2026-10-09T00:00:00Z",
 };
+
+test("anchor IDs resolve seven criteria without copying a 456-character source", () => {
+  const anchor = "a".repeat(456);
+  const longCapture = { ...capture, anchors: [anchor] };
+  const anchorId = digestOf({
+    namespace: "requirements-anchor-v1",
+    reference: capture.reference,
+    digest: capture.digest,
+    anchor,
+  });
+  const context = {
+    goal: "Verify checkout",
+    selection: { kind: "all" as const },
+    captures: [longCapture],
+  };
+  const criteria = Array.from({ length: 7 }, (_, index) => ({
+    key: `AC-${index + 1}`,
+    statement: `Requirement ${index + 1}`,
+    source: capture.reference,
+    anchorId,
+  }));
+  const result = accept(validateRequirements({ criteria, unresolved: [] }, context));
+  assert.deepEqual(
+    result.criteria.map((criterion) => criterion.key),
+    ["AC-1", "AC-2", "AC-3", "AC-4", "AC-5", "AC-6", "AC-7"],
+  );
+  assert.equal(result.criteria[6]?.anchor, anchor);
+  const legacy = accept(
+    validateRequirements(
+      {
+        criteria: criteria.map(({ anchorId: _, ...criterion }) => ({ ...criterion, anchor })),
+        unresolved: [],
+      },
+      context,
+    ),
+  );
+  assert.deepEqual(result, legacy);
+  assert.equal(digestOf(result), digestOf(legacy));
+  const selected = accept(
+    validateRequirements(
+      { criteria, unresolved: [] },
+      { ...context, selection: { kind: "selected", keys: ["AC-2"] } },
+    ),
+  );
+  assert.deepEqual(selected.selection, { kind: "selected", keys: ["AC-2"] });
+  assert.equal(selected.criteria.length, 7);
+});
+
+test("source capture views bind IDs to source and digest without changing receipts", () => {
+  const view = sourceCaptureView(capture);
+  assert.deepEqual(view.anchorRefs, [
+    {
+      id: digestOf({
+        namespace: "requirements-anchor-v1",
+        reference: capture.reference,
+        digest: capture.digest,
+        anchor: "AC-1",
+      }),
+      text: "AC-1",
+    },
+    {
+      id: digestOf({
+        namespace: "requirements-anchor-v1",
+        reference: capture.reference,
+        digest: capture.digest,
+        anchor: "AC-2",
+      }),
+      text: "AC-2",
+    },
+  ]);
+  assert.deepEqual(
+    sourceCaptureView({ ...capture, capturedAt: "later", anchors: ["AC-2", "AC-1"] }).anchorRefs,
+    [...view.anchorRefs].reverse(),
+  );
+  assert.equal("anchorRefs" in capture, false);
+  const criterion = {
+    key: "AC-1",
+    statement: "Checkout succeeds",
+    source: capture.reference,
+    anchorId: view.anchorRefs[0]!.id,
+  };
+  const context = {
+    goal: "Verify checkout",
+    selection: { kind: "all" as const },
+    captures: [capture],
+  };
+  for (const captures of [
+    [{ ...capture, digest: "other" }],
+    [{ ...capture, reference: { kind: "jira" as const, issueKey: "OTHER" } }],
+    [{ ...capture, digest: "other" }, capture],
+  ]) {
+    const result = validateRequirements(
+      { criteria: [criterion], unresolved: [] },
+      { ...context, captures },
+    );
+    assert.equal(result.kind, "rejected");
+  }
+  const foreign = sourceCaptureView({
+    ...capture,
+    reference: { kind: "jira", issueKey: "OTHER" },
+  });
+  assert.equal(
+    validateRequirements(
+      { criteria: [{ ...criterion, anchorId: foreign.anchorRefs[0]!.id }], unresolved: [] },
+      context,
+    ).kind,
+    "rejected",
+  );
+  const issueKeyCriterion = accept(
+    validateRequirements(
+      { criteria: [{ ...criterion, key: "CHUM-42" }], unresolved: [] },
+      { ...context, selection: { kind: "selected", keys: ["CHUM-42"] } },
+    ),
+  );
+  assert.deepEqual(issueKeyCriterion.selection, { kind: "selected", keys: ["CHUM-42"] });
+  assert.equal(issueKeyCriterion.criteria[0]?.key, "CHUM-42");
+  for (const invalid of [
+    { ...criterion, anchorId: "fake" },
+    { ...criterion, anchor: "AC-1" },
+    { key: "AC-1", statement: "Checkout succeeds", source: capture.reference, anchor: "AC" },
+  ]) {
+    assert.equal(
+      validateRequirements({ criteria: [invalid], unresolved: [] }, context).kind,
+      "rejected",
+    );
+  }
+});
+
+test("requirements feedback reports ID, duplicate, selected and schema field paths privately", () => {
+  const criterion = {
+    key: "AC-1",
+    statement: "Checkout succeeds",
+    source: capture.reference,
+    anchorId: "fake",
+  };
+  const result = validateRequirements(
+    { criteria: [criterion, criterion], unresolved: [] },
+    { goal: "Verify", selection: { kind: "selected", keys: ["AC-9"] }, captures: [capture] },
+  );
+  assert.equal(result.kind, "rejected");
+  if (result.kind === "rejected") {
+    assert.match(result.issues.join(";"), /criteria\[0\]\.anchorId/);
+    assert.match(result.issues.join(";"), /criteria\[1\]\.key/);
+    assert.match(result.issues.join(";"), /task\.criteria\.keys\[0\]/);
+  }
+  const malformed = validateRequirements(
+    { criteria: [], unresolved: ["x".repeat(513)] },
+    { goal: "Verify", selection: { kind: "all" }, captures: [capture] },
+  );
+  assert.equal(malformed.kind, "rejected");
+  if (malformed.kind === "rejected") {
+    assert.match(malformed.issues.join(";"), /criteria.*1/);
+    assert.match(malformed.issues.join(";"), /unresolved\[0\].*512/);
+  }
+});
+
+test("requirements preserve ordered diagnostics across duplicate and invalid criteria", () => {
+  const criterion = {
+    key: "AC-1",
+    statement: "Checkout succeeds",
+    source: capture.reference,
+    anchor: "AC-1",
+  };
+  const result = validateRequirements(
+    {
+      criteria: [
+        criterion,
+        { ...criterion, source: { kind: "jira", issueKey: "CHUM-99" } },
+        { ...criterion, anchor: "missing" },
+      ],
+      unresolved: [],
+    },
+    {
+      goal: "Verify",
+      selection: { kind: "selected", keys: ["AC-1", "AC-9"] },
+      captures: [capture],
+    },
+  );
+
+  assert.deepEqual(result, {
+    kind: "rejected",
+    issues: [
+      "criteria[1].key: duplicate criterion key AC-1",
+      "criteria[1].source: criterion AC-1 references an uncaptured source",
+      "criteria[2].key: duplicate criterion key AC-1",
+      "criteria[2].anchor: criterion AC-1 references an unknown anchor for this source capture",
+      "task.criteria.keys[1]: selected criterion AC-9 is missing from the extraction",
+    ],
+  });
+});
+
+test("not extractable is a named decision only with bounded nonempty reasons and captures", () => {
+  const context = { goal: "Verify", selection: { kind: "all" as const }, captures: [capture] };
+  assert.deepEqual(
+    validateRequirements(
+      { kind: "not_extractable", unresolved: ["No testable behavior"] },
+      context,
+    ),
+    { kind: "not_extractable", unresolved: ["No testable behavior"] },
+  );
+  for (const proposal of [
+    { kind: "not_extractable", unresolved: [] },
+    { kind: "not_extractable", unresolved: ["x".repeat(513)] },
+    { kind: "not_extractable", unresolved: ["No behavior"], criteria: [] },
+    { criteria: [], unresolved: ["No behavior"] },
+  ]) {
+    assert.equal(validateRequirements(proposal, context).kind, "rejected");
+  }
+  assert.equal(
+    validateRequirements(
+      { kind: "not_extractable", unresolved: ["No behavior"] },
+      { ...context, captures: [] },
+    ).kind,
+    "rejected",
+  );
+});
+
+const runOne = testRunIdSchema.parse("run-1");
+const requirementsRef = artifactRefSchema.parse("artifact-req");
 
 function buildRequirements(selection: CriteriaSelection = { kind: "all" }): Requirements {
   return accept(
@@ -354,9 +575,9 @@ test("requirements freeze captured inputs and reject fabricated sources and anch
     },
   );
   assert.equal(missingSelection.kind, "rejected");
-  assert.ok(
-    missingSelection.issues.includes("selected criterion AC-2 is missing from the extraction"),
-  );
+  assert.deepEqual(missingSelection.issues, [
+    "task.criteria.keys[0]: selected criterion AC-2 is missing from the extraction",
+  ]);
 });
 
 test("plan canonicalization assigns functional checks to AC and style checks to UI", () => {

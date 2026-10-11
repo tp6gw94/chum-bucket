@@ -27,18 +27,35 @@ export const testRunIdSchema = z.string().trim().min(1).max(256).brand<"TestRunI
 export type TestRunId = z.infer<typeof testRunIdSchema>;
 
 export const sourceSchema = z.discriminatedUnion("kind", [
-  z.strictObject({ kind: z.literal("jira"), issueKey: z.string().trim().min(1).max(128) }),
+  z.strictObject({
+    kind: z.literal("jira"),
+    issueKey: z
+      .string()
+      .trim()
+      .min(1)
+      .max(128)
+      .describe("Jira source issue identity, for example PROJ-123. Not a criterion selection key."),
+  }),
   z.strictObject({ kind: z.literal("confluence"), pageId: z.string().trim().min(1).max(128) }),
 ]);
 export type Source = Readonly<z.infer<typeof sourceSchema>>;
 
-export const criteriaSelectionSchema = z.discriminatedUnion("kind", [
-  z.strictObject({ kind: z.literal("all") }),
-  z.strictObject({
-    kind: z.literal("selected"),
-    keys: z.array(z.string().trim().min(1).max(128)).min(1),
-  }),
-]);
+export const criteriaSelectionSchema = z
+  .discriminatedUnion("kind", [
+    z.strictObject({ kind: z.literal("all") }),
+    z.strictObject({
+      kind: z.literal("selected"),
+      keys: z
+        .array(z.string().trim().min(1).max(128))
+        .min(1)
+        .describe(
+          "Explicit criterion keys such as AC-2 and AC-5. Preserve exactly; do not substitute source issue keys or widen the subset.",
+        ),
+    }),
+  ])
+  .describe(
+    "Use all for a whole issue or page. Use selected only for explicitly requested criterion keys, not source identities.",
+  );
 export type CriteriaSelection = Readonly<z.infer<typeof criteriaSelectionSchema>>;
 
 export const designReferenceSchema = z.strictObject({
@@ -63,14 +80,54 @@ export const testingRequestInputSchema = z.strictObject({
   design: designReferenceSchema.optional(),
   existingArtifacts: z.array(artifactRefSchema).max(20).optional(),
 });
-export type TestingRequestInput = Readonly<z.infer<typeof testingRequestInputSchema>>;
+export type TestingRequestInput = Readonly<z.infer<typeof testingIntentSchema>>;
+
+const delegationSummary = z.string().trim().min(1).max(2_000);
+
+export const delegationInputSchema = z.discriminatedUnion("role", [
+  z.strictObject({
+    role: z.literal("atlassian"),
+    summary: delegationSummary,
+    goal: delegationSummary,
+    sources: z.array(sourceSchema).min(1).max(20),
+    criteria: criteriaSelectionSchema,
+  }),
+  z.strictObject({
+    role: z.literal("planner"),
+    summary: delegationSummary,
+    requirementsRef: artifactRefSchema,
+    design: designReferenceSchema.optional(),
+  }),
+  z.strictObject({
+    role: z.literal("ac"),
+    summary: delegationSummary,
+    planRef: artifactRefSchema,
+    targetUrl: z.url().max(2_048),
+  }),
+  z.strictObject({
+    role: z.literal("ui"),
+    summary: delegationSummary,
+    planRef: artifactRefSchema,
+    targetUrl: z.url().max(2_048),
+  }),
+]);
+export type DelegationInput = Readonly<z.infer<typeof delegationInputSchema>>;
+
+export const testingIntentSchema = testingRequestInputSchema.extend({
+  targetUrl: z.url().max(2_048).nullable(),
+  task: z
+    .strictObject({
+      version: z.literal(2),
+      input: delegationInputSchema,
+    })
+    .optional(),
+});
 
 export const testingRequestSchema = testingRequestInputSchema.extend({
   threadId: z.string().trim().min(1).max(128),
   expectedRevision: z.number().int().nonnegative(),
   requestId: z.string().trim().min(1).max(128),
 });
-export type TestingRequest = Readonly<z.infer<typeof testingRequestSchema>>;
 
 export const actionSchema = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("navigate"), path: z.string().trim().min(1).max(2_048) }),
@@ -244,7 +301,12 @@ export class TestingRequestError extends Error {
   readonly decisions: NonEmpty<ReuseDecision>;
 
   constructor(decisions: NonEmpty<ReuseDecision>) {
-    super("Testing request has invalid artifact references");
+    super(
+      `Testing request has invalid artifact references: ${decisions
+        .filter((decision) => decision.kind === "rejected")
+        .map((decision) => `${decision.ref} (${decision.reason})`)
+        .join("; ")}`,
+    );
     this.name = "TestingRequestError";
     this.decisions = decisions;
   }
@@ -322,13 +384,42 @@ export type PublicTestReport = Readonly<{
   acceptance: Acceptance;
 }>;
 
-export type TestView = Readonly<{
+export type PublicTaskArtifact = Readonly<{ ref: ArtifactRef }> &
+  (
+    | Readonly<{ kind: "requirements"; payload: PublicRequirements }>
+    | Readonly<{ kind: "plan"; payload: PublicPlan }>
+    | Readonly<{ kind: "ac-result" | "ui-result"; payload: readonly PublicCheckResult[] }>
+  );
+
+export type TaskMessageOrigin = Readonly<{
+  parentRunId: string;
+  requestKey: string;
+  parentMessageId: string;
+}>;
+
+type TestViewBase = Readonly<{
   runId: TestRunId;
   progress: ProgressCard;
   reuse: readonly ReuseDecision[];
   availableArtifacts: readonly ArtifactRef[];
-}> &
+}>;
+
+export type TestView = TestViewBase &
   (
-    | Readonly<{ state: "active" | "cancelling"; report: null }>
-    | Readonly<{ state: "finished"; report: PublicTestReport }>
+    | Readonly<{
+        task: Readonly<{
+          version: 2;
+          role: RoleId;
+          summary: string;
+          origin?: TaskMessageOrigin | null;
+          result: PublicTaskArtifact | null;
+        }>;
+        state: "active" | "cancelling" | "finished";
+        report: null;
+      }>
+    | (Readonly<{ task?: undefined }> &
+        (
+          | Readonly<{ state: "active" | "cancelling"; report: null }>
+          | Readonly<{ state: "finished"; report: PublicTestReport }>
+        ))
   );

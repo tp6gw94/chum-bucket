@@ -23,17 +23,15 @@ import {
   type SummaryDraft,
   type TransferReceipt,
 } from "../../shared/side-chat";
-import { openuiInstructions } from "./prompts";
+import { agentRegistry, type AgentModel } from "./agents";
 import { snapshot } from "./model-turn";
 import { projectConversation, readProjection, type ConversationState } from "./conversation";
 import { compactionEvent, parseCompactionEvent } from "../../shared/compaction-event";
 import {
-  testingRequestSchema,
   type ArtifactKind,
   type ArtifactRef,
   type RoleId,
   type RootRunOutcome,
-  type TestingRequest,
   type TestView,
 } from "../../shared/testing";
 import {
@@ -42,11 +40,8 @@ import {
   cancelTestingInTransaction,
   closeTestingInTransaction,
   closeUnfinishedTesting,
-  findStandaloneAdmission,
   guardActualIOInTransaction,
   hostTestingRuntime,
-  insertStandaloneOperation,
-  prepareStandaloneClosure,
   publishProjectionInTransaction,
   readTestingExecutionInTransaction,
   readPublishedTestingRow,
@@ -54,7 +49,7 @@ import {
   readPublishedThreadViewsInTransaction,
   selectTestingCancellation,
   recordRoleFailureInTransaction,
-  reserveRoleTasksInTransaction,
+  reserveRoleTaskInTransaction,
   testingFinishOutcome,
   TestingPersistenceError,
   type ActualIoGuard,
@@ -66,9 +61,8 @@ import {
 } from "./testing-store";
 
 export const PREVIOUS_BUILD = "durable-chat-loop-v9";
-export const BUILD = "durable-chat-loop-v10";
-export const TESTING_ROOT_BUILD = "testing-root-v1";
-export const MODEL = "deepseek-ai/DeepSeek-V4.1-Flash";
+export const BUILD = "durable-chat-loop-v11";
+const TESTING_ROOT_BUILD = "testing-root-v1";
 const runIdSchema = z
   .string()
   .min(1)
@@ -95,7 +89,7 @@ export type AcceptedRun = z.output<typeof runInputSchema> & {
   messages: UIMessage[];
   context: UIMessage[];
   prompt: string;
-  model: typeof MODEL;
+  model: AgentModel;
   build: typeof BUILD | typeof PREVIOUS_BUILD | typeof TESTING_ROOT_BUILD;
   side?: SideFence;
 };
@@ -376,12 +370,13 @@ async function acceptInTransaction(
     throw new RunRequestError(409, "Message ID already exists in history or context");
   }
 
+  const agent = agentRegistry.main;
   const run: AcceptedRun = {
     ...input,
     messages: [...thread.messages, ...additions],
     context: [...priorContext, ...additions],
-    prompt: openuiInstructions(),
-    model: MODEL,
+    prompt: agent.systemPrompt(),
+    model: agent.model,
     build: BUILD,
     ...(side ? { side: { epoch: side.epoch, scope: side.page_scope } } : {}),
   };
@@ -690,6 +685,7 @@ export async function hydrateThread(threadId: string, access?: SideAccess) {
       revision: thread.revision,
       activeRun: thread.active_run_id ? { runId: thread.active_run_id } : null,
       publishedTesting: published[0] ?? null,
+      publishedTasks: published.toReversed(),
     };
   });
 }
@@ -1242,83 +1238,6 @@ async function withTestingRoot<T>(
   });
 }
 
-async function claimStandaloneRoot(tx: Transaction, request: TestingRequest) {
-  const side = await lockSide(tx, request.threadId);
-
-  if (side) {
-    throw new TestingPersistenceError(409, "Standalone testing cannot claim a side chat");
-  }
-
-  const [thread] = await tx
-    .select()
-    .from(threadsTable)
-    .where(eq(threadsTable.id, request.threadId))
-    .for("update");
-
-  if (!thread) {
-    throw new TestingPersistenceError(404, "Unknown thread");
-  }
-
-  const [existingRun] = await tx
-    .select()
-    .from(chatRunsTable)
-    .where(eq(chatRunsTable.id, request.requestId))
-    .for("update");
-
-  if (existingRun) {
-    if (existingRun.thread_id !== request.threadId || thread.active_run_id !== request.requestId) {
-      throw new TestingPersistenceError(409, "Testing request identity collision");
-    }
-
-    return;
-  }
-
-  if (thread.active_run_id || thread.revision !== request.expectedRevision) {
-    throw new TestingPersistenceError(409, "Thread revision or claim conflict");
-  }
-
-  const priorContext = await committedModelContext(tx, thread);
-  const claimInput = compactInputSchema.parse({
-    kind: "compact",
-    threadId: request.threadId,
-    runId: request.requestId,
-    baseRevision: request.expectedRevision,
-  });
-  const accepted: AcceptedRun = {
-    ...claimInput,
-    messages: thread.messages,
-    context: priorContext,
-    prompt: openuiInstructions(),
-    model: MODEL,
-    build: TESTING_ROOT_BUILD,
-  };
-  const [inserted] = await tx
-    .insert(chatRunsTable)
-    .values({
-      id: request.requestId,
-      thread_id: request.threadId,
-      request: claimInput,
-      accepted,
-      projection: projectConversation({ display: thread.messages, context: priorContext }),
-    })
-    .onConflictDoNothing({ target: chatRunsTable.id })
-    .returning();
-
-  if (!inserted) {
-    throw new TestingPersistenceError(409, "Testing request identity collision");
-  }
-
-  await tx
-    .update(threadsTable)
-    .set({ active_run_id: request.requestId })
-    .where(eq(threadsTable.id, request.threadId));
-  await appendEvent(tx, inserted, "started", {
-    type: EventType.RUN_STARTED,
-    threadId: request.threadId,
-    runId: request.requestId,
-  });
-}
-
 async function releaseStandaloneClaim(
   tx: Transaction,
   run: RunRow,
@@ -1361,44 +1280,14 @@ export async function admitAttachedTesting(
   });
 }
 
-export async function admitStandaloneTesting(
-  request: TestingRequest,
-  now = new Date(),
-): Promise<TestingAdmission> {
-  const parsed = testingRequestSchema.safeParse(request);
-
-  if (!parsed.success || !runIdSchema.safeParse(parsed.data.requestId).success) {
-    throw new TestingPersistenceError(400, "Invalid testing request");
-  }
-
-  if (!z.uuid().safeParse(parsed.data.threadId).success) {
-    throw new TestingPersistenceError(400, "Invalid testing request");
-  }
-
-  const runtime = hostTestingRuntime({ model: MODEL, build: BUILD }, now);
-  const db = await database();
-
-  return db.transaction(async (tx) => {
-    const existing = await findStandaloneAdmission(tx, parsed.data);
-
-    if (existing) {
-      return existing;
-    }
-
-    const prepared = await prepareStandaloneClosure(tx, parsed.data, runtime);
-    await claimStandaloneRoot(tx, parsed.data);
-
-    return insertStandaloneOperation(tx, parsed.data, runtime, prepared);
-  });
-}
-
-export async function reserveRoleTasks(
+export async function reserveRoleTask(
   ownerRunId: string,
   operationId: string,
-  frontier: readonly Readonly<{ role: RoleId; input: unknown }>[],
-): Promise<readonly RoleFrame[]> {
+  role: RoleId,
+  input: unknown,
+): Promise<RoleFrame | null> {
   return withTestingRoot(ownerRunId, (tx) =>
-    reserveRoleTasksInTransaction(tx, operationId, ownerRunId, frontier),
+    reserveRoleTaskInTransaction(tx, operationId, ownerRunId, role, input),
   );
 }
 

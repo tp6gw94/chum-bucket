@@ -1,122 +1,44 @@
 import { setTimeout as delay } from "node:timers/promises";
-import { DBOS } from "@dbos-inc/dbos-sdk";
-import type { RoleId } from "../../shared/testing";
+import { DBOS, DBOSClient, type WorkflowHandle } from "@dbos-inc/dbos-sdk";
 import type { ModelCall } from "./model-turn";
 import type { AcceptedRun } from "./run-store";
 import {
-  TESTING_ROOT_BUILD,
   acceptRoleCandidate,
   admitAttachedTesting,
+  database,
   closeTesting,
   publishProjection,
   readTestingExecution,
   recordRoleFailure,
-  reserveRoleTasks,
+  reserveRoleTask,
 } from "./run-store";
 import {
-  testingChildWorkflow,
+  abortTestingTransports,
+  acknowledgeDrain,
+  testingTransportState,
   type TestingChildInput,
   type TestingChildResult,
+  type testingChildWorkflow,
 } from "./testing-child";
-import { abortTestingTransports, testingTransportState } from "./testing-child";
 import {
+  TESTING_WORKFLOW_VERSION,
   ensureTestingCancelDeliveries,
   listPendingTestingOperations,
   readStartCancelDeliveries,
   type RoleFailureCode,
-  type TestingAdmission,
   type TestingExecution,
 } from "./testing-store";
-import { phaseEligible, rootOutcome } from "./testing-policy";
-
-type TestingRootInput = Readonly<{
-  parentRunId: string;
-  operationId: string;
-}>;
+import { rootOutcome } from "./testing-policy";
 
 type ChildSpec = TestingChildInput;
+type ChildStartResult = TestingChildResult | Readonly<{ state: "unstarted" }>;
 
-type DispatchFrame =
-  | Readonly<{ kind: "idle" }>
-  | Readonly<{ kind: "start"; child: ChildSpec }>
-  | Readonly<{ kind: "results"; ac: ChildSpec | null; ui: ChildSpec | null }>;
-
-function taskInput(execution: TestingExecution, role: RoleId): unknown {
-  return {
-    role,
-    operationId: execution.operationId,
-    intentDigest: execution.intent.goal,
-  };
-}
-
-function spec(execution: TestingExecution, role: RoleId): ChildSpec | null {
-  const task = execution.tasks.find((item) => item.frame.role === role);
-
-  if (!task) {
-    return null;
-  }
-
-  return {
-    taskId: task.frame.taskId,
-    attemptNonce: task.frame.attemptNonce,
-    childWorkflowId: task.frame.childWorkflowId,
-    parentRunId: execution.parentRunId,
-    operationId: execution.operationId,
-    role,
-  };
-}
-
-function sequentialRole(role: RoleId | undefined): role is "atlassian" | "planner" {
-  return role === "atlassian" || role === "planner";
-}
-
-async function startFrame(
-  execution: TestingExecution,
-  role: "atlassian" | "planner",
-): Promise<DispatchFrame> {
-  await reserveRoleTasks(execution.parentRunId, execution.operationId, [
-    { role, input: taskInput(execution, role) },
-  ]);
-  const latest = await readTestingExecution(execution.parentRunId, execution.operationId);
-  const child = spec(latest, role);
-
-  return child ? { kind: "start", child } : { kind: "idle" };
-}
-
-async function resultsFrame(
-  execution: TestingExecution,
-  roles: readonly RoleId[],
-): Promise<DispatchFrame> {
-  await reserveRoleTasks(
-    execution.parentRunId,
-    execution.operationId,
-    roles.map((role) => ({ role, input: taskInput(execution, role) })),
-  );
-  const latest = await readTestingExecution(execution.parentRunId, execution.operationId);
-
-  return {
-    kind: "results",
-    ac: roles.includes("ac") ? spec(latest, "ac") : null,
-    ui: roles.includes("ui") ? spec(latest, "ui") : null,
-  };
-}
-
-async function frameFor(
-  execution: TestingExecution,
-  roles: readonly RoleId[],
-): Promise<DispatchFrame> {
-  if (execution.cancelRequested || execution.finished || roles.length === 0) {
-    return { kind: "idle" };
-  }
-
-  const [role] = roles;
-
-  if (roles.length === 1 && sequentialRole(role)) {
-    return startFrame(execution, role);
-  }
-
-  return resultsFrame(execution, roles);
-}
+const DURABLE_RETRY = {
+  retriesAllowed: true,
+  maxAttempts: 3,
+  intervalSeconds: 0.2,
+  backoffRate: 2,
+};
 
 const FAILURE_CODES = new Map<string, RoleFailureCode>([
   ["cancel_requested", "cancelled"],
@@ -126,6 +48,7 @@ const FAILURE_CODES = new Map<string, RoleFailureCode>([
   ["budget", "budget"],
   ["missing", "missing"],
   ["proposal_rejected", "proposal_rejected"],
+  ["requirements_not_extractable", "requirements_not_extractable"],
   ["nonce", "denied"],
   ["scope", "denied"],
   ["terminal", "denied"],
@@ -166,36 +89,79 @@ async function settleChild(
   }
 }
 
-async function runChild(child: ChildSpec): Promise<TestingChildResult | null> {
-  const handle = await DBOS.startWorkflow(testingChildWorkflow, {
-    workflowID: child.childWorkflowId,
-  })(child);
+async function enqueueChild(
+  client: DBOSClient,
+  child: ChildSpec,
+): Promise<WorkflowHandle<TestingChildResult> | null> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await client.enqueue<typeof testingChildWorkflow>(
+        {
+          queueName: "testing-delegation",
+          workflowName: TESTING_WORKFLOW_VERSION,
+          workflowID: child.childWorkflowId,
+          appVersion: DBOS.applicationVersion,
+        },
+        child,
+      );
+    } catch {
+      if (attempt < 2) {
+        await delay(200);
+        continue;
+      }
 
+      const handle = client.retrieveWorkflow<TestingChildResult>(child.childWorkflowId);
+
+      return (await handle.getStatus()) ? handle : null;
+    }
+  }
+}
+
+async function joinChild(
+  handle: WorkflowHandle<TestingChildResult>,
+  child: ChildSpec,
+): Promise<TestingChildResult> {
   try {
     return await handle.getResult();
-  } catch {
+  } catch (error) {
+    const status = await handle.getStatus();
+
+    if (status?.status !== "ERROR") {
+      throw error;
+    }
+
+    await abortTestingTransports([child.childWorkflowId]);
+
     return { state: "failed", reason: "child_failed" };
   }
 }
 
-async function phaseFrame(
-  ownerRunId: string,
-  operationId: string,
-  role: RoleId,
-): Promise<DispatchFrame> {
-  const execution = await readTestingExecution(ownerRunId, operationId);
+async function runChild(child: ChildSpec): Promise<ChildStartResult> {
+  return DBOS.runStep(
+    async () => {
+      await DBOS.registerQueue("testing-delegation");
+      const db = await database();
+      const client = await DBOSClient.create({
+        systemDatabaseUrl: process.env.DATABASE_URL!,
+        systemDatabasePool: db.$client,
+        applicationName: "chum-bucket-chat",
+      });
 
-  if (!phaseEligible(execution, role)) {
-    return { kind: "idle" };
-  }
+      try {
+        const handle = await enqueueChild(client, child);
 
-  return frameFor(execution, [role]);
+        return handle ? await joinChild(handle, child) : { state: "unstarted" };
+      } finally {
+        await client.destroy();
+      }
+    },
+    { name: `${child.taskId}:start-join`, ...DURABLE_RETRY },
+  );
 }
 
-function markersQuiet(
-  execution: TestingExecution,
-  deliveries: readonly { taskId: string; kind: string; acknowledgement: string | null }[],
-): boolean {
+async function proveQuiet(execution: TestingExecution): Promise<boolean> {
+  const deliveries = await readStartCancelDeliveries(execution.operationId);
+
   return execution.tasks.every((task) => {
     if (testingTransportState(task.frame.childWorkflowId) === "live") {
       return false;
@@ -212,233 +178,123 @@ function markersQuiet(
   });
 }
 
-async function proveQuiet(execution: TestingExecution): Promise<boolean> {
-  if (
-    execution.tasks.some((task) => testingTransportState(task.frame.childWorkflowId) === "live")
-  ) {
-    return false;
+export async function delegateTask(run: AcceptedRun, call: ModelCall) {
+  if (run.side) {
+    throw new Error("Side chat cannot delegate tasks");
   }
 
-  const deliveries = await readStartCancelDeliveries(execution.operationId);
-
-  return markersQuiet(execution, deliveries);
-}
-
-async function runSerialProducer(
-  admission: TestingAdmission,
-  role: "atlassian" | "planner",
-): Promise<void> {
-  const prefix = admission.operationId;
-  const frame = await DBOS.runStep(
-    async () => phaseFrame(admission.parentRunId, admission.operationId, role),
-    { name: `${prefix}:frame:${role}` },
-  );
-
-  if (frame.kind === "start") {
-    const result = await runChild(frame.child);
-    await DBOS.runStep(() => settleChild(admission.parentRunId, frame.child, result), {
-      name: `${prefix}:settle:${role}`,
-    });
-  }
-}
-
-async function runTestingBody(
-  admission: TestingAdmission,
-): Promise<import("../../shared/testing").TestView> {
-  const prefix = admission.operationId;
-  await DBOS.runStep(() => publishProjection(admission.parentRunId, admission.operationId), {
-    name: `${prefix}:publish:admit`,
+  const admission = await DBOS.runStep(() => admitAttachedTesting(run, call.id, call.input), {
+    name: `delegate-v2:admit:${call.id}`,
   });
-  await runSerialProducer(admission, "atlassian");
-  await runSerialProducer(admission, "planner");
-  const results = await DBOS.runStep(
+  const prefix = admission.operationId;
+  const child = await DBOS.runStep(
     async () => {
-      const execution = await readTestingExecution(admission.parentRunId, admission.operationId);
-      const roles = (["ac", "ui"] as const).filter((role) => phaseEligible(execution, role));
-      const frame = roles.length > 0 ? await frameFor(execution, roles) : { kind: "idle" as const };
+      const execution = await readTestingExecution(run.runId, prefix);
+      const task = execution.intent.task;
 
-      return frame.kind === "results" ? frame : { kind: "results" as const, ac: null, ui: null };
+      if (!task) {
+        throw new Error("Legacy testing operation requires maintenance");
+      }
+
+      if (execution.finished) {
+        await publishProjection(run.runId, prefix);
+
+        return null;
+      }
+
+      const frame = await reserveRoleTask(run.runId, prefix, task.input.role, task.input);
+      await publishProjection(run.runId, prefix);
+
+      return frame
+        ? {
+            taskId: frame.taskId,
+            attemptNonce: frame.attemptNonce,
+            childWorkflowId: frame.childWorkflowId,
+            parentRunId: run.runId,
+            operationId: prefix,
+            role: task.input.role,
+          }
+        : null;
     },
-    { name: `${prefix}:frame:results` },
+    { name: `${prefix}:reserve`, ...DURABLE_RETRY },
   );
 
-  if (results.ac && results.ui) {
-    const acHandle = await DBOS.startWorkflow(testingChildWorkflow, {
-      workflowID: results.ac.childWorkflowId,
-    })(results.ac);
-    const uiHandle = await DBOS.startWorkflow(testingChildWorkflow, {
-      workflowID: results.ui.childWorkflowId,
-    })(results.ui);
-    const acResult = await acHandle
-      .getResult()
-      .catch(() => ({ state: "failed" as const, reason: "child_failed" }));
-    const uiResult = await uiHandle
-      .getResult()
-      .catch(() => ({ state: "failed" as const, reason: "child_failed" }));
+  if (child) {
+    const result = await runChild(child);
+
+    await DBOS.runStep(() => acknowledgeDrain(child), {
+      name: `${prefix}:drain`,
+      ...DURABLE_RETRY,
+    });
     await DBOS.runStep(
-      async () => {
-        await settleChild(admission.parentRunId, results.ac!, acResult);
-        await settleChild(admission.parentRunId, results.ui!, uiResult);
-      },
-      { name: `${prefix}:settle:results` },
+      () => settleChild(run.runId, child, result.state === "unstarted" ? null : result),
+      { name: `${prefix}:settle`, ...DURABLE_RETRY },
     );
-  } else if (results.ac) {
-    const result = await runChild(results.ac);
-    await DBOS.runStep(() => settleChild(admission.parentRunId, results.ac!, result), {
-      name: `${prefix}:settle:ac`,
-    });
-  } else if (results.ui) {
-    const result = await runChild(results.ui);
-    await DBOS.runStep(() => settleChild(admission.parentRunId, results.ui!, result), {
-      name: `${prefix}:settle:ui`,
-    });
   }
 
   await DBOS.runStep(
     async () => {
       for (;;) {
-        const execution = await readTestingExecution(admission.parentRunId, admission.operationId);
+        const execution = await readTestingExecution(run.runId, prefix);
 
         if (execution.finished || (await proveQuiet(execution))) {
           return;
+        }
+
+        if (child) {
+          await acknowledgeDrain(child);
         }
 
         if (execution.cancelRequested) {
           await abortTestingTransports(execution.tasks.map((task) => task.frame.childWorkflowId));
         }
 
-        await publishProjection(admission.parentRunId, admission.operationId).catch(
-          () => undefined,
-        );
+        await publishProjection(run.runId, prefix);
         await delay(200);
       }
     },
-    { name: `${prefix}:quiet` },
+    { name: `${prefix}:quiet`, ...DURABLE_RETRY },
   );
 
   return DBOS.runStep(
     async () => {
-      const execution = await readTestingExecution(admission.parentRunId, admission.operationId);
+      const execution = await readTestingExecution(run.runId, prefix);
 
-      return closeTesting(
-        admission.parentRunId,
-        admission.operationId,
-        rootOutcome(execution, Date.now()),
-      );
-    },
-    { name: `${prefix}:close` },
-  );
-}
-
-export async function orchestrateAttachedTesting(
-  run: AcceptedRun,
-  call: ModelCall,
-): Promise<import("../../shared/testing").TestView> {
-  if (run.side) {
-    throw new Error("Side chat cannot delegate testing");
-  }
-
-  const admission = await DBOS.runStep(() => admitAttachedTesting(run, call.id, call.input), {
-    name: `testing-admit:${call.id}`,
-  });
-
-  return runTestingBody(admission);
-}
-
-async function executeTestingRoot(input: TestingRootInput) {
-  const admission = await DBOS.runStep(
-    () => readTestingExecution(input.parentRunId, input.operationId).then(() => input),
-    { name: "testing-root-open" },
-  );
-  const loaded = await DBOS.runStep(
-    async () => {
-      const execution = await readTestingExecution(admission.parentRunId, admission.operationId);
+      const view = await closeTesting(run.runId, prefix, rootOutcome(execution, Date.now()));
 
       return {
-        operationId: execution.operationId,
-        parentRunId: execution.parentRunId,
-        threadId: execution.threadId,
-        requestKey: execution.operationId,
-        deadline: execution.deadline,
-        mode: execution.mode,
-        decisions: execution.decisions.flatMap((decision) =>
-          decision.kind === "reuse" ? [decision.decision] : [],
-        ),
-        pinnedRefs: execution.artifacts.map((artifact) => artifact.ref),
-      } satisfies TestingAdmission;
+        runId: view.runId,
+        state: view.state,
+        task: view.task,
+        progress: view.task ? view.progress.rows[view.task.role] : null,
+      };
     },
-    { name: "testing-root-admission" },
+    { name: `${prefix}:close`, ...DURABLE_RETRY },
   );
-
-  return runTestingBody(loaded);
 }
 
-const testingRootWorkflow = DBOS.registerWorkflow(executeTestingRoot, {
-  name: TESTING_ROOT_BUILD,
-});
+export async function assertDelegationCutover(): Promise<void> {
+  const pending = await listPendingTestingOperations();
 
-export async function ensureTestingRoot(parentRunId: string, operationId: string): Promise<void> {
-  const status = await DBOS.getWorkflowStatus(parentRunId);
-
-  if (!status) {
-    await DBOS.startWorkflow(testingRootWorkflow, { workflowID: parentRunId })({
-      parentRunId,
-      operationId,
-    });
+  if (pending.some((operation) => !operation.delegated)) {
+    throw new Error(
+      "Legacy testing operations are active. Maintenance is required before delegation cutover; no records were changed.",
+    );
   }
-}
-
-type PendingOperation = Awaited<ReturnType<typeof listPendingTestingOperations>>[number];
-
-const ROOT_ENDED_STATUSES: ReadonlySet<string> = new Set([
-  "SUCCESS",
-  "ERROR",
-  "CANCELLED",
-  "MAX_RECOVERY_ATTEMPTS_EXCEEDED",
-]);
-
-async function standaloneRootStatus(operation: PendingOperation) {
-  if (operation.mode !== "standalone") {
-    return null;
-  }
-
-  const status = await DBOS.getWorkflowStatus(operation.parentRunId).catch(() => null);
-
-  if (!status) {
-    await ensureTestingRoot(operation.parentRunId, operation.operationId);
-  }
-
-  return status;
-}
-
-async function reconcileOperation(operation: PendingOperation): Promise<void> {
-  if (operation.cancelRequested) {
-    await ensureTestingCancelDeliveries(operation.operationId).catch(() => undefined);
-  }
-
-  const status = await standaloneRootStatus(operation);
-  const execution = await readTestingExecution(operation.parentRunId, operation.operationId).catch(
-    () => null,
-  );
-  const quiet = execution !== null && (await proveQuiet(execution));
-
-  if (execution && quiet && status !== null && ROOT_ENDED_STATUSES.has(status.status)) {
-    await closeTesting(
-      operation.parentRunId,
-      operation.operationId,
-      rootOutcome(execution, Date.now()),
-    ).catch(() => undefined);
-
-    return;
-  }
-
-  await publishProjection(operation.parentRunId, operation.operationId).catch(() => undefined);
 }
 
 export async function reconcileTestingOperations(): Promise<void> {
   const pending = await listPendingTestingOperations();
 
   for (const operation of pending) {
-    await reconcileOperation(operation);
+    if (!operation.delegated) {
+      continue;
+    }
+
+    if (operation.cancelRequested) {
+      await ensureTestingCancelDeliveries(operation.operationId);
+    }
+
+    await publishProjection(operation.parentRunId, operation.operationId).catch(() => undefined);
   }
 }
