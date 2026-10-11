@@ -1,5 +1,6 @@
 const product = { name: "原味司康", price: 100, maxQuantity: 5 };
 const storageKey = "scone-shop:v1";
+const maxSavedOrders = 20;
 const money = (amount) => `NT$${amount}`;
 const all = (selector) => [...document.querySelectorAll(selector)];
 let storageAvailable = true;
@@ -20,7 +21,7 @@ function readQuantity(state) {
 }
 
 function validOrderId(id) {
-  return typeof id === "string" && /^[0-9a-f-]{36}$/.test(id);
+  return typeof id === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id);
 }
 
 function validNote(note) {
@@ -30,7 +31,7 @@ function validNote(note) {
 function readOrder(order) {
   if (!order) return null;
   const checks = [validQuantity(order.quantity), order.quantity > 0, validOrderId(order.id), validNote(order.note)];
-  return checks.every(Boolean) ? order : null;
+  return checks.every(Boolean) ? { id: order.id, quantity: order.quantity, note: order.note } : null;
 }
 
 function readState() {
@@ -41,7 +42,9 @@ function readState() {
   } catch {
     state = null;
   }
-  return { quantity: readQuantity(state), order: readOrder(state?.order) };
+  const savedOrders = Array.isArray(state?.orders) ? state.orders : [state?.order];
+  const orders = savedOrders.map(readOrder).filter(Boolean).slice(-maxSavedOrders);
+  return { quantity: readQuantity(state), orders };
 }
 
 function saveState(state) {
@@ -59,16 +62,26 @@ function feedback(message) {
 function storageError() {
   storageAvailable = false;
   all("button[data-action], button[data-submit]").forEach((button) => { button.disabled = true; });
+  all("[data-order-complete], [data-no-order]").forEach((element) => { element.hidden = true; });
   all("[data-storage-error]").forEach((element) => {
     element.hidden = false;
     element.textContent = "瀏覽器目前無法保存購物車。請允許此網站儲存資料後重新整理。";
   });
 }
 
-function renderOrder(order) {
+function requestedOrderId() {
+  const ids = [
+    ...new URLSearchParams(location.hash.slice(1)).getAll("order"),
+    ...new URLSearchParams(location.search).getAll("order"),
+  ];
+  return ids.length === 1 && validOrderId(ids[0]) ? ids[0] : null;
+}
+
+function renderOrder(orders) {
   if (document.body.dataset.page !== "order") return;
-  const requestedId = new URLSearchParams(location.search).get("order");
-  const matches = order !== null && requestedId === order.id;
+  const requestedId = requestedOrderId();
+  const order = orders.find((entry) => entry.id === requestedId);
+  const matches = order !== undefined;
   all("[data-order-complete]").forEach((element) => { element.hidden = !matches; });
   all("[data-no-order]").forEach((element) => { element.hidden = matches; });
   if (!matches) return;
@@ -110,7 +123,7 @@ function render() {
     all("[data-cart-item]").forEach((element) => { element.hidden = quantity === 0; });
     setText("[data-shipping-message]", quantity === 0 ? "加入 3 顆，就能享免運。"
       : amounts.shipping === 0 ? "這筆訂單已享免運。" : `再加 ${3 - quantity} 顆，就能享免運。`);
-    renderOrder(state.order);
+    renderOrder(state.orders);
   } catch {
     storageError();
   }
@@ -165,15 +178,18 @@ document.getElementById("checkout-form")?.addEventListener("submit", (event) => 
     }
     const note = document.getElementById("order-note").value.trim().slice(0, 120);
     const order = { id: crypto.randomUUID(), quantity: state.quantity, note };
-    saveState({ quantity: 0, order });
+    saveState({ quantity: 0, orders: [...state.orders, order].slice(-maxSavedOrders) });
+    event.currentTarget.reset();
     render();
-    location.assign(`order.html?order=${encodeURIComponent(order.id)}`);
+    location.assign(`order.html#order=${encodeURIComponent(order.id)}`);
   } catch {
     storageError();
   }
 });
 
 window.addEventListener("pageshow", render);
+window.addEventListener("hashchange", render);
+window.addEventListener("popstate", render);
 window.addEventListener("storage", (event) => {
   if (event.key === storageKey || event.key === null) render();
 });
@@ -183,3 +199,4 @@ try {
 } catch {
   storageError();
 }
+
