@@ -39,12 +39,8 @@
           "name": "chat_events_run_id_chat_runs_id_fk",
           "tableFrom": "chat_events",
           "tableTo": "chat_runs",
-          "columnsFrom": [
-            "run_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["run_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         }
@@ -52,20 +48,14 @@
       "compositePrimaryKeys": {
         "chat_events_run_id_sequence_pk": {
           "name": "chat_events_run_id_sequence_pk",
-          "columns": [
-            "run_id",
-            "sequence"
-          ]
+          "columns": ["run_id", "sequence"]
         }
       },
       "uniqueConstraints": {
         "chat_events_key_unique": {
           "name": "chat_events_key_unique",
           "nullsNotDistinct": false,
-          "columns": [
-            "run_id",
-            "event_key"
-          ]
+          "columns": ["run_id", "event_key"]
         }
       },
       "policies": {},
@@ -120,12 +110,8 @@
           "name": "chat_model_slots_run_id_chat_runs_id_fk",
           "tableFrom": "chat_model_slots",
           "tableTo": "chat_runs",
-          "columnsFrom": [
-            "run_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["run_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         }
@@ -133,10 +119,7 @@
       "compositePrimaryKeys": {
         "chat_model_slots_run_id_turn_pk": {
           "name": "chat_model_slots_run_id_turn_pk",
-          "columns": [
-            "run_id",
-            "turn"
-          ]
+          "columns": ["run_id", "turn"]
         }
       },
       "uniqueConstraints": {},
@@ -234,12 +217,8 @@
           "name": "chat_runs_thread_id_threads_id_fk",
           "tableFrom": "chat_runs",
           "tableTo": "threads",
-          "columnsFrom": [
-            "thread_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["thread_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         }
@@ -349,10 +328,7 @@
         "side_chats_open_key_unique": {
           "name": "side_chats_open_key_unique",
           "nullsNotDistinct": false,
-          "columns": [
-            "page_scope",
-            "open_key"
-          ]
+          "columns": ["page_scope", "open_key"]
         }
       },
       "policies": {},
@@ -512,12 +488,8 @@
           "name": "testing_artifacts_thread_id_threads_id_fk",
           "tableFrom": "testing_artifacts",
           "tableTo": "threads",
-          "columnsFrom": [
-            "thread_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["thread_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         },
@@ -525,12 +497,8 @@
           "name": "testing_artifacts_original_operation_id_testing_operations_id_fk",
           "tableFrom": "testing_artifacts",
           "tableTo": "testing_operations",
-          "columnsFrom": [
-            "original_operation_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["original_operation_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         }
@@ -585,12 +553,8 @@
           "name": "testing_decisions_operation_id_testing_operations_id_fk",
           "tableFrom": "testing_decisions",
           "tableTo": "testing_operations",
-          "columnsFrom": [
-            "operation_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["operation_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         }
@@ -598,20 +562,14 @@
       "compositePrimaryKeys": {
         "testing_decisions_operation_id_decision_index_pk": {
           "name": "testing_decisions_operation_id_decision_index_pk",
-          "columns": [
-            "operation_id",
-            "decision_index"
-          ]
+          "columns": ["operation_id", "decision_index"]
         }
       },
       "uniqueConstraints": {
         "testing_decisions_key_unique": {
           "name": "testing_decisions_key_unique",
           "nullsNotDistinct": false,
-          "columns": [
-            "operation_id",
-            "decision_key"
-          ]
+          "columns": ["operation_id", "decision_key"]
         }
       },
       "policies": {},
@@ -699,12 +657,8 @@
           "name": "testing_deliveries_operation_id_testing_operations_id_fk",
           "tableFrom": "testing_deliveries",
           "tableTo": "testing_operations",
-          "columnsFrom": [
-            "operation_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["operation_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         },
@@ -712,12 +666,8 @@
           "name": "testing_deliveries_task_id_testing_tasks_id_fk",
           "tableFrom": "testing_deliveries",
           "tableTo": "testing_tasks",
-          "columnsFrom": [
-            "task_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["task_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         }
@@ -784,12 +734,8 @@
           "name": "testing_observations_task_id_testing_tasks_id_fk",
           "tableFrom": "testing_observations",
           "tableTo": "testing_tasks",
-          "columnsFrom": [
-            "task_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["task_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         }
@@ -797,21 +743,14 @@
       "compositePrimaryKeys": {
         "testing_observations_task_id_attempt_seq_pk": {
           "name": "testing_observations_task_id_attempt_seq_pk",
-          "columns": [
-            "task_id",
-            "attempt",
-            "seq"
-          ]
+          "columns": ["task_id", "attempt", "seq"]
         }
       },
       "uniqueConstraints": {
         "testing_observations_key_unique": {
           "name": "testing_observations_key_unique",
           "nullsNotDistinct": false,
-          "columns": [
-            "task_id",
-            "observation_key"
-          ]
+          "columns": ["task_id", "observation_key"]
         }
       },
       "policies": {},
@@ -932,12 +871,8 @@
           "name": "testing_operations_parent_run_id_chat_runs_id_fk",
           "tableFrom": "testing_operations",
           "tableTo": "chat_runs",
-          "columnsFrom": [
-            "parent_run_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["parent_run_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         },
@@ -945,12 +880,8 @@
           "name": "testing_operations_thread_id_threads_id_fk",
           "tableFrom": "testing_operations",
           "tableTo": "threads",
-          "columnsFrom": [
-            "thread_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["thread_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         }
@@ -960,10 +891,7 @@
         "testing_operations_request_key_unique": {
           "name": "testing_operations_request_key_unique",
           "nullsNotDistinct": false,
-          "columns": [
-            "parent_run_id",
-            "request_key"
-          ]
+          "columns": ["parent_run_id", "request_key"]
         }
       },
       "policies": {},
@@ -1006,12 +934,8 @@
           "name": "testing_pins_operation_id_testing_operations_id_fk",
           "tableFrom": "testing_pins",
           "tableTo": "testing_operations",
-          "columnsFrom": [
-            "operation_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["operation_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         },
@@ -1019,12 +943,8 @@
           "name": "testing_pins_ref_testing_artifacts_ref_fk",
           "tableFrom": "testing_pins",
           "tableTo": "testing_artifacts",
-          "columnsFrom": [
-            "ref"
-          ],
-          "columnsTo": [
-            "ref"
-          ],
+          "columnsFrom": ["ref"],
+          "columnsTo": ["ref"],
           "onDelete": "restrict",
           "onUpdate": "no action"
         }
@@ -1032,10 +952,7 @@
       "compositePrimaryKeys": {
         "testing_pins_operation_id_ref_pk": {
           "name": "testing_pins_operation_id_ref_pk",
-          "columns": [
-            "operation_id",
-            "ref"
-          ]
+          "columns": ["operation_id", "ref"]
         }
       },
       "uniqueConstraints": {},
@@ -1090,12 +1007,8 @@
           "name": "testing_publications_operation_id_testing_operations_id_fk",
           "tableFrom": "testing_publications",
           "tableTo": "testing_operations",
-          "columnsFrom": [
-            "operation_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["operation_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         }
@@ -1103,20 +1016,14 @@
       "compositePrimaryKeys": {
         "testing_publications_operation_id_version_pk": {
           "name": "testing_publications_operation_id_version_pk",
-          "columns": [
-            "operation_id",
-            "version"
-          ]
+          "columns": ["operation_id", "version"]
         }
       },
       "uniqueConstraints": {
         "testing_publications_event_unique": {
           "name": "testing_publications_event_unique",
           "nullsNotDistinct": false,
-          "columns": [
-            "operation_id",
-            "root_event_key"
-          ]
+          "columns": ["operation_id", "root_event_key"]
         }
       },
       "policies": {},
@@ -1209,12 +1116,8 @@
           "name": "testing_receipts_task_id_testing_tasks_id_fk",
           "tableFrom": "testing_receipts",
           "tableTo": "testing_tasks",
-          "columnsFrom": [
-            "task_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["task_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         }
@@ -1224,12 +1127,7 @@
         "testing_receipts_slot_unique": {
           "name": "testing_receipts_slot_unique",
           "nullsNotDistinct": false,
-          "columns": [
-            "task_id",
-            "attempt",
-            "slot",
-            "native_name"
-          ]
+          "columns": ["task_id", "attempt", "slot", "native_name"]
         }
       },
       "policies": {},
@@ -1339,12 +1237,8 @@
           "name": "testing_tasks_operation_id_testing_operations_id_fk",
           "tableFrom": "testing_tasks",
           "tableTo": "testing_operations",
-          "columnsFrom": [
-            "operation_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["operation_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         }
@@ -1354,17 +1248,12 @@
         "testing_tasks_role_unique": {
           "name": "testing_tasks_role_unique",
           "nullsNotDistinct": false,
-          "columns": [
-            "operation_id",
-            "role"
-          ]
+          "columns": ["operation_id", "role"]
         },
         "testing_tasks_child_unique": {
           "name": "testing_tasks_child_unique",
           "nullsNotDistinct": false,
-          "columns": [
-            "child_workflow_id"
-          ]
+          "columns": ["child_workflow_id"]
         }
       },
       "policies": {},
@@ -1500,12 +1389,8 @@
           "name": "threads_parent_thread_id_threads_id_fk",
           "tableFrom": "threads",
           "tableTo": "threads",
-          "columnsFrom": [
-            "parent_thread_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["parent_thread_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         }

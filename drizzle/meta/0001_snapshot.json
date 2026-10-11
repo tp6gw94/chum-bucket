@@ -39,12 +39,8 @@
           "name": "chat_events_run_id_chat_runs_id_fk",
           "tableFrom": "chat_events",
           "tableTo": "chat_runs",
-          "columnsFrom": [
-            "run_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["run_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         }
@@ -52,20 +48,14 @@
       "compositePrimaryKeys": {
         "chat_events_run_id_sequence_pk": {
           "name": "chat_events_run_id_sequence_pk",
-          "columns": [
-            "run_id",
-            "sequence"
-          ]
+          "columns": ["run_id", "sequence"]
         }
       },
       "uniqueConstraints": {
         "chat_events_key_unique": {
           "name": "chat_events_key_unique",
           "nullsNotDistinct": false,
-          "columns": [
-            "run_id",
-            "event_key"
-          ]
+          "columns": ["run_id", "event_key"]
         }
       },
       "policies": {},
@@ -120,12 +110,8 @@
           "name": "chat_model_slots_run_id_chat_runs_id_fk",
           "tableFrom": "chat_model_slots",
           "tableTo": "chat_runs",
-          "columnsFrom": [
-            "run_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["run_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         }
@@ -133,10 +119,7 @@
       "compositePrimaryKeys": {
         "chat_model_slots_run_id_turn_pk": {
           "name": "chat_model_slots_run_id_turn_pk",
-          "columns": [
-            "run_id",
-            "turn"
-          ]
+          "columns": ["run_id", "turn"]
         }
       },
       "uniqueConstraints": {},
@@ -234,12 +217,8 @@
           "name": "chat_runs_thread_id_threads_id_fk",
           "tableFrom": "chat_runs",
           "tableTo": "threads",
-          "columnsFrom": [
-            "thread_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["thread_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         }
@@ -367,12 +346,8 @@
           "name": "threads_parent_thread_id_threads_id_fk",
           "tableFrom": "threads",
           "tableTo": "threads",
-          "columnsFrom": [
-            "parent_thread_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["parent_thread_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         }

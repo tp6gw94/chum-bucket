@@ -1,7 +1,7 @@
 onlyBuiltDependencies:
   - esbuild
 allowBuilds:
-  '@google/genai': true
-  '@openuidev/lang-core': true
+  "@google/genai": true
+  "@openuidev/lang-core": true
   esbuild: true
   protobufjs: true

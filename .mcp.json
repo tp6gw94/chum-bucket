@@ -3,10 +3,7 @@
     "fallow": {
       "type": "stdio",
       "command": "npx",
-      "args": [
-        "--no",
-        "fallow-mcp"
-      ]
+      "args": ["--no", "fallow-mcp"]
     }
   }
 }

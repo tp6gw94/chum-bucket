@@ -9,11 +9,9 @@
 - [skills](https://github.com/tp6gw94/skills)
 - [pi](https://github.com/tp6gw94/my-pi)
 
-
 ## 0. Intro
 
 Agent = Model + Harness
-
 
 好的 Harness 搭配不怎麼樣的模型能力可能大於強大的模型搭配不好的 Harness。
 
@@ -84,7 +82,6 @@ sequenceDiagram
     H->>M: 帶上工具結果，繼續生成
     M-->>H: 回答使用者
 ```
-
 
 ### Tool Search (Manual)
 
@@ -236,7 +233,6 @@ Prompt caching 透過重用相同的輸入前綴，減少重複處理的成本�
 
 延伸閱讀：[How Compaction Works in Pi](https://earendil.com/posts/compaction-in-pi/)。
 
-
 ### Target
 
 1. [ ] 設定 Buffer，避免 touch 到限制，提早進行 Compact
@@ -252,7 +248,6 @@ Prompt caching 透過重用相同的輸入前綴，減少重複處理的成本�
 1. 避免某個 Agent 的 context 被 Tool, Prompt 等塞滿
 2. 有特殊的 Tool 權限要進行設定
 3. 要各 Agent 使用不同的模型
-
 
 ### Target
 
