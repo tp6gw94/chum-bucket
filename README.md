@@ -273,10 +273,12 @@ Prompt caching 透過重用相同的輸入前綴，減少重複處理的成本�
 
 ### Target
 
-1. Test Planner Agent
-2. Test AC Agent
-3. Test UI Agent
-4. Atlassian Agent
+1. [ ] Test Planner Agent
+2. [ ] Test AC Agent
+3. [ ] Test UI Agent
+4. [ ] Atlassian Agent
+5. [ ] Browser use tool & jev
+
 
 ## 6. User Approve
 
