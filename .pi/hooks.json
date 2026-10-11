@@ -1,0 +1,12 @@
+{
+  "afterWrite": [],
+  "beforeSettle": [
+    {
+      "name": "lint",
+      "glob": "*.{ts,tsx}",
+      "command": "pnpm oxlint --fix {files}",
+      "timeoutMs": 6000
+    },
+    { "name": "format", "glob": "*.{ts,tsx}", "command": "pnpm oxfmt {files}", "timeoutMs": 6000 }
+  ]
+}

@@ -6,9 +6,9 @@ Use this reference only to choose the generation protocol and state model for an
 
 Responses and Chat Completions are the two conversational generation choices:
 
-| Protocol | Endpoint | Use when | Continue with |
-| --- | --- | --- | --- |
-| Responses | `POST https://api.thesys.dev/v1/embed/responses` | Building a new chat or agent app, preserving an existing Responses integration, or needing hosted tools | [responses.md](responses.md) |
+| Protocol         | Endpoint                                                | Use when                                                                                                                              | Continue with                              |
+| ---------------- | ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------ |
+| Responses        | `POST https://api.thesys.dev/v1/embed/responses`        | Building a new chat or agent app, preserving an existing Responses integration, or needing hosted tools                               | [responses.md](responses.md)               |
 | Chat Completions | `POST https://api.thesys.dev/v1/embed/chat/completions` | Preserving an existing `chat.completions.create()` application, plain-text passthrough, app-owned messages, or app-run function tools | [chat-completions.md](chat-completions.md) |
 
 Responses is the recommended starting point for new agent applications, not a mandatory migration target. Preserve an existing Chat Completions protocol unless the user requests migration or needs a Responses-only capability.
@@ -19,11 +19,11 @@ For a new Gateway chat that needs persistent threads, recommend `conversation` p
 
 Choose among the three Responses history patterns:
 
-| Pattern | Use when |
-| --- | --- |
-| `conversation` plus `store: true` | Recommended for new persistent Gateway chats with named, reopenable threads |
-| Full `input` history | The existing application owns history or needs explicit control over the context sent to the model |
-| `previous_response_id` | Stored response chaining is enough; named threads and a conversation list are not needed |
+| Pattern                           | Use when                                                                                           |
+| --------------------------------- | -------------------------------------------------------------------------------------------------- |
+| `conversation` plus `store: true` | Recommended for new persistent Gateway chats with named, reopenable threads                        |
+| Full `input` history              | The existing application owns history or needs explicit control over the context sent to the model |
+| `previous_response_id`            | Stored response chaining is enough; named threads and a conversation list are not needed           |
 
 Preserve an existing application's history model unless the user requests a storage migration. Read [conversations.md](conversations.md) for named threads or a separately configured framework storage integration needing conversation/item CRUD, frontend tokens, or `user_id`/`app_id` isolation. Conversations is a storage companion, not another generation protocol.
 

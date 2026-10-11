@@ -37,11 +37,11 @@ Do not conflate these choices:
 
 Use exactly one Responses history pattern:
 
-| Pattern | Use when | Application responsibility |
-| --- | --- | --- |
-| Full `input` history | The application already owns storage or needs explicit context control | Load, authorize, bound, and resend the relevant Responses input items |
-| `previous_response_id` | Turns should form a stored response chain without a named/listable conversation | Persist and authorize the latest response id; send only the new turn with `store: true` |
-| `conversation` plus `store: true` | The product needs persistent named Gateway threads or item CRUD | Authorize the conversation id and send only the new turn; follow [conversations.md](conversations.md) |
+| Pattern                           | Use when                                                                        | Application responsibility                                                                            |
+| --------------------------------- | ------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| Full `input` history              | The application already owns storage or needs explicit context control          | Load, authorize, bound, and resend the relevant Responses input items                                 |
+| `previous_response_id`            | Turns should form a stored response chain without a named/listable conversation | Persist and authorize the latest response id; send only the new turn with `store: true`               |
+| `conversation` plus `store: true` | The product needs persistent named Gateway threads or item CRUD                 | Authorize the conversation id and send only the new turn; follow [conversations.md](conversations.md) |
 
 Do not combine full history with `conversation`, or combine `previous_response_id` with `conversation`. Do not add frontend tokens or Gateway browser storage to the first two patterns.
 
@@ -146,11 +146,11 @@ OpenUI Gateway executes hosted tools server-side inside the Responses request. A
 
 The current [Hosted Tools guide](https://www.openui.com/docs/gateway/api/responses/hosted-tools) documents search and MCP.
 
-| Capability | Declaration | Execution owner |
-| --- | --- | --- |
-| Web search | `{ type: "web_search" }` | Gateway |
-| Image search | `{ type: "image_search" }` | Gateway |
-| Remote MCP server | `{ type: "mcp", server_label, server_url, headers? }` | Gateway |
+| Capability           | Declaration                                           | Execution owner    |
+| -------------------- | ----------------------------------------------------- | ------------------ |
+| Web search           | `{ type: "web_search" }`                              | Gateway            |
+| Image search         | `{ type: "image_search" }`                            | Gateway            |
+| Remote MCP server    | `{ type: "mcp", server_label, server_url, headers? }` | Gateway            |
 | Application function | `{ type: "function", name, description, parameters }` | Application server |
 
 For example, add hosted search and MCP to a named conversation:

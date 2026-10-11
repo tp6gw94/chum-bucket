@@ -18,11 +18,11 @@ For a new app, start with the [Gateway quickstart](gateway/quickstart.md), then 
 
 ## Choose the UI Surface
 
-| Application need | Integration |
-| --- | --- |
-| A complete chat application with threads and an artifact workspace | `AgentInterface` from `@openuidev/react-ui` |
+| Application need                                                                     | Integration                                                                                                                                               |
+| ------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A complete chat application with threads and an artifact workspace                   | `AgentInterface` from `@openuidev/react-ui`                                                                                                               |
 | An existing assistant-ui, CopilotKit, or custom chat surface that needs generated UI | Keep its shell and render OpenUI Lang in the assistant-message slot; follow [existing-chat integrations](examples.md#existing-chat-ui-integration-guides) |
-| An application-owned React chat layout that needs chat state and adapters | Use `@openuidev/react-headless` directly |
+| An application-owned React chat layout that needs chat state and adapters            | Use `@openuidev/react-headless` directly                                                                                                                  |
 
 Agent Interface measures its container and uses the mobile layout below 768px. A narrow container still has chat-shell navigation and controls. For a compact assistant rail, choose the surface based on which parts of the UI the host already owns; when using Agent Interface, customize its slots and test the actual container width.
 
@@ -94,15 +94,15 @@ For Tailwind layers and provider ownership, follow [the theme guide](theme-provi
 
 Select the adapter from the bytes returned to the browser. A framework may call a provider's Responses or Chat Completions API internally while sending its own event format to the client.
 
-| Browser response | `streamAdapter` | Outgoing message format |
-| --- | --- | --- |
-| Responses SSE | `openAIResponsesAdapter()` | `openAIConversationMessageFormat` for the Gateway conversation route above; preserve the route's selected history model |
-| Raw Chat Completions SSE | `openAIAdapter()` | `openAIMessageFormat` |
-| OpenAI SDK Chat Completions `toReadableStream()` | `openAIReadableStreamAdapter()` | `openAIMessageFormat` |
-| Vercel AI SDK UIMessage stream | `vercelAIAdapter()` | `vercelAIMessageFormat` |
-| Native LangGraph SSE | `langGraphAdapter()` | `langGraphMessageFormat` |
-| Agent Server AG-UI relay | `agUIAdapter()` | The relay's request contract |
-| Eve session NDJSON | `eveAdapter()` with the framework's session transport | Preserve session ids, continuation tokens, and stream cursors; inspect the [framework example](examples.md) |
+| Browser response                                 | `streamAdapter`                                       | Outgoing message format                                                                                                 |
+| ------------------------------------------------ | ----------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| Responses SSE                                    | `openAIResponsesAdapter()`                            | `openAIConversationMessageFormat` for the Gateway conversation route above; preserve the route's selected history model |
+| Raw Chat Completions SSE                         | `openAIAdapter()`                                     | `openAIMessageFormat`                                                                                                   |
+| OpenAI SDK Chat Completions `toReadableStream()` | `openAIReadableStreamAdapter()`                       | `openAIMessageFormat`                                                                                                   |
+| Vercel AI SDK UIMessage stream                   | `vercelAIAdapter()`                                   | `vercelAIMessageFormat`                                                                                                 |
+| Native LangGraph SSE                             | `langGraphAdapter()`                                  | `langGraphMessageFormat`                                                                                                |
+| Agent Server AG-UI relay                         | `agUIAdapter()`                                       | The relay's request contract                                                                                            |
+| Eve session NDJSON                               | `eveAdapter()` with the framework's session transport | Preserve session ids, continuation tokens, and stream cursors; inspect the [framework example](examples.md)             |
 
 For Responses with Gateway Conversations, the backend appends only the new turn; Chat Completions receives the full relevant history. Preserve the generated framework transport even if it uses another provider API internally. Read the closest [framework example](examples.md) before changing its adapter.
 
@@ -111,11 +111,7 @@ For Responses with Gateway Conversations, the backend appends only the new turn;
 For custom transport, implement `ChatLLM` directly. Its property is `streamProtocol`, while the `fetchLLM` option is `streamAdapter`. A direct implementation owns message conversion and abort forwarding. For example, an app-owned raw Chat Completions route can use:
 
 ```ts
-import {
-  type ChatLLM,
-  openAIAdapter,
-  openAIMessageFormat,
-} from "@openuidev/react-ui";
+import { type ChatLLM, openAIAdapter, openAIMessageFormat } from "@openuidev/react-ui";
 
 const llm: ChatLLM = {
   streamProtocol: openAIAdapter(),
@@ -136,12 +132,12 @@ Call adapter factories with `()`. Verify text deltas, tool calls, tool results, 
 
 ## Choose Conversation Storage
 
-| Persistence owner | `storage` configuration |
-| --- | --- |
-| In-memory conversations | Omit `storage` |
-| Gateway Conversations | `useOpenuiCloudStorage({ token: "/api/frontend-token", features: { artifact: false } })` from `@openuidev/react-ui`; follow [Conversations](gateway/chat/conversations.md) |
-| Application backend following the REST adapter's endpoints | `restStorage({ baseUrl: "/api/chat/storage" })` from `@openuidev/react-ui` |
-| Existing database or framework with another API | Implement `ChatStorage` around that API |
+| Persistence owner                                          | `storage` configuration                                                                                                                                                    |
+| ---------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| In-memory conversations                                    | Omit `storage`                                                                                                                                                             |
+| Gateway Conversations                                      | `useOpenuiCloudStorage({ token: "/api/frontend-token", features: { artifact: false } })` from `@openuidev/react-ui`; follow [Conversations](gateway/chat/conversations.md) |
+| Application backend following the REST adapter's endpoints | `restStorage({ baseUrl: "/api/chat/storage" })` from `@openuidev/react-ui`                                                                                                 |
+| Existing database or framework with another API            | Implement `ChatStorage` around that API                                                                                                                                    |
 
 With a token-route URL, `useOpenuiCloudStorage()` lazily POSTs to mint a frontend token and handles refresh and retry. It sends `x-thesys-frontend-token` on storage requests. Keep that header contract inside the hook; the [Conversations guide](gateway/chat/conversations.md#mint-frontend-tokens) covers the server token route and separate generation authorization.
 
@@ -166,15 +162,15 @@ Inline generated UI and artifacts are separate configuration choices: `component
 
 Start with props for branding and configuration, then replace the specific slots needed by the product:
 
-| Need | Public surface |
-| --- | --- |
-| Agent name and logo | `agentName`, `logoUrl` |
-| Suggested prompts | `starters`: entries with `displayText`, `prompt`, and optional `icon`; `starterVariant` selects `short` or `long` |
-| Empty-thread greeting | `AgentInterface.Welcome` with `title`, `description`, and optional starters, or custom children |
-| Sidebar content | `AgentInterface.Sidebar`, composed with `SidebarHeader`, `SidebarContent`, `NewChatButton`, `ThreadList`, `ArtifactNav`, and `SidebarItem` as needed |
-| Thread controls and input | `AgentInterface.ThreadHeader`, `AgentInterface.Composer`, and `AgentInterface.MobileHeader` |
-| Artifact workspace | `AgentInterface.Workspace` |
-| Colors, typography, radii, light/dark mode | `theme`; use `disableThemeProvider` when the host owns the surrounding provider |
+| Need                                       | Public surface                                                                                                                                       |
+| ------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Agent name and logo                        | `agentName`, `logoUrl`                                                                                                                               |
+| Suggested prompts                          | `starters`: entries with `displayText`, `prompt`, and optional `icon`; `starterVariant` selects `short` or `long`                                    |
+| Empty-thread greeting                      | `AgentInterface.Welcome` with `title`, `description`, and optional starters, or custom children                                                      |
+| Sidebar content                            | `AgentInterface.Sidebar`, composed with `SidebarHeader`, `SidebarContent`, `NewChatButton`, `ThreadList`, `ArtifactNav`, and `SidebarItem` as needed |
+| Thread controls and input                  | `AgentInterface.ThreadHeader`, `AgentInterface.Composer`, and `AgentInterface.MobileHeader`                                                          |
+| Artifact workspace                         | `AgentInterface.Workspace`                                                                                                                           |
+| Colors, typography, radii, light/dark mode | `theme`; use `disableThemeProvider` when the host owns the surrounding provider                                                                      |
 
 Place slot elements directly under `AgentInterface` so its slot extraction recognizes them. Unspecified sidebar, header, composer, and workspace slots use their defaults. When replacing the whole sidebar, include its needed controls inside that slot; a separate top-level `SidebarHeader` is ignored when `Sidebar` is supplied.
 

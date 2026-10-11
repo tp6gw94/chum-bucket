@@ -8,9 +8,9 @@ The central invariant is protocol preservation: moving model access or UI genera
 
 Choose whether Gateway should compile and correct OpenUI Lang or forward the application's existing prompt:
 
-| Mode | System prompt | Output owner |
-| --- | --- | --- |
-| Gateway generative UI | `generateSystemPrompt({ cloud: true, library })` | Gateway uses the supplied library spec and validates/repairs OpenUI Lang |
+| Mode                         | System prompt                                        | Output owner                                                                         |
+| ---------------------------- | ---------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| Gateway generative UI        | `generateSystemPrompt({ cloud: true, library })`     | Gateway uses the supplied library spec and validates/repairs OpenUI Lang             |
 | Existing prompt / plain text | Preserve the application's system/developer messages | Gateway provides model routing and provider fallbacks without OpenUI Lang correction |
 
 Do not infer the mode from the endpoint alone. Preserve the existing output mode unless the user asks to change it.

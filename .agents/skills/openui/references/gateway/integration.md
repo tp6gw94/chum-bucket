@@ -2,13 +2,13 @@
 
 Read this reference first for shared OpenUI Gateway integration requirements. This guide covers host discovery, configuration, compatibility, security, reliability, and verification. Then read only the guide for the requested workload:
 
-| Workload | Continue with |
-| --- | --- |
-| Conversational generation | [Choose a chat generation API](chat/api-selection.md), then read either [Responses](chat/responses.md) or [Chat Completions](chat/chat-completions.md) |
-| Persistent Gateway threads for a Responses chat | [Responses](chat/responses.md) plus [Conversations](chat/conversations.md) |
-| Agent Interface setup or customization | [Agent Interface](../agent-interface.md) |
-| New Gateway agent scaffold | [Gateway quickstart](quickstart.md), then the generated template |
-| Existing self-hosted/OpenUI OSS application moving to Gateway | [OSS migration](oss-migration.md) |
+| Workload                                                      | Continue with                                                                                                                                          |
+| ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Conversational generation                                     | [Choose a chat generation API](chat/api-selection.md), then read either [Responses](chat/responses.md) or [Chat Completions](chat/chat-completions.md) |
+| Persistent Gateway threads for a Responses chat               | [Responses](chat/responses.md) plus [Conversations](chat/conversations.md)                                                                             |
+| Agent Interface setup or customization                        | [Agent Interface](../agent-interface.md)                                                                                                               |
+| New Gateway agent scaffold                                    | [Gateway quickstart](quickstart.md), then the generated template                                                                                       |
+| Existing self-hosted/OpenUI OSS application moving to Gateway | [OSS migration](oss-migration.md)                                                                                                                      |
 
 Responses and Chat Completions are alternative conversational generation protocols. Conversations supplies named-thread persistence for Responses; it is not a third generation protocol. An explicitly configured framework can separately manage storage without changing its model protocol.
 

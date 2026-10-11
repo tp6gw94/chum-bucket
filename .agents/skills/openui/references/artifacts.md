@@ -40,19 +40,19 @@ function parseArtifact(raw: unknown): ArtifactData | null {
       typeof data.id !== "string" ||
       typeof data.title !== "string" ||
       typeof data.version !== "number" ||
-      !Number.isInteger(data.version) || data.version < 1 ||
+      !Number.isInteger(data.version) ||
+      data.version < 1 ||
       typeof data.mediaType !== "string" ||
       !("content" in data)
-    ) return null;
+    )
+      return null;
     return data as ArtifactData;
   } catch {
     return null;
   }
 }
 
-export function createAppArtifactRenderer(
-  renderContent: (artifact: ArtifactData) => ReactNode,
-) {
+export function createAppArtifactRenderer(renderContent: (artifact: ArtifactData) => ReactNode) {
   return defineArtifactRenderer({
     type: "artifact",
     toolName: ["create_artifact", "update_artifact"],
@@ -61,14 +61,13 @@ export function createAppArtifactRenderer(
       if (!data) return null;
       return {
         props: data,
-        meta: isStreaming
-          ? null
-          : { id: data.id, version: data.version, heading: data.title },
+        meta: isStreaming ? null : { id: data.id, version: data.version, heading: data.title },
       };
     },
     preview: (data, { open, isStreaming }) => (
       <button type="button" onClick={open}>
-        {data.title}{isStreaming ? " · building…" : ""}
+        {data.title}
+        {isStreaming ? " · building…" : ""}
       </button>
     ),
     actual: (data) => renderContent(data),
@@ -92,11 +91,11 @@ Here `renderArtifactContent` is the host's React rendering function. Validate ea
 
 The parser is called during streaming and when a stored artifact opens:
 
-| Path | Inputs | Parser behavior |
-| --- | --- | --- |
-| Tool call | `args` may be partial JSON; `response` may be absent | Tolerate incomplete input and return `null` until the view has enough data |
-| Completed tool result | `response` contains the result | Validate it and use it as the authoritative content |
-| Stored artifact | `args` is `undefined`; `response` is `artifact.content` | Parse the same result shape without relying on tool arguments |
+| Path                  | Inputs                                                  | Parser behavior                                                            |
+| --------------------- | ------------------------------------------------------- | -------------------------------------------------------------------------- |
+| Tool call             | `args` may be partial JSON; `response` may be absent    | Tolerate incomplete input and return `null` until the view has enough data |
+| Completed tool result | `response` contains the result                          | Validate it and use it as the authoritative content                        |
+| Stored artifact       | `args` is `undefined`; `response` is `artifact.content` | Parse the same result shape without relying on tool arguments              |
 
 Keep a stable artifact id and increment its version after edits. Return `meta: null` for an early preview and `{ id, version, heading }` when registering a completed artifact in the thread. Registry metadata alone does not make the artifact durable.
 

@@ -45,9 +45,7 @@ const Panel = defineComponent({
   props: z.object({
     children: z.array(Metric.ref),
   }),
-  component: ({ props, renderNode }) => (
-    <section>{renderNode(props.children)}</section>
-  ),
+  component: ({ props, renderNode }) => <section>{renderNode(props.children)}</section>,
 });
 
 export const appLibrary = createLibrary({

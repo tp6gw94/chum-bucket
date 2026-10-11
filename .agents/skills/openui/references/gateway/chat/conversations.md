@@ -27,10 +27,10 @@ Responses can instead use application-owned full `input` history or a `previous_
 
 Use the access plane that matches the caller:
 
-| Caller | Credential | Recommended path |
-| --- | --- | --- |
-| Application server | Server-side `THESYS_API_KEY` | Stock OpenAI SDK with base URL `https://api.thesys.dev/v1`, or direct server calls to `/v1/conversations*` |
-| Browser storage client | Short-lived scoped frontend token | Direct Conversations API access scoped to the authenticated user and app; keep the server key private |
+| Caller                 | Credential                        | Recommended path                                                                                           |
+| ---------------------- | --------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| Application server     | Server-side `THESYS_API_KEY`      | Stock OpenAI SDK with base URL `https://api.thesys.dev/v1`, or direct server calls to `/v1/conversations*` |
+| Browser storage client | Short-lived scoped frontend token | Direct Conversations API access scoped to the authenticated user and app; keep the server key private      |
 
 The generation proxy remains an application server route using the server key. A browser frontend token does not authorize that proxy automatically.
 
@@ -70,12 +70,12 @@ for (const item of page.data) {
 
 Current operations are:
 
-| Method | Path | Purpose |
-| --- | --- | --- |
-| `GET` / `POST` | `/v1/conversations` | List or create conversations |
-| `GET` / `POST` / `DELETE` | `/v1/conversations/{conversation_id}` | Retrieve, update, or delete a conversation |
-| `GET` / `POST` | `/v1/conversations/{conversation_id}/items` | List or add items |
-| `GET` / `DELETE` | `/v1/conversations/{conversation_id}/items/{item_id}` | Retrieve or delete one item |
+| Method                    | Path                                                  | Purpose                                    |
+| ------------------------- | ----------------------------------------------------- | ------------------------------------------ |
+| `GET` / `POST`            | `/v1/conversations`                                   | List or create conversations               |
+| `GET` / `POST` / `DELETE` | `/v1/conversations/{conversation_id}`                 | Retrieve, update, or delete a conversation |
+| `GET` / `POST`            | `/v1/conversations/{conversation_id}/items`           | List or add items                          |
+| `GET` / `DELETE`          | `/v1/conversations/{conversation_id}/items/{item_id}` | Retrieve or delete one item                |
 
 Prefer the installed OpenAI SDK methods for these operations. Verify current pagination, update fields, item unions, and delete behavior before implementing custom raw HTTP helpers.
 
@@ -131,10 +131,7 @@ export async function POST(req: Request) {
     });
   } catch (error) {
     console.error("[frontend-token] Gateway rejected token mint", error);
-    return Response.json(
-      { error: { message: "Unable to mint frontend token" } },
-      { status: 502 },
-    );
+    return Response.json({ error: { message: "Unable to mint frontend token" } }, { status: 502 });
   }
 }
 ```

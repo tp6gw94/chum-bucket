@@ -34,14 +34,14 @@ import {
 
 On current `main`, `ThemeProvider` accepts:
 
-| Prop | Meaning |
-| --- | --- |
-| `mode?: "light" \| "dark"` | Active scheme. A top-level provider defaults to `"light"`; a nested provider inherits its parent's mode when omitted. |
-| `lightTheme?: Theme` | Partial overrides merged onto built-in light defaults. |
-| `darkTheme?: Theme` | Partial overrides merged onto built-in dark defaults. If omitted, `lightTheme` overrides are reused over the dark defaults. |
-| `theme?: Theme` | Deprecated alias for `lightTheme`; do not use in new code. |
-| `cssSelector?: string` | Selector that receives injected `--openui-*` variables; defaults to `body`, with automatic scoping for nested providers. |
-| `children?: ReactNode` | The themed React subtree. |
+| Prop                       | Meaning                                                                                                                     |
+| -------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `mode?: "light" \| "dark"` | Active scheme. A top-level provider defaults to `"light"`; a nested provider inherits its parent's mode when omitted.       |
+| `lightTheme?: Theme`       | Partial overrides merged onto built-in light defaults.                                                                      |
+| `darkTheme?: Theme`        | Partial overrides merged onto built-in dark defaults. If omitted, `lightTheme` overrides are reused over the dark defaults. |
+| `theme?: Theme`            | Deprecated alias for `lightTheme`; do not use in new code.                                                                  |
+| `cssSelector?: string`     | Selector that receives injected `--openui-*` variables; defaults to `body`, with automatic scoping for nested providers.    |
+| `children?: ReactNode`     | The themed React subtree.                                                                                                   |
 
 `ThemeProvider` injects runtime CSS custom properties; it does not import the OpenUI component styles, persist a preference, render a toggle, or manage application theme state.
 
@@ -49,13 +49,13 @@ On current `main`, `ThemeProvider` accepts:
 
 Use this decision table before writing code:
 
-| Situation | Pattern |
-| --- | --- |
-| Only one `AgentInterface` needs the theme | Pass `{ mode, lightTheme, darkTheme }` to `AgentInterface.theme`; keep its internal provider enabled. |
-| OpenUI components or renderers across a broader app tree need the theme | Wrap that tree in `ThemeProvider`. |
-| A broader `ThemeProvider` already contains `AgentInterface` | Set `disableThemeProvider` on `AgentInterface`. |
-| One subtree intentionally needs another scheme or token set | Nest a second `ThemeProvider` and pass that scope's complete overrides. |
-| Separate top-level roots need different themes | Give each root a unique wrapper selector through `cssSelector`; do not let multiple providers all target `body`. |
+| Situation                                                               | Pattern                                                                                                          |
+| ----------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| Only one `AgentInterface` needs the theme                               | Pass `{ mode, lightTheme, darkTheme }` to `AgentInterface.theme`; keep its internal provider enabled.            |
+| OpenUI components or renderers across a broader app tree need the theme | Wrap that tree in `ThemeProvider`.                                                                               |
+| A broader `ThemeProvider` already contains `AgentInterface`             | Set `disableThemeProvider` on `AgentInterface`.                                                                  |
+| One subtree intentionally needs another scheme or token set             | Nest a second `ThemeProvider` and pass that scope's complete overrides.                                          |
+| Separate top-level roots need different themes                          | Give each root a unique wrapper selector through `cssSelector`; do not let multiple providers all target `body`. |
 
 Do not wrap `AgentInterface` in an outer provider while leaving its internal provider enabled by accident. A nested provider resolves its tokens from built-in defaults plus its own overrides, not from the parent's resolved custom theme. The inner provider can therefore reset the outer brand tokens.
 
@@ -121,13 +121,7 @@ import type { ReactNode } from "react";
 import { ThemeProvider, type ThemeMode } from "@openuidev/react-ui";
 import { brandDarkTheme, brandLightTheme } from "./openui-theme";
 
-export function OpenUIThemeRoot({
-  mode,
-  children,
-}: {
-  mode: ThemeMode;
-  children: ReactNode;
-}) {
+export function OpenUIThemeRoot({ mode, children }: { mode: ThemeMode; children: ReactNode }) {
   return (
     <ThemeProvider mode={mode} lightTheme={brandLightTheme} darkTheme={brandDarkTheme}>
       {children}
