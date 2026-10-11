@@ -18,7 +18,13 @@ export type TaskOutcome =
 
 export type RootRunOutcome = TaskOutcome;
 
-export type Judgment = "simulated_pass" | "simulated_fail" | "simulated_blocked";
+export type Judgment =
+  | "pass"
+  | "fail"
+  | "blocked"
+  | "simulated_pass"
+  | "simulated_fail"
+  | "simulated_blocked";
 
 export const artifactRefSchema = z.string().trim().min(1).max(256).brand<"ArtifactRef">();
 export type ArtifactRef = z.infer<typeof artifactRefSchema>;
@@ -161,6 +167,16 @@ const functionalCheckSchema = z.strictObject({
   criterionId: z.string().trim().min(1).max(128),
   kind: z.literal("functional"),
   expectedObservation: z.string().trim().min(1).max(2_000),
+  observation: z
+    .discriminatedUnion("kind", [
+      z.strictObject({ kind: z.literal("url"), comparison: z.enum(["equals", "contains"]) }),
+      z.strictObject({
+        kind: z.enum(["text", "value", "visible"]),
+        target: z.string().trim().min(1).max(512),
+        comparison: z.enum(["equals", "contains"]),
+      }),
+    ])
+    .optional(),
 });
 export type FunctionalCheck = Readonly<z.infer<typeof functionalCheckSchema>>;
 
@@ -170,6 +186,7 @@ const styleCheckSchema = z.strictObject({
   kind: z.literal("style"),
   design: designReferenceSchema,
   property: z.string().trim().min(1).max(128),
+  target: z.string().trim().min(1).max(512).optional(),
   tolerance: toleranceSchema,
 });
 export type StyleCheck = Readonly<z.infer<typeof styleCheckSchema>>;
@@ -201,65 +218,106 @@ export type RequirementCriterion = Readonly<z.infer<typeof requirementCriterionS
 const mockEvidenceBase = {
   caseId: z.string().trim().min(1).max(64),
   checkId: z.string().trim().min(1).max(64),
-  origin: z.literal("mock"),
+  origin: z.enum(["mock", "browser"]),
+  browser: z
+    .strictObject({
+      selections: z
+        .array(
+          z.strictObject({
+            model: z.string(),
+            choice: z.string(),
+            confidence: z.number().min(0).max(1),
+            candidateDigest: z.string(),
+          }),
+        )
+        .max(100),
+      screenshot: z
+        .strictObject({
+          path: z.string().regex(/^[0-9a-f-]{36}\.png$/),
+          digest: z.string().regex(/^[0-9a-f]{64}$/),
+        })
+        .optional(),
+    })
+    .optional(),
   fixture: fixtureIdentitySchema,
   adapterVersion: z.string().min(1).max(64),
 };
 
-export const evidenceSchema = z.union([
-  z.strictObject({
-    kind: z.literal("functional"),
-    outcome: z.literal("pass"),
-    expected: z.string().min(1),
-    observed: z.string().min(1),
-    actionIndex: z.number().int().nonnegative(),
-    ...mockEvidenceBase,
-  }),
-  z.strictObject({
-    kind: z.literal("functional"),
-    outcome: z.literal("fail"),
-    expected: z.string().min(1),
-    observed: z.string().min(1),
-    actionIndex: z.number().int().nonnegative(),
-    ...mockEvidenceBase,
-  }),
-  z.strictObject({
-    kind: z.literal("functional"),
-    outcome: z.literal("blocked"),
-    reason: z.string().min(1),
-    actionIndex: z.number().int().nonnegative(),
-    ...mockEvidenceBase,
-  }),
-  z.strictObject({
-    kind: z.literal("style"),
-    outcome: z.literal("inside_tolerance"),
-    property: z.string().min(1),
-    expected: z.string().min(1),
-    observed: z.string().min(1),
-    tolerance: toleranceSchema,
-    capturedDesign: designCaptureSchema,
-    ...mockEvidenceBase,
-  }),
-  z.strictObject({
-    kind: z.literal("style"),
-    outcome: z.literal("outside_tolerance"),
-    property: z.string().min(1),
-    expected: z.string().min(1),
-    observed: z.string().min(1),
-    tolerance: toleranceSchema,
-    capturedDesign: designCaptureSchema,
-    ...mockEvidenceBase,
-  }),
-  z.strictObject({
-    kind: z.literal("style"),
-    outcome: z.literal("blocked"),
-    reason: z.string().min(1),
-    property: z.string().min(1),
-    tolerance: toleranceSchema,
-    capturedDesign: designCaptureSchema,
-    ...mockEvidenceBase,
-  }),
-]);
+export const evidenceSchema = z
+  .union([
+    z.strictObject({
+      kind: z.literal("functional"),
+      outcome: z.literal("pass"),
+      expected: z.string().min(1),
+      observed: z.string(),
+      actionIndex: z.number().int().nonnegative(),
+      ...mockEvidenceBase,
+    }),
+    z.strictObject({
+      kind: z.literal("functional"),
+      outcome: z.literal("fail"),
+      expected: z.string().min(1),
+      observed: z.string(),
+      actionIndex: z.number().int().nonnegative(),
+      ...mockEvidenceBase,
+    }),
+    z.strictObject({
+      kind: z.literal("functional"),
+      outcome: z.literal("blocked"),
+      reason: z.string().min(1),
+      actionIndex: z.number().int().nonnegative(),
+      ...mockEvidenceBase,
+    }),
+    z.strictObject({
+      kind: z.literal("style"),
+      outcome: z.literal("inside_tolerance"),
+      property: z.string().min(1),
+      expected: z.string().min(1),
+      observed: z.string().min(1),
+      tolerance: toleranceSchema,
+      capturedDesign: designCaptureSchema,
+      ...mockEvidenceBase,
+    }),
+    z.strictObject({
+      kind: z.literal("style"),
+      outcome: z.literal("outside_tolerance"),
+      property: z.string().min(1),
+      expected: z.string().min(1),
+      observed: z.string().min(1),
+      tolerance: toleranceSchema,
+      capturedDesign: designCaptureSchema,
+      ...mockEvidenceBase,
+    }),
+    z.strictObject({
+      kind: z.literal("style"),
+      outcome: z.literal("blocked"),
+      reason: z.string().min(1),
+      property: z.string().min(1),
+      tolerance: toleranceSchema,
+      capturedDesign: designCaptureSchema,
+      ...mockEvidenceBase,
+    }),
+  ])
+  .superRefine((evidence, context) => {
+    if (
+      evidence.origin === "browser" &&
+      (!evidence.browser ||
+        evidence.fixture.id !== "playwright-chromium" ||
+        evidence.adapterVersion !== "playwright-jev-v1")
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "Browser evidence requires its live adapter identity and observations",
+      });
+    }
+
+    if (evidence.origin === "mock" && evidence.browser) {
+      context.addIssue({
+        code: "custom",
+        message: "Mock evidence cannot contain browser provenance",
+      });
+    }
+  });
 export type PublicEvidence = Readonly<z.infer<typeof evidenceSchema>>;
 
 export const browserOutputSchema = z.strictObject({
@@ -369,7 +427,7 @@ export type ProgressCard = Readonly<{
 }>;
 
 export type Acceptance =
-  | Readonly<{ verdict: "not_verified"; reason: "mock_only" }>
+  | Readonly<{ verdict: "not_verified"; reason: "mock_only" | "release_not_assessed" }>
   | Readonly<{ verdict: "blocked"; reasons: NonEmpty<string> }>;
 
 export type PublicTestReport = Readonly<{

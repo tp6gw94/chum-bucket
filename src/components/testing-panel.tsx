@@ -54,6 +54,9 @@ const OUTCOME_LABELS: Record<TaskOutcome, string> = {
 };
 
 const JUDGMENT_LABELS: Record<Judgment, string> = {
+  pass: "瀏覽器符合",
+  fail: "瀏覽器差異",
+  blocked: "瀏覽器受阻",
   simulated_pass: "模擬符合",
   simulated_fail: "模擬差異",
   simulated_blocked: "模擬受阻",
@@ -61,6 +64,7 @@ const JUDGMENT_LABELS: Record<Judgment, string> = {
 
 const REASON_LABELS: Record<string, string> = {
   mock_only: "模擬資料",
+  release_not_assessed: "尚未評估發布驗收",
   requirements_missing: "需求缺失",
   plan_missing: "計畫缺失",
   coverage_incomplete: "覆蓋不完整",
@@ -372,8 +376,10 @@ function AcceptanceSummary({ acceptance }: { acceptance: Acceptance }) {
   if (acceptance.verdict === "not_verified") {
     return (
       <div data-verdict="not_verified" className="flex flex-wrap items-center gap-2">
-        <Badge variant="secondary">未驗證真實網站</Badge>
-        <span className="text-xs text-muted-foreground">模擬資料（{acceptance.reason}）</span>
+        <Badge variant="secondary">
+          {acceptance.reason === "mock_only" ? "未驗證真實網站" : "未完成發布驗收"}
+        </Badge>
+        <span className="text-xs text-muted-foreground">{REASON_LABELS[acceptance.reason]}</span>
       </div>
     );
   }
@@ -539,7 +545,9 @@ function EvidenceItem({ evidence }: { evidence: PublicEvidence }) {
         </>
       )}
       {evidence.kind === "functional" ? <p>動作索引：{evidence.actionIndex}</p> : null}
-      <p>來源：模擬（{evidence.origin}）</p>
+      <p>
+        來源：{evidence.origin === "browser" ? "真實瀏覽器" : "模擬"}（{evidence.origin}）
+      </p>
       <p>
         Fixture：{evidence.fixture.id}@{evidence.fixture.version}
       </p>
@@ -572,7 +580,11 @@ function CheckResultList({
             >
               <p className="flex flex-wrap items-center gap-2 text-xs">
                 <Badge
-                  variant={result.judgment === "simulated_blocked" ? "destructive" : "outline"}
+                  variant={
+                    result.judgment === "simulated_blocked" || result.judgment === "blocked"
+                      ? "destructive"
+                      : "outline"
+                  }
                 >
                   {JUDGMENT_LABELS[result.judgment]}
                 </Badge>
@@ -722,7 +734,7 @@ function TestReportSection({
         <AcceptanceSummary acceptance={report.acceptance} />
       </div>
       <p className="text-xs text-muted-foreground">
-        模擬結果只描述與預期的差異，不構成真實網站驗收。
+        檢查結果只描述已驗證範圍，不構成整體網站或發布驗收。
       </p>
       <RequirementsSummary requirements={report.requirements} />
       <PlanSummary plan={report.plan} />
@@ -762,7 +774,9 @@ function TaskResult({ view }: { view: TestView }) {
       {result.kind === "plan" ? <PlanSummary plan={result.payload} /> : null}
       {result.kind === "ac-result" || result.kind === "ui-result" ? (
         <>
-          <p className="text-xs text-muted-foreground">僅為模擬結果，不構成真實網站驗收。</p>
+          <p className="text-xs text-muted-foreground">
+            結果來源逐項標示，不構成整體網站或發布驗收。
+          </p>
           <CheckResultList
             title={result.kind === "ac-result" ? "AC 功能結果" : "UI 樣式結果"}
             results={result.payload}

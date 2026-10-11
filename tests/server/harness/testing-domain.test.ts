@@ -507,6 +507,38 @@ function completeUiResults(): Results {
   );
 }
 
+test("live results retain real judgments and reject role or origin relabeling", () => {
+  const output = {
+    ...functionalOutput,
+    evidence: {
+      ...functionalOutput.evidence,
+      origin: "browser",
+      fixture: { id: "playwright-chromium", version: "v1" },
+      adapterVersion: "playwright-jev-v1",
+      browser: { selections: [] },
+    },
+  };
+  const receipt = { ...functionalReceipt, output, outputDigest: digestOf(output) };
+  assert.equal(completeAcResults(receipt, "pass").checks[0]?.judgment, "pass");
+  assert.throws(() => completeAcResults(receipt, "simulated_pass"), /not supported/);
+  assert.throws(() => completeAcResults({ ...receipt, role: "ui" }, "pass"), /not bound/);
+  assert.throws(
+    () =>
+      completeAcResults(
+        {
+          ...receipt,
+          output: { ...output, evidence: { ...output.evidence, browser: undefined } },
+          outputDigest: digestOf({
+            ...output,
+            evidence: { ...output.evidence, browser: undefined },
+          }),
+        },
+        "pass",
+      ),
+    /matching check result/,
+  );
+});
+
 test("requirements freeze captured inputs and reject fabricated sources and anchors", () => {
   assert.deepEqual(requirements.criteria, [
     {

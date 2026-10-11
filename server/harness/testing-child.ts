@@ -1,4 +1,5 @@
 import { setTimeout as delay } from "node:timers/promises";
+import { createPlaywrightFixture } from "./playwright-check";
 import { DBOS } from "@dbos-inc/dbos-sdk";
 import type { UIMessage } from "@tanstack/ai";
 import { z } from "zod";
@@ -50,7 +51,6 @@ import {
   type Source,
 } from "../../shared/testing";
 import type { AdapterYieldChunk } from "@tanstack/ai";
-import type { MockBrowserOutcome } from "./tools/use-browser";
 import type { RunTools } from "./tools";
 
 export type TestingChildInput = Readonly<{
@@ -385,28 +385,6 @@ function cssProperty(node: Record<string, unknown>, property: string): string | 
   return finiteNumber(direct) ? `${direct}px` : null;
 }
 
-export function hostBrowserOutcomes(
-  checks: readonly PlanCheck[],
-): Readonly<Record<string, MockBrowserOutcome>> {
-  const outcomes: Record<string, MockBrowserOutcome> = {};
-
-  for (const check of checks) {
-    const bucket = Number.parseInt(digestOf(check.id).slice(0, 2), 16) % 3;
-
-    if (bucket === 0) {
-      outcomes[check.id] = { state: "blocked", reason: "Host fixture blocked this check" };
-      continue;
-    }
-
-    outcomes[check.id] =
-      check.kind === "functional"
-        ? { state: "observed", observed: "host-fixture-observed" }
-        : { state: "observed", observed: bucket === 1 ? "16px" : "1px" };
-  }
-
-  return outcomes;
-}
-
 function pinnedRequirements(execution: TestingExecution): Requirements | null {
   const artifact = execution.artifacts.find((item) => item.kind === "requirements");
 
@@ -486,20 +464,33 @@ function planIssues(
   requirements: Requirements,
   proposal: unknown,
 ): string[] {
-  return validationIssues(
-    canonicalizePlan(proposal, {
-      requirements,
-      requirementsDigest: digestOf(requirements),
-      goal: execution.intent.goal,
-      targetUrl: execution.intent.targetUrl,
-      design: execution.intent.design ?? null,
-      bounds: execution.runtime.bounds,
-    }),
+  const validation = canonicalizePlan(proposal, {
+    requirements,
+    requirementsDigest: digestOf(requirements),
+    goal: execution.intent.goal,
+    targetUrl: execution.intent.targetUrl,
+    design: execution.intent.design ?? null,
+    bounds: execution.runtime.bounds,
+  });
+
+  if (validation.kind !== "accepted") {
+    return validationIssues(validation);
+  }
+
+  return validation.value.cases.flatMap((planCase) =>
+    planCase.checks.flatMap((check) =>
+      (check.kind === "functional" ? !check.observation : !check.target)
+        ? [`Check ${check.id} requires a typed executable observation or style target`]
+        : [],
+    ),
   );
 }
 
 function trustedBrowserReceipt(receipt: ExecutionReceipt, role: "ac" | "ui"): TrustedToolReceipt[] {
-  if (receipt.nativeName !== "use_browser" || !isObjectLike(receipt.bindings)) {
+  if (
+    !["use_browser", role === "ac" ? "verify_ac" : "verify_ui"].includes(receipt.nativeName) ||
+    !isObjectLike(receipt.bindings)
+  ) {
     return [];
   }
 
@@ -738,6 +729,8 @@ function browserEvidenceInScope(
   execution: TestingExecution,
 ): boolean {
   return (
+    evidence.origin === "browser" &&
+    evidence.browser !== undefined &&
     evidence.kind === match.check.kind &&
     evidence.caseId === match.planCase.id &&
     evidence.checkId === match.check.id &&
@@ -960,10 +953,9 @@ async function storeNativeReceipt(
   const { input } = run;
   const nativeInput = normalizeJson(invocation.input);
   const receiptId = `native-${slot}-${invocation.nativeName}`;
-  const bindings =
-    invocation.nativeName === "use_browser"
-      ? browserReceiptBindings(output, input.role, run.plan, run.execution)
-      : {};
+  const bindings = ["use_browser", "verify_ac", "verify_ui"].includes(invocation.nativeName)
+    ? browserReceiptBindings(output, input.role, run.plan, run.execution)
+    : {};
   const stored = await appendTrustedReceipt({
     id: receiptId,
     taskId: input.taskId,
@@ -1131,20 +1123,23 @@ function restoredDesignFor(run: ChildRun): DesignCaptureResult | undefined {
 }
 
 function childHost(run: ChildRun): TestingNativeHost {
-  const { execution, plan } = run;
+  const { execution } = run;
 
   return {
     invoke: (invocation, work) => invokeNative(run, invocation, work),
     captureSource: (capture) => captureSourceReceipt(run, capture),
     captureDesign: (capture) => captureDesignReceipt(run, capture),
     restoredDesign: restoredDesignFor(run),
-    browserFixture: plan
-      ? {
-          identity: execution.runtime.fixture,
-          adapterVersion: execution.runtime.versions.adapter,
-          outcomes: hostBrowserOutcomes(plan.cases.flatMap((planCase) => planCase.checks)),
-        }
-      : undefined,
+    browserFixture:
+      (run.input.role === "ac" || run.input.role === "ui") && execution.intent.targetUrl
+        ? createPlaywrightFixture(
+            execution.intent.targetUrl,
+            run.input.role,
+            run.signal,
+            undefined,
+            run.input.taskId,
+          )
+        : undefined,
   };
 }
 

@@ -5,7 +5,6 @@ import type { AdapterYieldChunk } from "@tanstack/ai";
 import { DELEGATE_TASK_TOOL, withRunTools } from "../../../server/harness/tools";
 import {
   designProperties,
-  hostBrowserOutcomes,
   observeStream,
   restoreDesignCapture,
   sourceAnchors,
@@ -17,7 +16,7 @@ import {
 } from "../../../server/harness/testing-domain";
 import { roleFeedbackPrompt } from "../../../server/harness/prompts";
 import type { TestingExecution } from "../../../server/harness/testing-store";
-import { delegationInputSchema, type PlanCheck } from "../../../shared/testing";
+import { delegationInputSchema } from "../../../shared/testing";
 
 const { scriptedEvents } = createRequire(import.meta.url)(
   "../../fixtures/testing-runtime-external-fixture.mjs",
@@ -248,22 +247,6 @@ test("design recovery recomputes properties from the exact persisted native rece
   assert.throws(
     () => restoreDesignCapture(mismatched, "task-ui", reference, ["width"]),
     /matching native response/,
-  );
-});
-
-test("host browser outcomes do not copy the model expected observation", () => {
-  const checks = [
-    {
-      id: "check-1",
-      criterionId: "crit:AC-1",
-      kind: "functional",
-      expectedObservation: "UNIQUE-EXPECTED",
-    },
-  ] as const satisfies readonly PlanCheck[];
-  const outcome = hostBrowserOutcomes(checks)["check-1"];
-  assert.notEqual(
-    outcome && "observed" in outcome ? outcome.observed : outcome?.reason,
-    "UNIQUE-EXPECTED",
   );
 });
 

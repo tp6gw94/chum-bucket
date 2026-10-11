@@ -586,7 +586,14 @@ export type Results = Readonly<{ role: "ac" | "ui"; checks: readonly CheckResult
 const resultClaimSchema = z.strictObject({
   caseId: z.string().trim().min(1).max(64),
   checkId: z.string().trim().min(1).max(64),
-  judgment: z.enum(["simulated_pass", "simulated_fail", "simulated_blocked"]),
+  judgment: z.enum([
+    "pass",
+    "fail",
+    "blocked",
+    "simulated_pass",
+    "simulated_fail",
+    "simulated_blocked",
+  ]),
   evidence: z
     .array(
       z.strictObject({
@@ -613,12 +620,12 @@ function judgmentOf(evidence: PublicEvidence): Judgment {
   switch (evidence.outcome) {
     case "pass":
     case "inside_tolerance":
-      return "simulated_pass";
+      return evidence.origin === "browser" ? "pass" : "simulated_pass";
     case "fail":
     case "outside_tolerance":
-      return "simulated_fail";
+      return evidence.origin === "browser" ? "fail" : "simulated_fail";
     case "blocked":
-      return "simulated_blocked";
+      return evidence.origin === "browser" ? "blocked" : "simulated_blocked";
   }
 }
 
@@ -638,10 +645,36 @@ function numericValue(value: string, unit: "px" | "ratio"): number | null {
   return Number.isFinite(numeric) ? numeric : null;
 }
 
+function normalizedColor(value: string): string {
+  const rgb = /^rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*1)?\)$/.exec(value);
+
+  if (rgb && rgb.slice(1).every((channel) => Number(channel) <= 255)) {
+    return `#${rgb
+      .slice(1)
+      .map((channel) => Number(channel).toString(16).padStart(2, "0"))
+      .join("")}`;
+  }
+
+  if (/^#[0-9a-f]{6}$/i.test(value)) {
+    return value.toLowerCase();
+  }
+
+  if (/^#[0-9a-f]{3}$/i.test(value)) {
+    return `#${value
+      .slice(1)
+      .split("")
+      .map((channel) => channel + channel)
+      .join("")
+      .toLowerCase()}`;
+  }
+
+  return value;
+}
+
 export function withinTolerance(tolerance: Tolerance, expected: string, observed: string): boolean {
   switch (tolerance.kind) {
     case "exact":
-      return expected === observed;
+      return normalizedColor(expected) === normalizedColor(observed);
 
     case "numeric": {
       const left = numericValue(expected, tolerance.unit);
@@ -1309,7 +1342,10 @@ function reportIssues(
     [(input.requirements?.unresolved.length ?? 0) > 0, "requirements_unresolved"],
     [input.unresolvedSources.length > 0, "sources_unresolved"],
     [coverage.some((row) => row.state === "uncovered"), "coverage_incomplete"],
-    [coverage.some((row) => row.state === "simulated_blocked"), "blocked_evidence"],
+    [
+      coverage.some((row) => row.state === "simulated_blocked" || row.state === "blocked"),
+      "blocked_evidence",
+    ],
     [input.rootOutcome !== "completed", `root_${input.rootOutcome}`],
   ];
 
@@ -1385,7 +1421,12 @@ export function deriveReport(input: ReportInput): PublicTestReport {
   const blocked = nonEmpty([...reportIssues(input, plan, coverage), ...roleIssues(input, plan)]);
   const acceptance: Acceptance = blocked
     ? { verdict: "blocked", reasons: blocked }
-    : { verdict: "not_verified", reason: "mock_only" };
+    : {
+        verdict: "not_verified",
+        reason: coverage.some((row) => ["pass", "fail", "blocked"].includes(row.state))
+          ? "release_not_assessed"
+          : "mock_only",
+      };
 
   return {
     runId: input.runId,

@@ -10,11 +10,21 @@ import { browserOutputSchema, useBrowserInputSchema } from "../../../../shared/t
 import { digestOf } from "../../../../server/harness/testing-domain";
 import {
   createUseBrowserTool,
-  type BrowserFixture,
+  type BrowserAdapter,
+  type BrowserOutcome,
 } from "../../../../server/harness/tools/use-browser";
 
-const fixtureIdentity = { id: "fixture-1", version: "1" };
-const adapterVersion = "browser-mock-1";
+const fixtureIdentity = { id: "playwright-chromium", version: "v1" };
+const adapterVersion = "playwright-jev-v1";
+const browser = { selections: [] };
+
+function runner(outcomes: Readonly<Record<string, BrowserOutcome>>): BrowserAdapter["run"] {
+  return async (_planCase, check) => {
+    const outcome = outcomes[check.id];
+    assert.ok(outcome, `Missing test observation for ${check.id}`);
+    return { ...outcome, browser };
+  };
+}
 
 const functionalChecks: readonly FunctionalCheck[] = [
   {
@@ -90,24 +100,24 @@ const designCapture: DesignCapture = {
   capturedAt: "2026-10-09T00:00:00Z",
 };
 
-const functionalFixture: BrowserFixture = {
+const functionalFixture: BrowserAdapter = {
   identity: fixtureIdentity,
   adapterVersion,
-  outcomes: {
+  run: runner({
     "check-pass": { state: "observed", observed: "Order confirmation is visible" },
     "check-fail": { state: "observed", observed: "Cart count is one" },
     "check-blocked": { state: "blocked", reason: "Fixture target page is unavailable" },
-  },
+  }),
 };
 
-const styleFixture: BrowserFixture = {
+const styleFixture: BrowserAdapter = {
   identity: fixtureIdentity,
   adapterVersion,
-  outcomes: {
+  run: runner({
     "check-inside": { state: "observed", observed: "15px" },
     "check-outside": { state: "observed", observed: "24px" },
     "check-style-blocked": { state: "blocked", reason: "Fixture computed styles are unavailable" },
-  },
+  }),
 };
 
 test("functional checks return literal pass, fail and blocked fixture outputs", async () => {
@@ -129,7 +139,8 @@ test("functional checks return literal pass, fail and blocked fixture outputs", 
       actionIndex: 1,
       expected: "Order confirmation is visible",
       observed: "Order confirmation is visible",
-      origin: "mock",
+      origin: "browser",
+      browser,
       fixture: fixtureIdentity,
       adapterVersion,
     },
@@ -144,7 +155,8 @@ test("functional checks return literal pass, fail and blocked fixture outputs", 
       actionIndex: 1,
       expected: "Cart count is two",
       observed: "Cart count is one",
-      origin: "mock",
+      origin: "browser",
+      browser,
       fixture: fixtureIdentity,
       adapterVersion,
     },
@@ -158,7 +170,8 @@ test("functional checks return literal pass, fail and blocked fixture outputs", 
       checkId: "check-blocked",
       actionIndex: 1,
       reason: "Fixture target page is unavailable",
-      origin: "mock",
+      origin: "browser",
+      browser,
       fixture: fixtureIdentity,
       adapterVersion,
     },
@@ -186,7 +199,8 @@ test("style checks bind expected properties, tolerance and the trusted design ca
       observed: "15px",
       tolerance: { kind: "numeric", unit: "px", maxDelta: 2 },
       capturedDesign: designCapture,
-      origin: "mock",
+      origin: "browser",
+      browser,
       fixture: fixtureIdentity,
       adapterVersion,
     },
@@ -203,7 +217,8 @@ test("style checks bind expected properties, tolerance and the trusted design ca
       observed: "24px",
       tolerance: { kind: "numeric", unit: "px", maxDelta: 2 },
       capturedDesign: designCapture,
-      origin: "mock",
+      origin: "browser",
+      browser,
       fixture: fixtureIdentity,
       adapterVersion,
     },
@@ -219,7 +234,8 @@ test("style checks bind expected properties, tolerance and the trusted design ca
       tolerance: { kind: "exact" },
       capturedDesign: designCapture,
       reason: "Fixture computed styles are unavailable",
-      origin: "mock",
+      origin: "browser",
+      browser,
       fixture: fixtureIdentity,
       adapterVersion,
     },
@@ -282,17 +298,17 @@ test("numeric style observations reject foreign units, trailing junk and non-fin
     "captured-padding": "16em",
     opacity: "0.5",
   };
-  const fixture: BrowserFixture = {
+  const fixture: BrowserAdapter = {
     identity: fixtureIdentity,
     adapterVersion,
-    outcomes: {
+    run: runner({
       "check-foreign-unit": { state: "observed", observed: "16em" },
       "check-missing-px-unit": { state: "observed", observed: "16" },
       "check-trailing-junk": { state: "observed", observed: "16garbage" },
       "check-invalid-capture-unit": { state: "observed", observed: "16px" },
       "check-ratio-percent": { state: "observed", observed: "0.5%" },
       "check-non-finite": { state: "observed", observed: "Infinitypx" },
-    },
+    }),
   };
   const tool = createUseBrowserTool({
     role: "ui",
@@ -324,7 +340,7 @@ test("numeric style observations reject foreign units, trailing junk and non-fin
   ]);
 });
 
-test("the host fixture policy must cover exactly the scoped checks", () => {
+test("legacy static outcomes cannot execute and role scope remains enforced", () => {
   const scope = {
     role: "ac" as const,
     cases: planCases,
@@ -337,25 +353,12 @@ test("the host fixture policy must cover exactly the scoped checks", () => {
       createUseBrowserTool({
         ...scope,
         fixture: {
-          ...functionalFixture,
-          outcomes: { "check-pass": functionalFixture.outcomes["check-pass"]! },
-        },
+          identity: fixtureIdentity,
+          adapterVersion,
+          outcomes: { "check-pass": { state: "observed", observed: "fabricated" } },
+        } as unknown as BrowserAdapter,
       }),
-    /no outcome for check-fail/,
-  );
-  assert.throws(
-    () =>
-      createUseBrowserTool({
-        ...scope,
-        fixture: {
-          ...functionalFixture,
-          outcomes: {
-            ...functionalFixture.outcomes,
-            "check-extra": { state: "observed", observed: "x" },
-          },
-        },
-      }),
-    /outside the scoped checks/,
+    /requires a live runner/,
   );
   assert.throws(
     () =>
@@ -365,7 +368,6 @@ test("the host fixture policy must cover exactly the scoped checks", () => {
         checks: [styleChecks[0]!],
         fixture: {
           ...functionalFixture,
-          outcomes: { "check-inside": { state: "observed", observed: "16px" } },
         },
         figmaProperties: null,
         designCapture: null,
@@ -380,7 +382,6 @@ test("the host fixture policy must cover exactly the scoped checks", () => {
         checks: [styleChecks[0]!],
         fixture: {
           ...styleFixture,
-          outcomes: { "check-inside": { state: "observed", observed: "16px" } },
         },
         figmaProperties: {},
         designCapture: {
@@ -402,7 +403,7 @@ test("the factory rejects unknown case assignments and untrusted capture metadat
     fixture: {
       identity: fixtureIdentity,
       adapterVersion,
-      outcomes: { "check-inside": { state: "observed" as const, observed: "15px" } },
+      run: runner({ "check-inside": { state: "observed", observed: "15px" } }),
     },
     figmaProperties: { "padding-left": "16px" },
   };
@@ -412,13 +413,7 @@ test("the factory rejects unknown case assignments and untrusted capture metadat
         role: "ac",
         cases: [],
         checks: [functionalChecks[0]!],
-        fixture: {
-          identity: fixtureIdentity,
-          adapterVersion,
-          outcomes: {
-            "check-pass": { state: "observed", observed: "Order confirmation is visible" },
-          },
-        },
+        fixture: functionalFixture,
         figmaProperties: null,
         designCapture: null,
       }),
@@ -430,13 +425,7 @@ test("the factory rejects unknown case assignments and untrusted capture metadat
         role: "ac",
         cases: [{ ...planCases[0]!, actions: [] }],
         checks: [functionalChecks[0]!],
-        fixture: {
-          identity: fixtureIdentity,
-          adapterVersion,
-          outcomes: {
-            "check-pass": { state: "observed", observed: "Order confirmation is visible" },
-          },
-        },
+        fixture: functionalFixture,
         figmaProperties: null,
         designCapture: null,
       }),

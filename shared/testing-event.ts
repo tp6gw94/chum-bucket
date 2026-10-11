@@ -18,7 +18,14 @@ export const TESTING_PROJECTION_EVENT = "testing.projection";
 
 const boundedText = (max: number) => z.string().trim().min(1).max(max);
 
-const judgmentSchema = z.enum(["simulated_pass", "simulated_fail", "simulated_blocked"]);
+const judgmentSchema = z.enum([
+  "pass",
+  "fail",
+  "blocked",
+  "simulated_pass",
+  "simulated_fail",
+  "simulated_blocked",
+]);
 
 const taskOutcomeSchema = z.enum([
   "completed",
@@ -161,7 +168,7 @@ const blockedReasonsSchema = z.tuple([boundedText(256)]).rest(boundedText(256));
 const acceptanceSchema = z.discriminatedUnion("verdict", [
   z.object({
     verdict: z.literal("not_verified"),
-    reason: z.literal("mock_only"),
+    reason: z.enum(["mock_only", "release_not_assessed"]),
   }),
   z.object({
     verdict: z.literal("blocked"),

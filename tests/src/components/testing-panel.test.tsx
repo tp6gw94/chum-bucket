@@ -14,6 +14,7 @@ import {
   type TestView,
 } from "../../../shared/testing";
 import { TestingPanel } from "../../../src/components/testing-panel";
+import { parseTestView } from "../../../shared/testing-event";
 
 const runId = testRunIdSchema.parse("run-1");
 const originalRunId = testRunIdSchema.parse("run-0");
@@ -416,6 +417,39 @@ test("the cancel control only exists with a callback and follows the server stat
   assert.doesNotMatch(finished, /<details|<summary/);
 });
 
+test("live browser judgments survive hydration and are not labeled simulated", () => {
+  const base = report();
+  const evidence: PublicEvidence = {
+    kind: "functional",
+    outcome: "pass",
+    expected: "1",
+    observed: "1",
+    actionIndex: 0,
+    caseId: "case-1",
+    checkId: "live",
+    origin: "browser",
+    fixture: { id: "playwright-chromium", version: "v1" },
+    adapterVersion: "playwright-jev-v1",
+    browser: { selections: [] },
+  };
+  const view = finishedView({
+    ...base,
+    results: {
+      ac: [{ caseId: "case-1", checkId: "live", judgment: "pass", evidence: [evidence] }],
+      ui: [],
+    },
+    coverage: [],
+    acceptance: { verdict: "not_verified", reason: "release_not_assessed" },
+  });
+  const hydrated = parseTestView(JSON.parse(JSON.stringify(view)));
+  assert.ok(hydrated);
+  const text = plainText(renderToStaticMarkup(<TestingPanel view={hydrated} />));
+  assert.match(text, /瀏覽器符合/);
+  assert.match(text, /來源：真實瀏覽器/);
+  assert.match(text, /未完成發布驗收/);
+  assert.doesNotMatch(text, /模擬符合|來源：模擬/);
+});
+
 test("a finished view renders the public report with mock-only acceptance", () => {
   const html = renderToStaticMarkup(<TestingPanel view={finishedView(report())} />);
   const text = plainText(html);
@@ -425,8 +459,8 @@ test("a finished view renders the public report with mock-only acceptance", () =
   assert.match(html, /data-testid="testing-report"/);
   assert.match(html, /data-verdict="not_verified"/);
   assert.match(text, /未驗證真實網站/);
-  assert.match(text, /模擬資料（mock_only）/);
-  assert.match(text, /模擬結果只描述與預期的差異，不構成真實網站驗收。/);
+  assert.match(text, /模擬資料/);
+  assert.match(text, /檢查結果只描述已驗證範圍，不構成整體網站或發布驗收。/);
 
   assert.match(text, /目標：驗證結帳流程與樣式/);
   assert.match(text, /選取範圍：已選 1 項/);

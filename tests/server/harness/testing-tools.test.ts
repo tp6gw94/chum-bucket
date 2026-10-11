@@ -23,15 +23,16 @@ import {
 } from "../../../server/harness/testing-tools";
 import { mcpFixture, withMcpEnvironment } from "../../fixtures/mcp-fixture";
 import type { RunTools } from "../../../server/harness/tools";
-import type { BrowserFixture } from "../../../server/harness/tools/use-browser";
+import type { BrowserAdapter } from "../../../server/harness/tools/use-browser";
 
-const hostFixture: BrowserFixture = {
-  identity: { id: "host-browser-mock", version: "v1" },
-  adapterVersion: "mock-adapter-v1",
-  outcomes: {
-    "check-f": { state: "observed", observed: "Submitted" },
-    "check-s": { state: "observed", observed: "16px" },
-  },
+const hostFixture: BrowserAdapter = {
+  identity: { id: "playwright-chromium", version: "v1" },
+  adapterVersion: "playwright-jev-v1",
+  run: async (_planCase, check) => ({
+    state: "observed",
+    observed: check.kind === "functional" ? "Submitted" : "16px",
+    browser: { selections: [] },
+  }),
 };
 
 const design: DesignReference = { fileKey: "abc", nodeId: "1:2" };
@@ -152,7 +153,7 @@ function designCapture(raw: unknown): DesignCaptureResult {
 }
 
 function fixtureHost(options: {
-  fixture?: BrowserFixture;
+  fixture?: BrowserAdapter;
   invokeDelayMs?: number;
   design?: (raw: unknown) => DesignCaptureResult;
   restoredDesign?: DesignCaptureResult;
@@ -245,8 +246,8 @@ async function discoveryHistory(
 test("role catalog derives from the domain authority", () => {
   assert.deepEqual(testingRoleToolNames("atlassian"), ["jira_get_issue", "confluence_get_page"]);
   assert.deepEqual(testingRoleToolNames("planner"), []);
-  assert.deepEqual(testingRoleToolNames("ac"), ["use_browser"]);
-  assert.deepEqual(testingRoleToolNames("ui"), ["use_browser", "get_figma"]);
+  assert.deepEqual(testingRoleToolNames("ac"), ["verify_ac"]);
+  assert.deepEqual(testingRoleToolNames("ui"), ["verify_ui", "get_figma"]);
 });
 
 test("planner keeps zero-binding codemode, rejects every native call, and never opens MCP", async () => {
@@ -272,7 +273,7 @@ test("planner keeps zero-binding codemode, rejects every native call, and never 
             "edit",
             "run_tests",
             "delegate_to_agent",
-            "use_browser",
+            "verify_ac",
             "get_figma",
           ]) {
             await assert.rejects(
@@ -522,7 +523,7 @@ test("AC role returns Host receipt envelopes and rejects foreign tools", async (
       const turn = await tools.getModelTools([]);
       assert.deepEqual(
         turn.definitions.map((definition) => definition.name),
-        ["use_browser", "codemode"],
+        ["verify_ac", "codemode"],
       );
 
       for (const name of ["get_figma", "read", "write", "edit", "run_tests"]) {
@@ -536,7 +537,7 @@ test("AC role returns Host receipt envelopes and rejects foreign tools", async (
 
       const direct = (await tools.executeTool(
         [],
-        modelCall("use_browser", { checkId: "check-f" }),
+        modelCall("verify_ac", { checkId: "check-f" }),
         context,
       )) as {
         checkId: string;
@@ -547,20 +548,20 @@ test("AC role returns Host receipt envelopes and rejects foreign tools", async (
       assert.equal(direct.checkId, "check-f");
       assert.equal(direct.evidence.outcome, "pass");
       assert.deepEqual(direct.evidence.fixture, {
-        id: "host-browser-mock",
+        id: "playwright-chromium",
         version: "v1",
       });
-      assert.equal(direct.evidence.adapterVersion, "mock-adapter-v1");
+      assert.equal(direct.evidence.adapterVersion, "playwright-jev-v1");
       assert.equal(direct.receiptId, "receipt-1");
       assert.match(direct.outputDigest, /^[0-9a-f]{64}$/);
       assert.equal(harness.invocations.length, 1);
-      assert.equal(harness.invocations[0]!.nativeName, "use_browser");
+      assert.equal(harness.invocations[0]!.nativeName, "verify_ac");
       assert.equal(harness.invocations[0]!.route, "direct");
 
       const sandbox = (await tools.executeTool(
         [],
         modelCall("codemode", {
-          code: "const r = await external_use_browser({ checkId: 'check-f' }); return r.receiptId;",
+          code: "const r = await external_verify_ac({ checkId: 'check-f' }); return r.receiptId;",
         }),
         context,
       )) as { success: boolean; result: unknown };
@@ -570,7 +571,7 @@ test("AC role returns Host receipt envelopes and rejects foreign tools", async (
       assert.equal(harness.invocations[1]!.route, "codemode");
 
       await assert.rejects(
-        () => tools.executeTool([], modelCall("use_browser", { checkId: "missing" }), context),
+        () => tools.executeTool([], modelCall("verify_ac", { checkId: "missing" }), context),
         /Unknown scoped check/,
       );
     },
@@ -615,7 +616,7 @@ test("browser roles refuse to start without checks of their own kind", async () 
   );
 });
 
-test("browser roles scope use_browser to their own kind across cases in plan order", async () => {
+test("browser roles scope verify_ac to their own kind across cases in plan order", async () => {
   const base = testPlan();
   const [first] = base.cases;
   const plan: CanonicalPlan = {
@@ -648,11 +649,11 @@ test("browser roles scope use_browser to their own kind across cases in plan ord
   const harness = fixtureHost({
     fixture: {
       ...hostFixture,
-      outcomes: {
-        "f-1": { state: "observed", observed: "one" },
-        "f-2": { state: "observed", observed: "two" },
-        "s-1": { state: "observed", observed: "16px" },
-      },
+      run: async (_planCase, check) => ({
+        state: "observed",
+        observed: check.id === "f-1" ? "one" : check.id === "f-2" ? "two" : "16px",
+        browser: { selections: [] },
+      }),
     },
   });
   await withTestingRoleTools(
@@ -661,14 +662,14 @@ test("browser roles scope use_browser to their own kind across cases in plan ord
       for (const checkId of ["f-1", "f-2"]) {
         const result = (await tools.executeTool(
           [],
-          modelCall("use_browser", { checkId }),
+          modelCall("verify_ac", { checkId }),
           context,
         )) as { checkId: string };
         assert.equal(result.checkId, checkId);
       }
 
       await assert.rejects(
-        () => tools.executeTool([], modelCall("use_browser", { checkId: "s-1" }), context),
+        () => tools.executeTool([], modelCall("verify_ac", { checkId: "s-1" }), context),
         /Unknown scoped check/,
       );
     },
@@ -705,10 +706,10 @@ test("UI captures Figma lazily from the requested node and blocks incomplete out
         const turn = await tools.getModelTools([]);
         assert.deepEqual(
           turn.definitions.map((definition) => definition.name),
-          ["get_figma", "use_browser", "codemode"],
+          ["get_figma", "verify_ui", "codemode"],
         );
         await assert.rejects(
-          () => tools.executeTool([], modelCall("use_browser", { checkId: "check-s" }), context),
+          () => tools.executeTool([], modelCall("verify_ui", { checkId: "check-s" }), context),
           /requires an accepted Figma capture/,
         );
         await assert.rejects(
@@ -746,7 +747,7 @@ test("UI captures Figma lazily from the requested node and blocks incomplete out
 
         const browser = (await tools.executeTool(
           [],
-          modelCall("use_browser", { checkId: "check-s" }),
+          modelCall("verify_ui", { checkId: "check-s" }),
           context,
         )) as { evidence: { outcome: string; expected: string }; receiptId: string };
         assert.equal(browser.evidence.outcome, "inside_tolerance");
@@ -782,7 +783,7 @@ test("UI captures Figma lazily from the requested node and blocks incomplete out
           /missing property padding-left/,
         );
         await assert.rejects(
-          () => tools.executeTool([], modelCall("use_browser", { checkId: "check-s" }), context),
+          () => tools.executeTool([], modelCall("verify_ui", { checkId: "check-s" }), context),
           /requires an accepted Figma capture/,
         );
       },
@@ -819,7 +820,7 @@ test("UI captures Figma lazily from the requested node and blocks incomplete out
         );
         assert.equal(truncated.designInputs.length, 0);
         await assert.rejects(
-          () => tools.executeTool([], modelCall("use_browser", { checkId: "check-s" }), context),
+          () => tools.executeTool([], modelCall("verify_ui", { checkId: "check-s" }), context),
           /requires an accepted Figma capture/,
         );
       },
@@ -852,7 +853,7 @@ test("UI tools reuse a host-restored capture without requesting Figma again", as
     async (tools) => {
       const output = (await tools.executeTool(
         [],
-        modelCall("use_browser", { checkId: "check-s" }),
+        modelCall("verify_ui", { checkId: "check-s" }),
         context,
       )) as { evidence: { outcome: string; expected: string } };
       assert.equal(output.evidence.outcome, "inside_tolerance");
@@ -861,7 +862,7 @@ test("UI tools reuse a host-restored capture without requesting Figma again", as
   );
   assert.deepEqual(
     harness.invocations.map((invocation) => invocation.nativeName),
-    ["use_browser"],
+    ["verify_ui"],
   );
 });
 
@@ -872,7 +873,7 @@ test("factory waits for pending native work and threads abort through the tool c
   await withTestingRoleTools(
     { role: "ac", intent, requirements: null, plan: testPlan(), host: harness.host },
     async (tools) => {
-      const pending = tools.executeTool([], modelCall("use_browser", { checkId: "check-f" }), {
+      const pending = tools.executeTool([], modelCall("verify_ac", { checkId: "check-f" }), {
         ...context,
         abortSignal: controller.signal,
       });
@@ -897,7 +898,7 @@ test("factory waits for pending native work and threads abort through the tool c
     async (tools) => {
       await assert.rejects(
         () =>
-          tools.executeTool([], modelCall("use_browser", { checkId: "check-f" }), {
+          tools.executeTool([], modelCall("verify_ac", { checkId: "check-f" }), {
             ...context,
             abortSignal: abortedController.signal,
           }),
@@ -912,7 +913,7 @@ test("factory waits for pending native work and threads abort through the tool c
   await withTestingRoleTools(
     { role: "ac", intent, requirements: null, plan: testPlan(), host: threaded.host },
     async (tools) => {
-      await tools.executeTool([], modelCall("use_browser", { checkId: "check-f" }), {
+      await tools.executeTool([], modelCall("verify_ac", { checkId: "check-f" }), {
         ...context,
         abortSignal: threadedController.signal,
       });

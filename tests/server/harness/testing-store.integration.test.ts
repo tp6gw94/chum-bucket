@@ -56,6 +56,7 @@ import {
 } from "../../../server/harness/run-store";
 
 const enabled = process.env.TESTING_STORE_DATABASE_URL;
+const originalDatabaseUrl = process.env.DATABASE_URL;
 const source = { kind: "jira" as const, issueKey: "CHUM-42" };
 const design = { fileKey: "CheckoutDemo", nodeId: "12:34" };
 const goal = "Verify checkout";
@@ -64,15 +65,15 @@ const privateMarker = "private-observation-marker";
 const rawMarker = "raw-source-secret";
 let migrationFolder: string | undefined;
 
-function hostFixture() {
-  const runtime = hostTestingRuntime({ model: MODEL, build: BUILD });
-
+function syntheticBlockedBrowserFixture() {
   return {
-    identity: runtime.fixture,
-    adapterVersion: runtime.versions.adapter,
-    outcomes: {
-      "check-1": { state: "blocked" as const, reason: "Fixture target page is unavailable" },
-    },
+    identity: { id: "playwright-chromium", version: "v1" },
+    adapterVersion: "playwright-jev-v1",
+    run: async () => ({
+      state: "blocked" as const,
+      reason: "Synthetic browser evidence for persistence only; no browser was launched",
+      browser: { selections: [] },
+    }),
   };
 }
 
@@ -137,8 +138,13 @@ async function integrationMigrationsFolder() {
 }
 
 after(async () => {
-  if (migrationFolder) {
-    await rm(migrationFolder, { recursive: true, force: true });
+  try {
+    if (migrationFolder) {
+      await rm(migrationFolder, { recursive: true, force: true });
+    }
+  } finally {
+    if (originalDatabaseUrl === undefined) delete process.env.DATABASE_URL;
+    else process.env.DATABASE_URL = originalDatabaseUrl;
   }
 });
 
@@ -1052,7 +1058,7 @@ test(
     const checking = await admitAttachedTesting(parent, "ac", acInput);
     const ac = await reserveRoleTask(parent.runId, checking.operationId, "ac", acInput);
     assert.ok(ac);
-    const fixture = hostFixture();
+    const fixture = syntheticBlockedBrowserFixture();
     const tool = createUseBrowserTool({
       role: "ac",
       cases: [planCase],
@@ -1062,24 +1068,57 @@ test(
       designCapture: null,
     });
     const output = browserOutputSchema.parse(await tool.execute!({ checkId: "check-1" }));
+    const legacyOutput = browserOutputSchema.parse({
+      ...output,
+      evidence: {
+        ...output.evidence,
+        origin: "mock",
+        browser: undefined,
+        fixture: { id: "legacy-mock", version: "v1" },
+        adapterVersion: "mock-browser-v1",
+      },
+    });
+    await assert.rejects(
+      () =>
+        appendTrustedReceipt({
+          id: `legacy-browser-${randomUUID()}`,
+          taskId: ac.taskId,
+          attemptNonce: 1,
+          slot: "browser",
+          nativeName: "use_browser",
+          route: "direct",
+          input: { checkId: "check-1" },
+          output: legacyOutput,
+          bindings: {
+            checkId: "check-1",
+            fixture: legacyOutput.evidence.fixture,
+            adapterVersion: legacyOutput.evidence.adapterVersion,
+          },
+        }),
+      /Browser receipt is outside the host scope/,
+    );
     const receiptId = `browser-${randomUUID()}`;
     const receipt = await appendTrustedReceipt({
       id: receiptId,
       taskId: ac.taskId,
       attemptNonce: 1,
       slot: "browser",
-      nativeName: "use_browser",
+      nativeName: "verify_ac",
       route: "direct",
       input: { checkId: "check-1" },
       output,
-      bindings: { fixture: fixture.identity, adapterVersion: fixture.adapterVersion },
+      bindings: {
+        checkId: "check-1",
+        fixture: fixture.identity,
+        adapterVersion: fixture.adapterVersion,
+      },
     });
     const resultProposal = {
       checks: [
         {
           caseId: "case-1",
           checkId: "check-1",
-          judgment: "simulated_blocked",
+          judgment: "blocked",
           evidence: [{ receiptId, digest: receipt.outputDigest }],
         },
       ],
@@ -1101,7 +1140,21 @@ test(
     const lastView = await closeTesting(parent.runId, checking.operationId, "completed");
     assert.equal(
       lastView.task?.result?.kind === "ac-result" && lastView.task.result.payload[0]?.judgment,
-      "simulated_blocked",
+      "blocked",
+    );
+    assert.deepEqual(
+      lastView.task?.result?.kind === "ac-result" && lastView.task.result.payload[0]?.evidence,
+      [output.evidence],
+    );
+    const storedAc = await readTestingExecution(parent.runId, checking.operationId);
+    assert.deepEqual(
+      storedAc.tasks[0]?.receipts
+        .filter((item) => item.slot === "browser")
+        .map((item) => ({
+          nativeName: item.nativeName,
+          output: item.output,
+        })),
+      [{ nativeName: "verify_ac", output }],
     );
     assert.equal(lastView.task?.result?.ref, result.ref);
     assert.equal(lastView.report, null);

@@ -28,13 +28,14 @@ const requiredAtlassianToolNames: readonly string[] = [...atlassianTools]
 export const capabilityToolNames = {
   workspace: ["read", "write", "edit"],
   figma_read: ["get_figma"],
-  browser_mock: ["use_browser"],
+  browser_ac: ["verify_ac"],
+  browser_ui: ["verify_ui"],
   atlassian_read: requiredAtlassianToolNames,
 } as const;
 
 type Capability = keyof typeof capabilityToolNames;
 type ConversationCapability = "workspace" | "figma_read";
-type QaCapability = "atlassian_read" | "browser_mock" | "figma_read";
+type QaCapability = "atlassian_read" | "browser_ac" | "browser_ui" | "figma_read";
 
 type ConversationAgent = Readonly<{
   kind: "conversation";
@@ -97,7 +98,7 @@ export const agentRegistry = {
     kind: "qa",
     model: MODEL,
     artifact: "ac-result",
-    capabilities: ["browser_mock"],
+    capabilities: ["browser_ac"],
     codeMode: "enabled",
     profile: "functional-v2",
     systemPrompt: qaSystemPrompts.ac,
@@ -106,7 +107,7 @@ export const agentRegistry = {
     kind: "qa",
     model: MODEL,
     artifact: "ui-result",
-    capabilities: ["browser_mock", "figma_read"],
+    capabilities: ["browser_ui", "figma_read"],
     codeMode: "enabled",
     profile: "style-v2",
     systemPrompt: qaSystemPrompts.ui,

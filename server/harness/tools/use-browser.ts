@@ -11,20 +11,22 @@ import {
 } from "../../../shared/testing";
 import { digestOf, withinTolerance } from "../testing-domain";
 
-export type MockBrowserOutcome =
+export type BrowserOutcome = (
   | Readonly<{ state: "observed"; observed: string }>
-  | Readonly<{ state: "blocked"; reason: string }>;
+  | Readonly<{ state: "blocked"; reason: string }>
+) &
+  Readonly<{ browser?: PublicEvidence["browser"] }>;
 
-export type BrowserFixture = Readonly<{
+export type BrowserAdapter = Readonly<{
   identity: FixtureIdentity;
   adapterVersion: string;
-  outcomes: Readonly<Record<string, MockBrowserOutcome>>;
+  run: (planCase: PlanCase, check: PlanCheck) => Promise<BrowserOutcome>;
 }>;
 
 export type BrowserCheckScope = Readonly<{
   cases: readonly PlanCase[];
   checks: readonly PlanCheck[];
-  fixture: BrowserFixture;
+  fixture: BrowserAdapter;
 }> &
   (
     | Readonly<{ role: "ac"; figmaProperties: null; designCapture: null }>
@@ -58,7 +60,8 @@ function assignedCases(cases: readonly PlanCase[]): ReadonlyMap<string, PlanCase
 type EvidenceBase = Readonly<{
   caseId: string;
   checkId: string;
-  origin: "mock";
+  origin: "browser";
+  browser?: PublicEvidence["browser"];
   fixture: FixtureIdentity;
   adapterVersion: string;
 }>;
@@ -74,7 +77,7 @@ type TrustedDesign = Readonly<{
 function functionalEvidence(
   check: FunctionalCheck,
   planCase: PlanCase,
-  outcome: MockBrowserOutcome,
+  outcome: BrowserOutcome,
   base: EvidenceBase,
 ): PublicEvidence {
   const actionIndex = planCase.actions.length - 1;
@@ -91,7 +94,13 @@ function functionalEvidence(
 
   return {
     kind: "functional",
-    outcome: outcome.observed === check.expectedObservation ? "pass" : "fail",
+    outcome: (
+      check.observation?.comparison === "contains"
+        ? outcome.observed.includes(check.expectedObservation)
+        : outcome.observed === check.expectedObservation
+    )
+      ? "pass"
+      : "fail",
     expected: check.expectedObservation,
     observed: outcome.observed,
     actionIndex,
@@ -101,7 +110,7 @@ function functionalEvidence(
 
 function styleEvidence(
   check: StyleCheck,
-  outcome: MockBrowserOutcome,
+  outcome: BrowserOutcome,
   base: EvidenceBase,
   design: TrustedDesign,
 ): PublicEvidence {
@@ -146,14 +155,15 @@ function styleEvidence(
 function evidenceFor(
   check: PlanCheck,
   planCase: PlanCase,
-  outcome: MockBrowserOutcome,
-  fixture: BrowserFixture,
+  outcome: BrowserOutcome,
+  fixture: BrowserAdapter,
   design: TrustedDesign,
 ): PublicEvidence {
   const base: EvidenceBase = {
     caseId: planCase.id,
     checkId: check.id,
-    origin: "mock",
+    origin: "browser",
+    ...(outcome.browser ? { browser: outcome.browser } : {}),
     fixture: fixture.identity,
     adapterVersion: fixture.adapterVersion,
   };
@@ -176,10 +186,6 @@ function scopedCheckIssue(
 
   if (check.kind !== expectedKind) {
     return `Scoped check ${check.id} is not a ${expectedKind} check`;
-  }
-
-  if (!scope.fixture.outcomes[check.id]) {
-    return `Fixture has no outcome for ${check.id}`;
   }
 
   if (check.kind === "style" && scope.figmaProperties?.[check.property] === undefined) {
@@ -205,12 +211,6 @@ function assertScopedChecks(
 
     if (issue) {
       throw new Error(issue);
-    }
-  }
-
-  for (const id of Object.keys(scope.fixture.outcomes)) {
-    if (!checkIds.has(id)) {
-      throw new Error(`Fixture has an outcome outside the scoped checks: ${id}`);
     }
   }
 }
@@ -244,12 +244,12 @@ function trustedDesign(scope: BrowserCheckScope): TrustedDesign {
   return { figmaProperties: scope.figmaProperties, designCapture: capture.data };
 }
 
-function browserOutput(
+async function browserOutput(
   scope: BrowserCheckScope,
   casesByCheck: ReadonlyMap<string, PlanCase>,
   design: TrustedDesign,
   raw: unknown,
-): BrowserOutput {
+): Promise<BrowserOutput> {
   const input = useBrowserInputSchema.parse(raw);
   const check = scope.checks.find((item) => item.id === input.checkId);
 
@@ -263,10 +263,10 @@ function browserOutput(
     throw new Error(`Scoped check ${input.checkId} is not assigned to a canonical case`);
   }
 
-  const outcome = scope.fixture.outcomes[input.checkId];
+  const outcome = await scope.fixture.run(planCase, check);
 
   if (!outcome) {
-    throw new Error(`Fixture has no outcome for ${input.checkId}`);
+    throw new Error(`Browser adapter returned no outcome for ${input.checkId}`);
   }
 
   return {
@@ -277,7 +277,11 @@ function browserOutput(
 
 export function createUseBrowserTool(scope: BrowserCheckScope) {
   if (scope.checks.length === 0) {
-    throw new Error("use_browser requires at least one scoped check");
+    throw new Error("Browser verification requires at least one scoped check");
+  }
+
+  if (typeof scope.fixture.run !== "function") {
+    throw new Error("Browser adapter requires a live runner");
   }
 
   const casesByCheck = assignedCases(scope.cases);
@@ -285,9 +289,9 @@ export function createUseBrowserTool(scope: BrowserCheckScope) {
   const design = trustedDesign(scope);
 
   return toolDefinition({
-    name: "use_browser",
+    name: scope.role === "ac" ? "verify_ac" : "verify_ui",
     description:
-      "Run one assigned browser check against the host-provided deterministic fixture. Pass the check ID from the canonical plan. The host fixture decides the observed result; it is never chosen by the caller.",
+      "Verify one assigned canonical check. The host owns actions, targets, observations and expectations. Supply only checkId; never supply selectors or expected values.",
     inputSchema: useBrowserInputSchema,
   }).server(async (raw): Promise<BrowserOutput> => browserOutput(scope, casesByCheck, design, raw));
 }

@@ -29,3 +29,5 @@ lerna-debug.log*
 
 dist
 .fallow/
+.data/browser-executions/
+.data/browser-evidence/

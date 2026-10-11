@@ -49,6 +49,12 @@ const { scriptedEvents, anchorScenarioSource } =
     ) => Array<Record<string, unknown>>;
   };
 const enabled = process.env.TESTING_RUNTIME_DATABASE_URL;
+const originalEnvironment = {
+  DATABASE_URL: process.env.DATABASE_URL,
+  MODEL_API_KEY: process.env.MODEL_API_KEY,
+  FIGMA_API_KEY: process.env.FIGMA_API_KEY,
+  JEV_API_KEY: process.env.JEV_API_KEY,
+};
 const providerCalls: string[] = [];
 type ProviderRequest = {
   model: string;
@@ -269,6 +275,7 @@ before(async () => {
   process.env.DATABASE_URL = enabled;
   process.env.MODEL_API_KEY = "offline";
   process.env.FIGMA_API_KEY = "offline-figma";
+  process.env.JEV_API_KEY = "";
   await migrateDatabase();
   installFigmaBoundary();
   await installProviderBoundary();
@@ -281,12 +288,19 @@ after(async () => {
     return;
   }
 
-  chatStream?.mock.restore();
-  restoreFetch?.();
-  if (runtimeLaunched) await shutdownChatRuntime();
+  try {
+    chatStream?.mock.restore();
+    restoreFetch?.();
+    if (runtimeLaunched) await shutdownChatRuntime();
 
-  if (migrationFolder) {
-    await rm(migrationFolder, { recursive: true, force: true });
+    if (migrationFolder) {
+      await rm(migrationFolder, { recursive: true, force: true });
+    }
+  } finally {
+    for (const [key, value] of Object.entries(originalEnvironment)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
   }
 });
 
@@ -738,7 +752,7 @@ test(
 );
 
 test(
-  "explicit AC/UI calls use pinned outputs, native receipts, and distinct role prompts",
+  "explicit AC/UI calls persist live-adapter blocked evidence without Jev or browser execution",
   { skip: !enabled, timeout: 120_000 },
   async () => {
     await withMcpEnvironment(async () => {
@@ -771,7 +785,43 @@ test(
         const result = view?.task?.result;
         assert.ok(result && (result.kind === "ac-result" || result.kind === "ui-result"));
         assert.equal(result.payload.length, 1);
-        assert.equal(result.payload[0]?.evidence[0]?.origin, "mock");
+        assert.equal(result.payload[0]?.judgment, "blocked");
+        const evidence = result.payload[0]?.evidence[0];
+        assert.equal(evidence?.origin, "browser");
+        assert.equal(evidence?.outcome, "blocked");
+        assert.deepEqual(evidence?.fixture, { id: "playwright-chromium", version: "v1" });
+        assert.equal(evidence?.adapterVersion, "playwright-jev-v1");
+        assert.deepEqual(evidence?.browser, { selections: [] });
+        assert.equal(
+          evidence?.outcome === "blocked" && evidence.reason,
+          JSON.stringify({ stage: "scope", code: "JEV_API_KEY is required", replay: "forbidden" }),
+        );
+      }
+      const pool = new pg.Pool({ connectionString: enabled });
+      try {
+        const receipts = await pool.query(
+          "select t.role, r.native_name, r.output, r.output_digest, r.bindings from testing_receipts r join testing_tasks t on t.id = r.task_id join testing_operations o on o.id = t.operation_id where o.parent_run_id = $1 and r.native_name in ('verify_ac', 'verify_ui') order by t.role",
+          [parent.runId],
+        );
+        assert.deepEqual(
+          receipts.rows.map((row) => ({ role: row.role, nativeName: row.native_name })),
+          [
+            { role: "ac", nativeName: "verify_ac" },
+            { role: "ui", nativeName: "verify_ui" },
+          ],
+        );
+        for (const row of receipts.rows) {
+          const evidence = done.publishedTasks.find((view) => view.task?.role === row.role)?.task
+            ?.result;
+          assert.ok(evidence && (evidence.kind === "ac-result" || evidence.kind === "ui-result"));
+          assert.deepEqual(row.output.evidence, evidence.payload[0]?.evidence[0]);
+          assert.equal(row.output_digest, digestOf(row.output));
+          assert.equal(row.bindings.checkId, row.output.checkId);
+          assert.deepEqual(row.bindings.fixture, { id: "playwright-chromium", version: "v1" });
+          assert.equal(row.bindings.adapterVersion, "playwright-jev-v1");
+        }
+      } finally {
+        await pool.end();
       }
       for (const role of ROLE_IDS) {
         const calls = providerRequests

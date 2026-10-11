@@ -37,11 +37,7 @@ import {
 } from "./tools/atlassian";
 import { codeModeToolName, composeCodeModeTurn, type CodeModeTurn } from "./tools/code-mode";
 import { getFigma } from "./tools/get-figma";
-import {
-  createUseBrowserTool,
-  type BrowserFixture,
-  type MockBrowserOutcome,
-} from "./tools/use-browser";
+import { createUseBrowserTool, type BrowserAdapter } from "./tools/use-browser";
 import type { RunTools } from "./tools";
 
 export type TestingNativeRoute = "direct" | "codemode";
@@ -84,7 +80,7 @@ export type TestingNativeHost = Readonly<{
     }>,
   ) => Promise<DesignCaptureResult>;
   restoredDesign?: DesignCaptureResult;
-  browserFixture?: BrowserFixture;
+  browserFixture?: BrowserAdapter;
 }>;
 
 export type DesignCaptureResult = Readonly<{
@@ -389,32 +385,12 @@ function plannerRoleTools(signal?: AbortSignal): RoleRun {
   });
 }
 
-function hostFixture(host: TestingNativeHost): BrowserFixture {
+function hostFixture(host: TestingNativeHost): BrowserAdapter {
   if (!host.browserFixture) {
     throw new Error("Host browser fixture is required");
   }
 
   return host.browserFixture;
-}
-
-function projectFixture(fixture: BrowserFixture, checks: readonly PlanCheck[]): BrowserFixture {
-  const outcomes: Record<string, MockBrowserOutcome> = {};
-
-  for (const check of checks) {
-    const outcome = fixture.outcomes[check.id];
-
-    if (!outcome) {
-      throw new Error(`Host browser fixture has no outcome for ${check.id}`);
-    }
-
-    outcomes[check.id] = outcome;
-  }
-
-  return {
-    identity: fixture.identity,
-    adapterVersion: fixture.adapterVersion,
-    outcomes,
-  };
 }
 
 function browserChecks(plan: CanonicalPlan, kind: "functional"): readonly FunctionalCheck[];
@@ -440,9 +416,8 @@ async function browserEnvelope(
 ): Promise<unknown> {
   const parsed = useBrowserInputSchema.parse(call.input);
   const envelope = envelopeOf(
-    await host.invoke(
-      { call, input: parsed, nativeName: "use_browser", route, context },
-      async () => browser.execute!(parsed, context),
+    await host.invoke({ call, input: parsed, nativeName: call.name, route, context }, async () =>
+      browser.execute!(parsed, context),
     ),
   );
   const output = browserOutputSchema.parse(envelope.output);
@@ -465,7 +440,7 @@ function acRoleTools(input: TestingRoleToolsInput, signal?: AbortSignal): RoleRu
 
   const plan = input.plan;
   const checks = browserChecks(plan, "functional");
-  const fixture = projectFixture(hostFixture(input.host), checks);
+  const fixture = hostFixture(input.host);
   const browser = createUseBrowserTool({
     role: "ac",
     cases: plan.cases,
@@ -482,7 +457,7 @@ function acRoleTools(input: TestingRoleToolsInput, signal?: AbortSignal): RoleRu
     guard: () => undefined,
     definitions: async () => [definition],
     dispatch: () => async (call, context, route) => {
-      if (call.name !== "use_browser") {
+      if (call.name !== "verify_ac") {
         throw new Error("Unknown tool");
       }
 
@@ -492,9 +467,9 @@ function acRoleTools(input: TestingRoleToolsInput, signal?: AbortSignal): RoleRu
 }
 
 const stubUseBrowserDefinition: ModelTool = {
-  name: "use_browser",
+  name: "verify_ui",
   description:
-    "Run one assigned browser check against the host-provided deterministic fixture. Pass the check ID from the canonical plan. The host fixture decides the observed result; it is never chosen by the caller.",
+    "Verify one assigned canonical check using the live browser adapter after capturing the requested Figma design. Supply only checkId; the host owns actions, targets and observations.",
   inputSchema: (() => {
     const inputSchema = convertSchemaToJsonSchema(useBrowserInputSchema);
 
@@ -612,7 +587,7 @@ function uiRoleTools(input: TestingRoleToolsInput, signal?: AbortSignal): RoleRu
 
   const plan = input.plan;
   const checks = browserChecks(plan, "style");
-  const fixture = projectFixture(hostFixture(input.host), checks);
+  const fixture = hostFixture(input.host);
   const design = input.intent.design;
 
   if (!design) {
@@ -634,7 +609,7 @@ function uiRoleTools(input: TestingRoleToolsInput, signal?: AbortSignal): RoleRu
 
   const currentBrowser = (): BrowserTool => {
     if (!capture) {
-      throw new Error("use_browser requires an accepted Figma capture");
+      throw new Error("verify_ui requires an accepted Figma capture");
     }
 
     return createUseBrowserTool({
@@ -681,7 +656,7 @@ function uiRoleTools(input: TestingRoleToolsInput, signal?: AbortSignal): RoleRu
         return envelope.output;
       }
 
-      if (call.name === "use_browser") {
+      if (call.name === "verify_ui") {
         const browser = currentBrowser();
 
         return browserEnvelope(input.host, browser, call, context, route);

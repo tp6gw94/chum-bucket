@@ -26,6 +26,7 @@ import {
   delegationInputSchema,
   type DelegationInput,
   browserOutputSchema,
+  type BrowserOutput,
   designCaptureSchema,
   type ArtifactKind,
   type ArtifactRef,
@@ -81,7 +82,7 @@ const TESTING_LIMITS = {
   modelAttempts: 3,
   operationMs: 15 * 60 * 1000,
 } as const;
-const TESTING_FIXTURE = { id: "host-browser-mock", version: "v1" } as const;
+const TESTING_FIXTURE = { id: "playwright-chromium", version: "v1" } as const;
 
 const VERSIONS = {
   runtime: "host-testing-runtime-v1",
@@ -89,7 +90,7 @@ const VERSIONS = {
   validator: "testing-domain-v1",
   policy: "role-registry-v1",
   catalog: "catalog-v1",
-  adapter: "mock-adapter-v1",
+  adapter: "playwright-jev-v1",
   loop: "agent-loop-v1",
   fixture: TESTING_FIXTURE.version,
   workflow: TESTING_WORKFLOW_VERSION,
@@ -1876,17 +1877,46 @@ function sameFixture(
   return fixture?.id === runtime.fixture.id && fixture.version === runtime.fixture.version;
 }
 
+const browserNativeByRole = { ac: "verify_ac", ui: "verify_ui" } as const;
+const browserEvidenceKindByRole = { ac: "functional", ui: "style" } as const;
+
+function isBrowserReceiptNative(nativeName: string): boolean {
+  return nativeName === "use_browser" || nativeName === "verify_ac" || nativeName === "verify_ui";
+}
+
+function browserEvidenceMatches(
+  role: "ac" | "ui",
+  checkId: string,
+  evidence: BrowserOutput["evidence"],
+  bindings: ReceiptBindings,
+): boolean {
+  return (
+    evidence.kind === browserEvidenceKindByRole[role] &&
+    checkId === bindings.checkId &&
+    evidence.checkId === bindings.checkId &&
+    evidence.origin === "browser" &&
+    evidence.browser !== undefined
+  );
+}
+
 function browserReceiptValid(
   task: TaskRow,
   runtime: HostTestingRuntime,
   output: unknown,
   bindings: ReceiptBindings,
 ): boolean {
+  if (task.role !== "ac" && task.role !== "ui") {
+    return false;
+  }
+
   const parsed = browserOutputSchema.safeParse(output);
 
+  if (!parsed.success) {
+    return false;
+  }
+
   return (
-    (task.role === "ac" || task.role === "ui") &&
-    parsed.success &&
+    browserEvidenceMatches(task.role, parsed.data.checkId, parsed.data.evidence, bindings) &&
     sameFixture(bindings.fixture, runtime) &&
     sameFixture(parsed.data.evidence.fixture, runtime) &&
     parsed.data.evidence.adapterVersion === runtime.versions.adapter
@@ -1897,6 +1927,24 @@ function figmaReceiptValid(task: TaskRow, output: unknown): boolean {
   return (
     task.role === "ui" && rawFigmaOutput(output) && !designCaptureSchema.safeParse(output).success
   );
+}
+
+function browserScopeError(
+  task: TaskRow,
+  runtime: HostTestingRuntime,
+  nativeName: string,
+  output: unknown,
+  bindings: ReceiptBindings,
+): string | null {
+  const role = task.role === "ac" || task.role === "ui" ? task.role : "ui";
+
+  if (nativeName !== "use_browser" && nativeName !== browserNativeByRole[role]) {
+    return "Browser tool does not match role";
+  }
+
+  return browserReceiptValid(task, runtime, output, bindings)
+    ? null
+    : "Browser receipt is outside the host scope";
 }
 
 function receiptScopeError(
@@ -1917,10 +1965,8 @@ function receiptScopeError(
     return "Planner has no external receipt scope";
   }
 
-  if (nativeName === "use_browser") {
-    return browserReceiptValid(task, runtime, output, bindings)
-      ? null
-      : "Browser receipt is outside the host scope";
+  if (isBrowserReceiptNative(nativeName)) {
+    return browserScopeError(task, runtime, nativeName, output, bindings);
   }
 
   if (nativeName === "get_figma") {
@@ -2470,6 +2516,51 @@ async function artifactByRef(tx: Transaction, ref: string) {
   return artifact;
 }
 
+function browserProjectionMatches(
+  output: BrowserOutput,
+  bindings: ReceiptBindings,
+  role: "ac" | "ui",
+): boolean {
+  const { evidence } = output;
+
+  return (
+    evidence.kind === browserEvidenceKindByRole[role] &&
+    output.checkId === bindings.checkId &&
+    evidence.checkId === bindings.checkId
+  );
+}
+
+function trustedBrowserReceipt(row: ReceiptRow, role: "ac" | "ui"): TrustedToolReceipt | undefined {
+  const output = browserOutputSchema.safeParse(row.output);
+  const bindings = receiptBindingsSchema.safeParse(row.bindings);
+
+  if (!output.success || !bindings.success || !bindings.data.fixture) {
+    return undefined;
+  }
+
+  if (row.native_name !== "use_browser" && row.native_name !== browserNativeByRole[role]) {
+    return undefined;
+  }
+
+  if (!browserProjectionMatches(output.data, bindings.data, role)) {
+    return undefined;
+  }
+
+  if (row.output_digest !== digestOf(row.output)) {
+    return undefined;
+  }
+
+  return {
+    id: row.id,
+    role,
+    checkId: output.data.checkId,
+    inputDigest: row.input_digest,
+    outputDigest: row.output_digest,
+    output: row.output,
+    fixture: bindings.data.fixture,
+  };
+}
+
 async function readTrustedReceipts(tx: Transaction, task: TaskRow): Promise<TrustedToolReceipt[]> {
   const rows = await tx
     .select()
@@ -2487,28 +2578,9 @@ async function readTrustedReceipts(tx: Transaction, task: TaskRow): Promise<Trus
   }
 
   return rows.flatMap((row) => {
-    const output = browserOutputSchema.safeParse(row.output);
-    const bindings = receiptBindingsSchema.safeParse(row.bindings);
+    const receipt = trustedBrowserReceipt(row, role);
 
-    if (!output.success || !bindings.success || !bindings.data.fixture) {
-      return [];
-    }
-
-    if (row.output_digest !== digestOf(row.output)) {
-      return [];
-    }
-
-    return [
-      {
-        id: row.id,
-        role,
-        checkId: output.data.checkId,
-        inputDigest: row.input_digest,
-        outputDigest: row.output_digest,
-        output: row.output,
-        fixture: bindings.data.fixture,
-      },
-    ];
+    return receipt ? [receipt] : [];
   });
 }
 

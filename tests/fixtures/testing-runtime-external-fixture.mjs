@@ -237,7 +237,7 @@ export function scriptedEvents(options, control = {}) {
       ].join("\n");
       return textEvents(identity, reply, 24);
     }
-    return textEvents(identity, "委派任務已完成。測試計畫與產物參照已保留，瀏覽器結果僅為模擬。");
+    return textEvents(identity, "委派任務已完成。測試計畫與產物參照已保留，請依證據確認執行結果。");
   }
 
   if (role === "atlassian") {
@@ -337,6 +337,7 @@ export function scriptedEvents(options, control = {}) {
             criterionId: criterion.id,
             kind: "functional",
             expectedObservation: "UNIQUE-EXPECTED",
+            observation: { kind: "text", target: "Order confirmation", comparison: "equals" },
           }))
         : [
             {
@@ -344,6 +345,7 @@ export function scriptedEvents(options, control = {}) {
               criterionId: selected[0]?.id ?? "crit:missing",
               kind: "functional",
               expectedObservation: "UNIQUE-EXPECTED",
+              observation: { kind: "text", target: "Order confirmation", comparison: "equals" },
             },
           ];
 
@@ -354,6 +356,7 @@ export function scriptedEvents(options, control = {}) {
         kind: "style",
         design: task.design,
         property: "width",
+        target: "Checkout",
         tolerance: { kind: "exact" },
       });
     }
@@ -393,7 +396,9 @@ export function scriptedEvents(options, control = {}) {
   if (browserOutputs.length < checks.length) {
     const pending = checks[browserOutputs.length];
 
-    return toolEvents(identity, "use_browser", { checkId: pending.id });
+    return toolEvents(identity, role === "ac" ? "verify_ac" : "verify_ui", {
+      checkId: pending.id,
+    });
   }
 
   const evidence = browserOutputs.flatMap((message) => {
@@ -403,12 +408,13 @@ export function scriptedEvents(options, control = {}) {
       return [];
     }
 
-    const judgment =
+    const outcome =
       parsed.evidence?.outcome === "pass" || parsed.evidence?.outcome === "inside_tolerance"
-        ? "simulated_pass"
+        ? "pass"
         : parsed.evidence?.outcome === "fail" || parsed.evidence?.outcome === "outside_tolerance"
-          ? "simulated_fail"
-          : "simulated_blocked";
+          ? "fail"
+          : "blocked";
+    const judgment = parsed.evidence?.origin === "mock" ? `simulated_${outcome}` : outcome;
 
     return [
       {
