@@ -9,7 +9,11 @@ import {
   type StreamChunk,
   type UIMessage,
 } from "@tanstack/ai";
-import { streamModelTurn, type Turn } from "../../../server/harness/model-turn";
+import {
+  ContextOverflowError,
+  streamModelTurn,
+  type Turn,
+} from "../../../server/harness/model-turn";
 import type { ModelTool } from "../../../server/harness/tools/atlassian";
 
 type ToolCallEnd = Extract<StreamChunk, { type: "TOOL_CALL_END" }>;
@@ -273,3 +277,38 @@ for (const argumentsJson of ["{", "", "null", "[]", '"text"', "1", "true"]) {
     );
   });
 }
+
+test("context overflow is recognized whether the provider throws or streams RUN_ERROR", async () => {
+  const overflowText =
+    "This model's maximum context length is 131072 tokens. However, you requested 140000 tokens.";
+  const thrown = (error: unknown) =>
+    streamModelTurn({
+      messages: [],
+      stream: (async function* () {
+        throw error;
+      })(),
+      append: async () => {},
+    });
+  const streamed = (event: Record<string, unknown>) =>
+    streamModelTurn({
+      messages: [],
+      stream: (async function* () {
+        yield { type: "RUN_ERROR", ...event } as never;
+      })(),
+      append: async () => {},
+    });
+
+  await assert.rejects(thrown({ code: "context_length_exceeded" }), ContextOverflowError);
+  await assert.rejects(thrown({ status: 400, message: overflowText }), ContextOverflowError);
+  await assert.rejects(streamed({ message: overflowText }), ContextOverflowError);
+  await assert.rejects(streamed({ message: overflowText, code: "400" }), ContextOverflowError);
+
+  for (const error of [
+    { status: 429, message: overflowText },
+    { status: 503, message: "Service Unavailable" },
+    new TypeError("fetch failed"),
+    { status: 400, message: "Invalid tool schema" },
+  ]) {
+    await assert.rejects(thrown(error), (cause) => !(cause instanceof ContextOverflowError));
+  }
+});

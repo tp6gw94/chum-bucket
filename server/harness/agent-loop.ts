@@ -7,7 +7,14 @@ import {
   type UIMessage,
 } from "@tanstack/ai";
 import { resolveDebugOption } from "@tanstack/ai/adapter-internals";
-import { snapshot, streamModelTurn, type ModelCall, type Turn } from "./model-turn";
+import { advanceConversation, type ConversationState } from "./conversation";
+import {
+  ContextOverflowError,
+  snapshot,
+  streamModelTurn,
+  throwProviderError,
+  type ModelCall,
+} from "./model-turn";
 import type { ModelTool } from "./tools/atlassian";
 import { createToolEventBuffer, drainToolEvents } from "./tool-events";
 import type { RunTools } from "./tools";
@@ -33,7 +40,7 @@ export type AgentRetry = Readonly<{
 export type AgentEmit = (
   runId: string,
   event: StreamChunk,
-  messages?: UIMessage[],
+  conversation?: ConversationState,
 ) => Promise<void>;
 
 export type AgentChatStream = (options: {
@@ -47,6 +54,7 @@ export type AgentChatStream = (options: {
 
 export type AgentSession = Readonly<{
   runId: string;
+  assertExecution: () => Promise<void>;
   emit: AgentEmit;
   chatStream: AgentChatStream;
   tools: RunTools;
@@ -55,50 +63,89 @@ export type AgentSession = Readonly<{
 export type AgentCheckpoint = <T>(input: {
   name: string;
   retry?: AgentRetry;
+  shouldRetry?: () => boolean;
   work: () => Promise<T>;
 }) => Promise<T>;
 
+export type AgentCompact = (input: {
+  conversation: ConversationState;
+  reason: "threshold" | "overflow";
+  turn: number;
+}) => Promise<ConversationState>;
+
 export type AgentLoopResult =
-  | { state: "done"; messages: UIMessage[] }
-  | { state: "limit"; messages: UIMessage[] };
+  | { state: "done"; conversation: ConversationState }
+  | { state: "limit"; conversation: ConversationState };
 
 type AgentLoopInput = {
   session: AgentSession;
-  messages: UIMessage[];
+  conversation: ConversationState;
   model: string;
   prompt: string;
   checkpoint: AgentCheckpoint;
+  compact: AgentCompact;
+  signal: AbortSignal;
 };
+
+type ModelOutcome =
+  | { state: "done"; conversation: ConversationState; calls: ModelCall[] }
+  | { state: "overflow" };
 
 async function modelStep(
   session: AgentSession,
-  input: { messages: UIMessage[]; model: string; prompt: string },
-): Promise<Turn> {
-  const { messages, model, prompt } = input;
-  await session.emit(session.runId, snapshot(messages), messages);
-  const tools = await session.tools.getModelTools(messages);
-  const result = await streamModelTurn({
-    messages,
-    stream: await session.chatStream({
-      model,
-      messages: convertMessagesToModelMessages(messages),
-      systemPrompts: [prompt, tools.systemPrompt],
-      tools: tools.definitions,
-      logger: resolveDebugOption(false),
-      request: { signal: AbortSignal.timeout(MODEL_REQUEST_TIMEOUT_MS) },
-    }),
-    append: (event) => session.emit(session.runId, event),
-  });
-  await session.emit(session.runId, snapshot(result.messages), result.messages);
+  input: { conversation: ConversationState; model: string; prompt: string; signal: AbortSignal },
+): Promise<ModelOutcome> {
+  const { conversation, model, prompt, signal } = input;
+  signal.throwIfAborted();
+  await session.assertExecution();
+  await session.emit(session.runId, snapshot(conversation.display), conversation);
+  const tools = await session.tools.getModelTools(conversation.context);
+  let result: Awaited<ReturnType<typeof streamModelTurn>>;
 
-  return result;
+  try {
+    let stream: AsyncIterable<AdapterYieldChunk>;
+
+    try {
+      stream = await session.chatStream({
+        model,
+        messages: convertMessagesToModelMessages(conversation.context),
+        systemPrompts: [prompt, tools.systemPrompt],
+        tools: tools.definitions,
+        logger: resolveDebugOption(false),
+        request: {
+          signal: AbortSignal.any([signal, AbortSignal.timeout(MODEL_REQUEST_TIMEOUT_MS)]),
+        },
+      });
+    } catch (error) {
+      throwProviderError(error);
+    }
+
+    result = await streamModelTurn({
+      messages: conversation.context,
+      stream,
+      append: (event) => session.emit(session.runId, event),
+    });
+  } catch (error) {
+    if (error instanceof ContextOverflowError) {
+      return { state: "overflow" };
+    }
+
+    throw error;
+  }
+
+  signal.throwIfAborted();
+  const next = advanceConversation(conversation, result.messages);
+  await session.emit(session.runId, snapshot(next.display), next);
+
+  return { state: "done", conversation: next, calls: result.calls };
 }
 
 async function settleToolStep(
   session: AgentSession,
-  input: { messages: UIMessage[]; call: ModelCall; output: unknown; error: boolean },
-): Promise<UIMessage[]> {
-  const { messages, call, output, error } = input;
+  input: { conversation: ConversationState; call: ModelCall; output: unknown; error: boolean },
+): Promise<ConversationState> {
+  const { conversation, call, output, error } = input;
+  const messages = conversation.context;
   const content = JSON.stringify(output);
 
   if (typeof content !== "string") {
@@ -117,17 +164,22 @@ async function settleToolStep(
   const processor = new StreamProcessor({ initialMessages: structuredClone(messages) });
   processor.processChunk(event);
   const next = JSON.parse(JSON.stringify(processor.getMessages())) as UIMessage[];
-  await session.emit(session.runId, event, next);
+  const owner = messages.find((message) =>
+    message.parts.some((part) => part.type === "tool-call" && part.id === call.id),
+  );
+  const settled = advanceConversation(conversation, next, owner?.id);
+  await session.emit(session.runId, event, settled);
 
-  return next;
+  return settled;
 }
 
 async function executeToolStep(
   session: AgentSession,
-  input: { messages: UIMessage[]; call: ModelCall },
-): Promise<UIMessage[]> {
-  const { messages, call } = input;
-  await session.emit(session.runId, snapshot(messages), messages);
+  input: { conversation: ConversationState; call: ModelCall; signal: AbortSignal },
+): Promise<ConversationState> {
+  const { conversation, call, signal } = input;
+  signal.throwIfAborted();
+  await session.emit(session.runId, snapshot(conversation.display), conversation);
   const events = createToolEventBuffer(call.id);
   let output: unknown;
   let error = false;
@@ -135,58 +187,99 @@ async function executeToolStep(
   try {
     const context = {
       toolCallId: call.id,
-      abortSignal: AbortSignal.timeout(TOOL_REQUEST_TIMEOUT_MS),
+      abortSignal: AbortSignal.any([signal, AbortSignal.timeout(TOOL_REQUEST_TIMEOUT_MS)]),
       emitCustomEvent: (name: string, value: Record<string, unknown>) => events.emit(name, value),
     };
-    output = await session.tools.executeTool(messages, call, context);
+    output = await session.tools.executeTool(conversation.context, call, context);
   } catch (failure) {
     output = { error: failure instanceof Error ? failure.message.slice(0, 2000) : "Tool failed" };
     error = true;
   }
 
+  signal.throwIfAborted();
   await drainToolEvents(events, (event) => session.emit(session.runId, event));
 
-  return settleToolStep(session, { messages, call, output, error });
+  return settleToolStep(session, { conversation, call, output, error });
 }
 
 async function toolTurn(
   input: AgentLoopInput,
-  initial: UIMessage[],
+  initial: ConversationState,
   calls: readonly ModelCall[],
   turn: number,
-): Promise<UIMessage[]> {
-  let messages = initial;
+): Promise<ConversationState> {
+  const { session, signal } = input;
+  let conversation = initial;
 
   for (const [index, call] of calls.entries()) {
-    const current = messages;
-    messages = await input.checkpoint({
+    signal.throwIfAborted();
+    await session.assertExecution();
+    const current = conversation;
+    conversation = await input.checkpoint({
       name: `tool:${turn}:${index}`,
-      work: () => executeToolStep(input.session, { messages: current, call }),
+      work: () => executeToolStep(session, { conversation: current, call, signal }),
     });
   }
 
-  return messages;
+  return conversation;
+}
+
+function modelAttempt(input: AgentLoopInput, conversation: ConversationState, name: string) {
+  const { session, model, prompt, signal } = input;
+
+  return input.checkpoint({
+    name,
+    retry: MODEL_RETRY,
+    shouldRetry: () => !signal.aborted,
+    work: () => modelStep(session, { conversation, model, prompt, signal }),
+  });
+}
+
+function resetModel(input: AgentLoopInput, conversation: ConversationState, name: string) {
+  const { session } = input;
+
+  return input.checkpoint({
+    name,
+    work: () => session.emit(session.runId, snapshot(conversation.display), conversation),
+  });
+}
+
+async function recoverOverflow(
+  input: AgentLoopInput,
+  conversation: ConversationState,
+  turn: number,
+): Promise<Extract<ModelOutcome, { state: "done" }>> {
+  await resetModel(input, conversation, `reset-model:${turn}:overflow`);
+  const compacted = await input.compact({ conversation, reason: "overflow", turn });
+  const result = await modelAttempt(input, compacted, `model-overflow:${turn}`);
+
+  if (result.state === "overflow") {
+    await resetModel(input, compacted, `reset-model:${turn}:exhausted`);
+    throw new ContextOverflowError();
+  }
+
+  return result;
 }
 
 export async function runAgentLoop(input: AgentLoopInput): Promise<AgentLoopResult> {
-  const { session, model, prompt } = input;
-  let messages = input.messages;
+  const { session, signal } = input;
+  let conversation = input.conversation;
 
   for (let turn = 0; turn < MAX_TURN; turn++) {
-    const current = messages;
-    const result = await input.checkpoint({
-      name: `model:${turn}`,
-      retry: MODEL_RETRY,
-      work: () => modelStep(session, { messages: current, model, prompt }),
-    });
-    messages = result.messages;
+    signal.throwIfAborted();
+    await session.assertExecution();
+    conversation = await input.compact({ conversation, reason: "threshold", turn });
+    const attempt = await modelAttempt(input, conversation, `model:${turn}`);
+    const result =
+      attempt.state === "done" ? attempt : await recoverOverflow(input, conversation, turn);
+    conversation = result.conversation;
 
     if (!result.calls.length) {
-      return { state: "done", messages };
+      return { state: "done", conversation };
     }
 
-    messages = await toolTurn(input, messages, result.calls, turn);
+    conversation = await toolTurn(input, conversation, result.calls, turn);
   }
 
-  return { state: "limit", messages };
+  return { state: "limit", conversation };
 }

@@ -8,6 +8,72 @@ import {
   type AdapterYieldChunk,
 } from "@tanstack/ai";
 
+export class ContextOverflowError extends Error {
+  constructor() {
+    super("Model context capacity exceeded");
+    this.name = "ContextOverflowError";
+  }
+}
+
+const TRANSIENT_STATUS = /^(?:401|403|408|429|5\d\d)$/;
+const TRANSIENT_TEXT =
+  /unauthorized|forbidden|invalid api key|rate.?limit|too many requests|internal server|service unavailable|gateway|network|socket|connection|fetch failed|timed?\s*out|aborterror/i;
+const OVERFLOW_CODES: ReadonlySet<string> = new Set([
+  "context_length_exceeded",
+  "max_context_length_exceeded",
+  "context_window_exceeded",
+]);
+const OVERFLOW_TEXT =
+  /maximum context length|(?:input|prompt|requested) tokens? exceed(?:s|ed)? (?:the )?(?:model'?s? )?(?:maximum context length|context window)/i;
+
+function errorEvidence(error: unknown): Record<string, unknown>[] {
+  const evidence: Record<string, unknown>[] = [];
+  let item = error;
+
+  while (item && typeof item === "object" && evidence.length < 12) {
+    const value = item as Record<string, unknown>;
+    evidence.push(value);
+    item = value.error ?? value.cause;
+  }
+
+  return evidence;
+}
+
+function isContextOverflow(error: unknown): boolean {
+  const evidence = errorEvidence(error);
+  const codes = evidence
+    .flatMap((value) => [value.code, value.status, value.statusCode])
+    .filter((value) => typeof value === "string" || typeof value === "number")
+    .map(String);
+  const messages = evidence.flatMap((value) =>
+    typeof value.message === "string" ? [value.message] : [],
+  );
+
+  if (
+    codes.some((code) => TRANSIENT_STATUS.test(code)) ||
+    messages.some((message) => TRANSIENT_TEXT.test(message))
+  ) {
+    return false;
+  }
+
+  if (codes.some((code) => OVERFLOW_CODES.has(code.toLowerCase()))) {
+    return true;
+  }
+
+  return (
+    codes.every((code) => /^(?:400|413)$/.test(code)) &&
+    messages.some((message) => OVERFLOW_TEXT.test(message))
+  );
+}
+
+export function throwProviderError(error: unknown): never {
+  if (isContextOverflow(error)) {
+    throw new ContextOverflowError();
+  }
+
+  throw error;
+}
+
 export type ModelCall = { id: string; name: string; arguments: string; input: unknown };
 export type Turn = {
   messages: UIMessage[];
@@ -65,6 +131,10 @@ function validateToolEvent(event: StreamChunk, processor: StreamProcessor): void
 
 function assertLiveEvent(event: StreamChunk, processor: StreamProcessor, finished: boolean): void {
   if (event.type === "RUN_ERROR") {
+    if (isContextOverflow(event)) {
+      throw new ContextOverflowError();
+    }
+
     throw new Error(event.message);
   }
 
@@ -93,8 +163,12 @@ function eventFlow(type: StreamChunk["type"]): EventFlow {
 async function* normalizedEvents(
   stream: AsyncIterable<AdapterYieldChunk>,
 ): AsyncGenerator<StreamChunk> {
-  for await (const yielded of stream) {
-    yield* normalizeStreamChunk(yielded);
+  try {
+    for await (const yielded of stream) {
+      yield* normalizeStreamChunk(yielded);
+    }
+  } catch (error) {
+    throwProviderError(error);
   }
 }
 

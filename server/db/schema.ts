@@ -1,6 +1,8 @@
 import { sql } from "drizzle-orm";
 import type { UIMessage, StreamChunk } from "@tanstack/ai";
 import type { RunInput, AcceptedRun } from "../harness/run-store";
+import type { RunProjection } from "../harness/conversation";
+import type { SideChatSeed } from "../../shared/side-chat";
 import {
   pgTable,
   uuid,
@@ -36,6 +38,17 @@ export const threadsTable = pgTable(
   ],
 );
 
+export const sideChatsTable = pgTable(
+  "side_chats",
+  {
+    id: uuid().primaryKey(),
+    parent_thread_id: uuid().notNull(),
+    state: text().notNull().$type<"open" | "closing">().default("open"),
+    seed: jsonb().notNull().$type<SideChatSeed>(),
+  },
+  (t) => [check("side_chats_state_check", sql`${t.state} in ('open', 'closing')`)],
+);
+
 export const chatRunsTable = pgTable(
   "chat_runs",
   {
@@ -45,7 +58,7 @@ export const chatRunsTable = pgTable(
       .references(() => threadsTable.id),
     request: jsonb().notNull().$type<RunInput>(),
     accepted: jsonb().notNull().$type<AcceptedRun>(),
-    projection: jsonb().notNull().$type<UIMessage[]>(),
+    projection: jsonb().notNull().$type<RunProjection | UIMessage[]>(),
     state: text().notNull().$type<"pending" | "succeeded" | "failed">().default("pending"),
     next_sequence: integer().notNull().default(0),
     created_at: timestamp({ withTimezone: true }).notNull().defaultNow(),

@@ -70,16 +70,22 @@ test("the agent loop runs codemode and persists its events before the result", a
     runAgentLoop({
       session: {
         runId: "code-mode-run",
+        assertExecution: async () => undefined,
         emit: async (_runId, event) => {
           persisted.push(event);
         },
         chatStream,
         tools,
       },
-      messages: [{ id: "user-1", role: "user", parts: [{ type: "text", content: "read" }] }],
+      conversation: {
+        display: [{ id: "user-1", role: "user", parts: [{ type: "text", content: "read" }] }],
+        context: [{ id: "user-1", role: "user", parts: [{ type: "text", content: "read" }] }],
+      },
       model: "offline",
       prompt: "base prompt",
       checkpoint,
+      compact: async (input) => input.conversation,
+      signal: new AbortController().signal,
     }),
   );
 

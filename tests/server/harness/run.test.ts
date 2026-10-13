@@ -295,11 +295,13 @@ const accepted: AcceptedRun = {
   threadId: "d08035f1-07df-49f3-b2d0-5cf5cb2b1e74",
   runId: "ca2f180a-8461-4cfb-9012-f413df6d72f9",
   baseRevision: 0,
+  kind: "chat",
   message: { id: "user-1", text: "Hello" },
   messages: baseline,
+  context: baseline,
   prompt: "offline",
   model: "deepseek-ai/DeepSeek-V4.1-Flash",
-  build: "durable-chat-loop-v5",
+  build: "durable-chat-loop-v6",
 };
 const toolTurn: Turn = {
   messages: baseline,
@@ -331,7 +333,7 @@ test("model checkpoint serialization failure halts all tools", async () => {
   );
   try {
     await assert.rejects(executeRun(accepted), /Checkpoint serialization rejected/);
-    assert.deepEqual(names, ["model:0"]);
+    assert.deepEqual(names, ["compact:0"]);
   } finally {
     stepping.mock.restore();
   }
@@ -1164,6 +1166,7 @@ test("AG-UI boundary ignores forged history, requires revision, and keeps run id
     threadId: accepted.threadId,
     runId: accepted.runId,
     baseRevision: 0,
+    kind: "chat",
     message: accepted.message,
   });
   assert.throws(() => parseRunBody({ ...body, forwardedProps: {} }), /Invalid AG-UI/);
@@ -1312,7 +1315,8 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
       .replaceAll('"', "");
     if (text.endsWith("from chat_runs where id = $1 for update")) {
       assert.ok(statements.at(-1)?.endsWith("from threads where id = $1 for update"));
-      assert.equal(statements.at(-2), "select thread_id from chat_runs where id = $1");
+      assert.ok(statements.at(-2)?.includes("from side_chats"));
+      assert.equal(statements.at(-3), "select thread_id from chat_runs where id = $1");
     }
     statements.push(text);
     const threadColumns =
@@ -1324,17 +1328,29 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
     if (["begin", "commit", "rollback"].includes(text)) {
       return { rows, rowCount: 0 };
     }
-    if (text.startsWith(`select ${threadColumns} from threads`)) {
+    if (text.includes("from side_chats") && !text.includes("from chat_runs")) {
+      rows = [];
+    } else if (text.startsWith(`select ${threadColumns} from threads`)) {
       rows = [threads.get(String(a))].filter((row): row is Row => !!row);
     } else if (
       text.startsWith("select thread_id from chat_runs") ||
       text.startsWith(`select ${runColumns} from chat_runs where id`)
     ) {
       rows = [runs.get(String(a))].filter((row): row is Row => !!row);
-    } else if (text.startsWith(`select ${runColumns} from chat_runs where state`)) {
+    } else if (text.startsWith(`select ${runColumns} from chat_runs where (thread_id`)) {
       assert.equal(
         text,
-        `select ${runColumns} from chat_runs where state = $1 order by created_at`,
+        `select ${runColumns} from chat_runs where (thread_id = $1 and projection->>'committedRevision' = $2)`,
+      );
+      rows = [...runs.values()].filter(
+        (row) =>
+          row.thread_id === a &&
+          String((row.projection as { committedRevision?: number }).committedRevision) === b,
+      );
+    } else if (text.startsWith(`select ${runColumns} from chat_runs where (state`)) {
+      assert.equal(
+        text,
+        `select ${runColumns} from chat_runs where (state = $1 and not exists (select 1 from side_chats where side_chats.id = thread_id and side_chats.state <> 'open')) order by created_at`,
       );
       assert.equal(a, "pending");
       rows = [...runs.values()].filter((row) => row.state === a);
@@ -1378,6 +1394,12 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
         .filter((row) => row.run_id === a && Number(row.sequence) > Number(b))
         .sort((a, b) => Number(a.sequence) - Number(b.sequence))
         .slice(0, Number(c));
+    } else if (text.startsWith("select run_id, sequence, event_key, payload from chat_events")) {
+      assert.equal(
+        text,
+        "select run_id, sequence, event_key, payload from chat_events where (run_id = $1 and event_key = $2)",
+      );
+      rows = events.filter((row) => row.run_id === a && row.event_key === b);
     } else if (text.startsWith("insert into chat_events")) {
       events.push({ run_id: a, sequence: b, event_key: c, payload: JSON.parse(String(d)) });
     } else if (text.startsWith("update chat_runs set next_sequence")) {
@@ -1446,7 +1468,7 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
         }
         started.push(options!.workflowID!);
         statuses.set(options!.workflowID!, "PENDING");
-        return {};
+        return { getResult: () => new Promise(() => {}) };
       }) as never,
   );
   const input = {
@@ -1458,7 +1480,8 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
   try {
     await assert.rejects(acceptRun(input), /Start unavailable/);
     assert.equal(statements[0], "begin");
-    assert.ok(statements[1]?.endsWith("from threads where id = $1 for update"));
+    assert.ok(statements[1]?.includes("from side_chats"));
+    assert.ok(statements[2]?.endsWith("from threads where id = $1 for update"));
     assert.equal(threads.get(accepted.threadId)!.active_run_id, accepted.runId);
     assert.equal(events.length, 1);
     await reconcileRuns();
@@ -1531,7 +1554,11 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
         parts: [{ type: "text" as const, content: "complete" }],
       },
     ];
-    const modelTurn: Turn = { calls: [], messages: canonical };
+    const modelTurn = {
+      state: "done",
+      calls: [],
+      conversation: { display: canonical, context: canonical },
+    };
     const completed = new Map<string, unknown>();
     const failures = new Set(["finish"]);
     const steps = mock.method(
@@ -1687,7 +1714,7 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
         rejectedStream = invalidEvents;
         await assert.rejects(executeRun(nextRun), error);
         assert.deepEqual(external, []);
-        assert.equal(cached.size, 0);
+        assert.deepEqual([...cached.keys()], ["compact:0"]);
         assert.equal(rejectedGenerations, executedModelCallbacks);
       }
       rejectedStream = undefined;
@@ -1707,7 +1734,7 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
       await assert.rejects(executeRun(nextRun), /Uncheckpointed finish/);
       assert.deepEqual(
         runEvents()[beforeToolRetry]!.payload,
-        snapshot(cached.get("tool:0:0") as UIMessage[]),
+        snapshot((cached.get("tool:0:0") as { display: UIMessage[] }).display),
       );
       assert.deepEqual(external, ["TEST-1", "TEST-2", "TEST-2"]);
       assert.equal(modelCalls, 3);
@@ -1738,7 +1765,8 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
       cached.clear();
       gaps.add("model:0");
       await assert.rejects(executeRun(failedRun), /Uncheckpointed model:0/);
-      const speculative = runs.get(failedRun.runId)!.projection as UIMessage[];
+      const speculative = (runs.get(failedRun.runId)!.projection as { display: UIMessage[] })
+        .display;
       assert.equal(speculative.at(-1)!.parts[0]!.type, "text");
       statuses.set(failedRun.runId, "ERROR");
       await reconcileRuns();
@@ -1793,10 +1821,16 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
       await largeReplay.return(undefined);
       const largeThreadRow = threads.get(largeThread)!;
       largeThreadRow.active_run_id = "other-run";
-      await assert.rejects(finishRun(largeRun.runId, largeRun.messages), /Thread claim changed/);
+      await assert.rejects(
+        finishRun(largeRun.runId, { display: largeRun.messages, context: largeRun.messages }),
+        /Thread claim changed/,
+      );
       threads.get(largeThread)!.active_run_id = largeRun.runId;
       threads.get(largeThread)!.revision = 1;
-      await assert.rejects(finishRun(largeRun.runId, largeRun.messages), /Thread claim changed/);
+      await assert.rejects(
+        finishRun(largeRun.runId, { display: largeRun.messages, context: largeRun.messages }),
+        /Thread claim changed/,
+      );
       threads.get(largeThread)!.revision = 0;
       cached.clear();
       gaps.clear();
@@ -1846,7 +1880,7 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
         Array.from({ length: sequences.length - 1 }, (_, index) => 100_000 + index),
       );
       const beforeTerminal = largeEvents().length;
-      await finishRun(largeRun.runId, largeSaved);
+      await finishRun(largeRun.runId, { display: largeSaved, context: largeSaved });
       await assert.rejects(emit(largeRun.runId, largeEvent), /Run is terminal/);
       assert.equal(largeEvents().length, beforeTerminal);
       assert.equal(threads.get(largeThread)!.revision, 1);

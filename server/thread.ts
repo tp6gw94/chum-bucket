@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { db } from "./db";
 import { threadsTable } from "./db/schema";
-import { desc, eq } from "drizzle-orm";
+import { and, desc, eq, isNull } from "drizzle-orm";
 import { z } from "zod";
 
 const app = new Hono();
@@ -38,6 +38,7 @@ app.get("/", async (c) => {
   const threads = await db
     .select({ id: threadsTable.id, title: threadsTable.title })
     .from(threadsTable)
+    .where(isNull(threadsTable.parent_thread_id))
     .orderBy(desc(threadsTable.updated_at), desc(threadsTable.id))
     .limit(100);
 
@@ -58,7 +59,7 @@ app.get("/:threadId", async (c) => {
       revision: threadsTable.revision,
     })
     .from(threadsTable)
-    .where(eq(threadsTable.id, threadId));
+    .where(and(eq(threadsTable.id, threadId), isNull(threadsTable.parent_thread_id)));
 
   return thread ? c.json(thread) : c.notFound();
 });
