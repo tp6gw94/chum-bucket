@@ -53,9 +53,11 @@ test("full Jira configuration maps the service environment and derives Confluenc
   ]) {
     const configuration = readAtlassianConfiguration({ ...full, JIRA_BASE_URL: baseUrl });
     assert.equal(configuration.mode, "http");
+
     if (configuration.mode !== "http") {
       continue;
     }
+
     assert.equal(configuration.endpoint, defaultAtlassianEndpoint);
     assert.equal(configuration.serviceEnvironment.JIRA_URL, baseUrl.replace(/\/+$/, ""));
     assert.equal(configuration.serviceEnvironment.JIRA_USERNAME, full.JIRA_EMAIL);
@@ -74,6 +76,7 @@ test("full Jira configuration maps the service environment and derives Confluenc
       "jira_issues,confluence_pages,confluence_comments",
     );
     assert.equal(configuration.serviceEnvironment.ENABLED_TOOLS, atlassianToolNames.join(","));
+
     for (const secret of [
       full.JIRA_API_TOKEN,
       `${full.JIRA_EMAIL}:${full.JIRA_API_TOKEN}`,
@@ -94,10 +97,12 @@ test("endpoint accepts only literal loopback HTTP URLs and defaults to the fixed
   ]) {
     const configuration = readAtlassianConfiguration({ ...full, ATLASSIAN_MCP_URL: endpoint });
     assert.equal(configuration.mode, "http");
+
     if (configuration.mode === "http") {
       assert.equal(configuration.endpoint, endpoint);
     }
   }
+
   for (const endpoint of [
     "https://127.0.0.1:8000/mcp",
     "http://localhost:8000/mcp",
@@ -124,6 +129,7 @@ test("readonly policy names the five native tools and keeps both required reader
   ]);
   const configuration = readAtlassianConfiguration(full);
   assert.equal(configuration.mode, "http");
+
   if (configuration.mode === "http") {
     assert.equal(
       configuration.serviceEnvironment.ENABLED_TOOLS,

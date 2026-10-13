@@ -66,7 +66,7 @@ export function parseRunBody(body: unknown, header?: string) {
   return result.data;
 }
 
-function parseCompactBody(body: unknown, header?: string) {
+export function parseCompactBody(body: unknown, header?: string) {
   const result = compactInputSchema.safeParse(body);
 
   if (!result.success) {
@@ -149,7 +149,7 @@ const requestError: Parameters<typeof app.onError>[0] = (error, c) => {
 
   console.error("Chat request failed", error);
 
-  return c.json({ error: "Chat service unavailable" }, 503);
+  return c.json({ error: "對話服務暫時無法使用" }, 503);
 };
 
 app.onError(requestError);

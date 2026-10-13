@@ -16,27 +16,53 @@ export class ContextOverflowError extends Error {
 }
 
 const TRANSIENT_STATUS = /^(?:401|403|408|429|5\d\d)$/;
+const TRANSIENT_CODE =
+  /auth|permission|rate|quota|timeout|timedout|econn|enet|enotfound|eai_again|socket|server|transport/i;
 const TRANSIENT_TEXT =
-  /unauthorized|forbidden|invalid api key|rate.?limit|too many requests|internal server|service unavailable|gateway|network|socket|connection|fetch failed|timed?\s*out|aborterror/i;
+  /unauthorized|authentication|authorization|forbidden|invalid api key|permission denied|rate.?limit|too many requests|quota exceeded|internal server|service unavailable|gateway|network|socket|connection|fetch failed|timed?\s*out|aborterror/i;
 const OVERFLOW_CODES: ReadonlySet<string> = new Set([
   "context_length_exceeded",
   "max_context_length_exceeded",
   "context_window_exceeded",
 ]);
-const OVERFLOW_TEXT =
-  /maximum context length|(?:input|prompt|requested) tokens? exceed(?:s|ed)? (?:the )?(?:model'?s? )?(?:maximum context length|context window)/i;
+const CONTEXT_LENGTHS =
+  /maximum context length (?:is|of) (\d[\d,]*) tokens[\s\S]*?(?:you requested|resulted in) (\d[\d,]*) tokens/i;
+const CONTEXT_EXCEEDED =
+  /(?:input|prompt|requested) tokens? (?:exceed|exceeds|exceeded) (?:the )?(?:model'?s? )?(?:maximum context length|context window)/i;
 
 function errorEvidence(error: unknown): Record<string, unknown>[] {
   const evidence: Record<string, unknown>[] = [];
-  let item = error;
+  const pending = [error];
+  const seen = new Set<unknown>();
 
-  while (item && typeof item === "object" && evidence.length < 12) {
+  while (pending.length && evidence.length < 12) {
+    const item = pending.shift();
+
+    if (!item || typeof item !== "object" || seen.has(item)) {
+      continue;
+    }
+
+    seen.add(item);
     const value = item as Record<string, unknown>;
     evidence.push(value);
-    item = value.error ?? value.cause;
+    pending.push(value.error, value.cause, value.rawEvent);
   }
 
   return evidence;
+}
+
+function stringsOf(evidence: readonly Record<string, unknown>[], key: string): string[] {
+  return evidence.flatMap((value) => (typeof value[key] === "string" ? [value[key]] : []));
+}
+
+function overflowMessage(message: string): boolean {
+  const lengths = CONTEXT_LENGTHS.exec(message);
+
+  if (lengths) {
+    return Number(lengths[2]!.replaceAll(",", "")) > Number(lengths[1]!.replaceAll(",", ""));
+  }
+
+  return CONTEXT_EXCEEDED.test(message);
 }
 
 function isContextOverflow(error: unknown): boolean {
@@ -45,13 +71,12 @@ function isContextOverflow(error: unknown): boolean {
     .flatMap((value) => [value.code, value.status, value.statusCode])
     .filter((value) => typeof value === "string" || typeof value === "number")
     .map(String);
-  const messages = evidence.flatMap((value) =>
-    typeof value.message === "string" ? [value.message] : [],
-  );
+  const messages = stringsOf(evidence, "message");
+  const texts = [...messages, ...stringsOf(evidence, "name")];
 
   if (
-    codes.some((code) => TRANSIENT_STATUS.test(code)) ||
-    messages.some((message) => TRANSIENT_TEXT.test(message))
+    codes.some((code) => TRANSIENT_STATUS.test(code) || TRANSIENT_CODE.test(code)) ||
+    texts.some((value) => TRANSIENT_TEXT.test(value))
   ) {
     return false;
   }
@@ -60,10 +85,11 @@ function isContextOverflow(error: unknown): boolean {
     return true;
   }
 
-  return (
-    codes.every((code) => /^(?:400|413)$/.test(code)) &&
-    messages.some((message) => OVERFLOW_TEXT.test(message))
-  );
+  if (codes.some((code) => !/^(?:400|413)$/.test(code))) {
+    return false;
+  }
+
+  return messages.some(overflowMessage);
 }
 
 export function throwProviderError(error: unknown): never {
@@ -81,6 +107,7 @@ export type Turn = {
 };
 type ModelStream = {
   messages: UIMessage[];
+  protectedMessages?: UIMessage[];
   stream: AsyncIterable<AdapterYieldChunk>;
   append: (event: StreamChunk) => Promise<void>;
 };
@@ -163,12 +190,41 @@ function eventFlow(type: StreamChunk["type"]): EventFlow {
 async function* normalizedEvents(
   stream: AsyncIterable<AdapterYieldChunk>,
 ): AsyncGenerator<StreamChunk> {
+  const iterator = stream[Symbol.asyncIterator]();
+  let complete = false;
+  let failed = false;
+
   try {
-    for await (const yielded of stream) {
-      yield* normalizeStreamChunk(yielded);
+    while (true) {
+      let next: IteratorResult<AdapterYieldChunk>;
+
+      try {
+        next = await iterator.next();
+      } catch (error) {
+        throwProviderError(error);
+      }
+
+      if (next.done) {
+        complete = true;
+
+        return;
+      }
+
+      yield* normalizeStreamChunk(next.value);
     }
   } catch (error) {
-    throwProviderError(error);
+    failed = true;
+    throw error;
+  } finally {
+    if (!complete) {
+      await Promise.resolve()
+        .then(() => iterator.return?.())
+        .catch((error: unknown) => {
+          if (!failed) {
+            throw error;
+          }
+        });
+    }
   }
 }
 
@@ -178,13 +234,59 @@ function assertTurnComplete(finished: boolean): void {
   }
 }
 
+type ProviderReferences = { messageId?: unknown; parentMessageId?: unknown; toolCallId?: unknown };
+
+function nestedProviderReferences(event: StreamChunk): ProviderReferences {
+  if (event.type === EventType.CUSTOM && event.value && typeof event.value === "object") {
+    return event.value as ProviderReferences;
+  }
+
+  if (event.type === EventType.REASONING_ENCRYPTED_VALUE && event.subtype === "tool-call") {
+    return { toolCallId: event.entityId };
+  }
+
+  return {};
+}
+
+function assertProviderHistory(
+  event: StreamChunk & ProviderReferences,
+  messageIds: ReadonlySet<string>,
+  toolIds: ReadonlySet<string>,
+): void {
+  const nested = nestedProviderReferences(event);
+  const messageCollision = [event.messageId, event.parentMessageId, nested.messageId].some(
+    (id) => typeof id === "string" && messageIds.has(id),
+  );
+  const toolCollision = [event.toolCallId, nested.toolCallId].some(
+    (id) => typeof id === "string" && toolIds.has(id),
+  );
+
+  if (event.type === EventType.MESSAGES_SNAPSHOT || messageCollision || toolCollision) {
+    throw new Error("Provider event collides with conversation history");
+  }
+}
+
 export async function streamModelTurn(input: ModelStream): Promise<Turn> {
   const processor = new StreamProcessor({ initialMessages: structuredClone(input.messages) });
+  const history = [...input.messages, ...(input.protectedMessages ?? [])];
+  const messageIds = new Set(history.map((message) => message.id));
+  const toolIds = new Set(
+    history.flatMap((message) =>
+      message.parts.flatMap((part) =>
+        part.type === "tool-call"
+          ? [part.id]
+          : part.type === "tool-result"
+            ? [part.toolCallId]
+            : [],
+      ),
+    ),
+  );
 
   async function* checkedStream(): AsyncGenerator<StreamChunk> {
     let finished = false;
 
     for await (const event of normalizedEvents(input.stream)) {
+      assertProviderHistory(event, messageIds, toolIds);
       assertLiveEvent(event, processor, finished);
       const flow = eventFlow(event.type);
 

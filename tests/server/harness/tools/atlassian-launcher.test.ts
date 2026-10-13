@@ -64,7 +64,9 @@ async function readUvxLog(path: string): Promise<UvxRecord[]> {
   if (!existsSync(path)) {
     return [];
   }
+
   const text = await readFile(path, "utf8");
+
   return text
     .trim()
     .split("\n")
@@ -75,11 +77,14 @@ async function readUvxLog(path: string): Promise<UvxRecord[]> {
 async function waitFor<T>(read: () => Promise<T | undefined>, message: string): Promise<T> {
   for (let attempt = 0; attempt < 400; attempt++) {
     const value = await read();
+
     if (value !== undefined) {
       return value;
     }
+
     await delay(20);
   }
+
   assert.fail(message);
 }
 
@@ -100,6 +105,7 @@ function startLauncher(env: Record<string, string | undefined>, cwd: string): La
   const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
     child.on("exit", (code, signal) => resolve({ code, signal }));
   });
+
   return { child, stdout: () => out, stderr: () => err, exited };
 }
 
@@ -131,9 +137,11 @@ async function stopLauncher(launcher: Launcher, log: string) {
     launcher.child.kill("SIGKILL");
     await launcher.exited;
   }
+
   if (process.platform === "win32") {
     return;
   }
+
   for (const record of await readUvxLog(log)) {
     try {
       process.kill(-record.pid, "SIGKILL");
@@ -152,6 +160,7 @@ test("launcher runs the fixed readonly HTTP command with a sanitized mapped envi
     stderr: "RAW-SERVER-ERROR unsafe",
   });
   const launcher = startLauncher(launcherEnv(directory), directory);
+
   try {
     const record = await waitFor(async () => (await readUvxLog(log))[0], "uvx never started");
     assert.deepEqual(record.argv, [
@@ -186,6 +195,7 @@ test("launcher runs the fixed readonly HTTP command with a sanitized mapped envi
     );
     assert.equal(record.env!.UV_PYTHON, "/custom/python3.13");
     assert.equal(record.env!.PATH, launcherEnv(directory).PATH);
+
     for (const key of [
       "MODEL_API_KEY",
       "HTTP_PROXY",
@@ -196,6 +206,7 @@ test("launcher runs the fixed readonly HTTP command with a sanitized mapped envi
     ]) {
       assert.equal(record.env![key], undefined);
     }
+
     for (const secret of [
       fakeToken,
       `${fakeEmail}:${fakeToken}`,
@@ -204,6 +215,7 @@ test("launcher runs the fixed readonly HTTP command with a sanitized mapped envi
     ]) {
       assert.equal(JSON.stringify(record.argv).includes(secret), false);
     }
+
     launcher.child.kill("SIGTERM");
     const exit = await launcher.exited;
     assert.equal(exit.code, 0);
@@ -235,6 +247,7 @@ test("launcher refuses to start without credentials and never invokes uvx", asyn
     { PATH: `${directory}:${process.env.PATH ?? ""}`, HOME: process.env.HOME },
     directory,
   );
+
   try {
     const exit = await launcher.exited;
     assert.equal(exit.code, 1);
@@ -252,6 +265,7 @@ test("launcher reports a missing uvx without leaking credentials", async () => {
   const environment = launcherEnv(directory);
   environment.PATH = directory;
   const launcher = startLauncher(environment, directory);
+
   try {
     const exit = await launcher.exited;
     assert.equal(exit.code, 1);
@@ -269,6 +283,7 @@ test("launcher escalates to SIGKILL after five seconds when the service ignores 
   const log = join(directory, "uvx.jsonl");
   await writeFakeUvx(directory, { log, ignoreTerm: true });
   const launcher = startLauncher(launcherEnv(directory), directory);
+
   try {
     const record = await waitFor(
       async () => (await readUvxLog(log)).find((entry) => entry.descendant),
@@ -285,6 +300,7 @@ test("launcher escalates to SIGKILL after five seconds when the service ignores 
     await waitFor(async () => {
       try {
         process.kill(record.descendant!, 0);
+
         return undefined;
       } catch {
         return true;
@@ -301,6 +317,7 @@ test("launcher cleans up a service descendant when the uvx parent exits first", 
   const log = join(directory, "uvx.jsonl");
   await writeFakeUvx(directory, { log, descendant: true });
   const launcher = startLauncher(launcherEnv(directory), directory);
+
   try {
     const descendant = await waitFor(
       async () => (await readUvxLog(log)).find((entry) => entry.descendantReady),
@@ -311,6 +328,7 @@ test("launcher cleans up a service descendant when the uvx parent exits first", 
     await waitFor(async () => {
       try {
         process.kill(descendant.pid, 0);
+
         return undefined;
       } catch {
         return true;

@@ -27,6 +27,7 @@ test("get_figma fetches bounded design data and reports failures", async () => {
       { id: "1:4", name: "Hidden", type: "TEXT", visible: false },
     ],
   };
+
   try {
     globalThis.fetch = async (url, init) => {
       const request = new URL(String(url));
@@ -34,8 +35,10 @@ test("get_figma fetches bounded design data and reports failures", async () => {
       assert.equal(request.searchParams.get("ids"), "1:2");
       assert.equal(request.searchParams.get("depth"), "2");
       assert.ok(init?.signal);
+
       return Response.json({ nodes: { "1:2": { document } } });
     };
+
     const result = await execute(input);
     assert.equal(result.truncated, false);
     assert.deepEqual(result.nodes, [
@@ -76,6 +79,7 @@ test("get_figma fetches bounded design data and reports failures", async () => {
     await assert.rejects(() => execute(input), /non-JSON/);
   } finally {
     globalThis.fetch = originalFetch;
+
     if (originalKey === undefined) {
       delete process.env.FIGMA_API_KEY;
     } else {

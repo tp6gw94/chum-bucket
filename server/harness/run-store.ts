@@ -4,15 +4,56 @@ import { setTimeout as delay } from "node:timers/promises";
 import { and, eq, gt, inArray, sql } from "drizzle-orm";
 import { EventType, type StreamChunk, type UIMessage } from "@tanstack/ai";
 import { z } from "zod";
-import { chatEventsTable, chatRunsTable, sideChatsTable, threadsTable } from "../db/schema";
-import { compactionEvent, parseCompactionEvent } from "../../shared/compaction-event";
+import {
+  chatEventsTable,
+  chatModelSlotsTable,
+  chatRunsTable,
+  sideChatsTable,
+  testingOperationsTable,
+  threadsTable,
+} from "../db/schema";
 import { sideTranscript, sideTransferRunId, type SideChatSeed } from "../../shared/side-chat";
-import { openuiInstructions } from "./prompts";
+import { agentRegistry, type AgentModel } from "./agents";
 import { snapshot } from "./model-turn";
 import { projectConversation, readProjection, type ConversationState } from "./conversation";
+import { compactionEvent, parseCompactionEvent } from "../../shared/compaction-event";
+import {
+  type ArtifactKind,
+  type ArtifactRef,
+  type RoleId,
+  type RootRunOutcome,
+  type TestView,
+} from "../../shared/testing";
+import {
+  admitAttachedInTransaction,
+  acceptRoleCompletionInTransaction,
+  cancelTestingInTransaction,
+  closeTestingInTransaction,
+  closeUnfinishedTesting,
+  guardActualIOInTransaction,
+  hostTestingRuntime,
+  publishProjectionInTransaction,
+  readTestingExecutionInTransaction,
+  readPublishedTestingRow,
+  readPublishedThreadViewsRow,
+  readPublishedThreadViewsInTransaction,
+  selectTestingCancellation,
+  recordRoleFailureInTransaction,
+  reserveRoleTaskInTransaction,
+  testingFinishOutcome,
+  TestingPersistenceError,
+  type ActualIoGuard,
+  type ActualIoInput,
+  type AppendTestingEvent,
+  type RoleCompletion,
+  type RoleFrame,
+  type TestingAdmission,
+  type TestingExecution,
+} from "./testing-store";
 
-export const BUILD = "durable-chat-loop-v6";
-export const MODEL = "deepseek-ai/DeepSeek-V4.1-Flash";
+export const PREVIOUS_BUILD = "durable-chat-loop-v9";
+export const BUILD = "durable-chat-loop-v11";
+const TESTING_ROOT_BUILD = "testing-root-v1";
 const runIdSchema = z
   .string()
   .min(1)
@@ -39,8 +80,8 @@ export type AcceptedRun = z.output<typeof runInputSchema> & {
   messages: UIMessage[];
   context: UIMessage[];
   prompt: string;
-  model: typeof MODEL;
-  build: typeof BUILD;
+  model: AgentModel;
+  build: typeof BUILD | typeof PREVIOUS_BUILD | typeof TESTING_ROOT_BUILD;
   side?: boolean;
 };
 type RunRow = typeof chatRunsTable.$inferSelect;
@@ -69,17 +110,16 @@ async function lockRun(tx: Transaction, id: string): Promise<{ run: RunRow; thre
   }
 
   const side = await lockSide(tx, found.thread_id);
-
-  if (side) {
-    assertSideOpen(side);
-  }
-
   const [thread] = await tx
     .select()
     .from(threadsTable)
     .where(eq(threadsTable.id, found.thread_id))
     .for("update");
   const [run] = await tx.select().from(chatRunsTable).where(eq(chatRunsTable.id, id)).for("update");
+
+  if (side) {
+    assertSideOpen(side);
+  }
 
   return { run: run!, thread: thread! };
 }
@@ -95,6 +135,7 @@ async function appendEvent(tx: Transaction, run: RunRow, key: string, event: Str
     throw new Error("Run is terminal");
   }
 
+  const bytes = Buffer.byteLength(JSON.stringify(event));
   await tx.insert(chatEventsTable).values({
     run_id: run.id,
     sequence: run.next_sequence,
@@ -103,23 +144,27 @@ async function appendEvent(tx: Transaction, run: RunRow, key: string, event: Str
   });
   await tx
     .update(chatRunsTable)
-    .set({ next_sequence: sql`${chatRunsTable.next_sequence} + 1` })
+    .set({
+      next_sequence: sql`${chatRunsTable.next_sequence} + 1`,
+      log_bytes: sql`${chatRunsTable.log_bytes} + ${bytes}`,
+    })
     .where(eq(chatRunsTable.id, run.id));
   run.next_sequence++;
+  run.log_bytes += bytes;
 }
 
 async function sideSeedContext(tx: Transaction, thread: ThreadRow): Promise<UIMessage[]> {
   const [side] = await tx.select().from(sideChatsTable).where(eq(sideChatsTable.id, thread.id));
 
-  if (!side) {
-    throw new RunRequestError(409, "Side chat is closed");
+  if (!side?.seed || !isDeepStrictEqual(side.seed.display, thread.messages)) {
+    throw new RunRequestError(409, "Invalid side chat seed anchor");
   }
 
   return side.seed.context;
 }
 
 async function contextAnchors(tx: Transaction, thread: ThreadRow): Promise<RunRow[]> {
-  return tx
+  const marked = await tx
     .select()
     .from(chatRunsTable)
     .where(
@@ -128,6 +173,43 @@ async function contextAnchors(tx: Transaction, thread: ThreadRow): Promise<RunRo
         sql`${chatRunsTable.projection}->>'committedRevision' = ${String(thread.revision)}`,
       ),
     );
+
+  if (marked.length) {
+    return marked;
+  }
+
+  return tx
+    .select()
+    .from(chatRunsTable)
+    .where(
+      and(
+        eq(chatRunsTable.thread_id, thread.id),
+        eq(chatRunsTable.state, "succeeded"),
+        sql`${chatRunsTable.request}->>'baseRevision' = ${String(thread.revision - 1)}`,
+      ),
+    );
+}
+
+function unanchoredContext(thread: ThreadRow): UIMessage[] {
+  if (thread.messages.some((message) => message.metadata?.fromSummary === true)) {
+    throw new RunRequestError(409, "Archived summaries require a conversation context anchor");
+  }
+
+  return thread.messages;
+}
+
+function anchoredContext(anchor: RunRow, thread: ThreadRow): UIMessage[] {
+  if (anchor.state === "pending" || anchor.request.baseRevision !== thread.revision - 1) {
+    throw new RunRequestError(409, "Invalid conversation context anchor");
+  }
+
+  const prior = readProjection(anchor.projection);
+
+  if (!isDeepStrictEqual(prior.display, thread.messages)) {
+    throw new RunRequestError(409, "Conversation context anchor does not match saved history");
+  }
+
+  return prior.context;
 }
 
 async function committedModelContext(tx: Transaction, thread: ThreadRow): Promise<UIMessage[]> {
@@ -143,21 +225,54 @@ async function committedModelContext(tx: Transaction, thread: ThreadRow): Promis
 
   const [anchor] = anchors;
 
-  if (!anchor) {
-    if (thread.messages.some((message) => message.metadata?.fromSummary === true)) {
-      throw new RunRequestError(409, "Archived summaries require a conversation context anchor");
+  return !anchor || Array.isArray(anchor.projection)
+    ? unanchoredContext(thread)
+    : anchoredContext(anchor, thread);
+}
+
+export async function persistRun(value: RunInput) {
+  const parsed = runInputSchema.safeParse(value);
+
+  if (!parsed.success) {
+    throw new RunRequestError(400, "Invalid run input");
+  }
+
+  const input = parsed.data;
+  const db = await database();
+  const accepted = await db.transaction(async (tx) => {
+    const side = await lockSide(tx, input.threadId);
+
+    if (side) {
+      assertSideOpen(side);
     }
 
-    return thread.messages;
-  }
+    const [thread] = await tx
+      .select()
+      .from(threadsTable)
+      .where(eq(threadsTable.id, input.threadId))
+      .for("update");
 
-  const prior = readProjection(anchor.projection);
+    if (!thread) {
+      throw new RunRequestError(404, "Unknown thread");
+    }
 
-  if (!isDeepStrictEqual(prior.display, thread.messages)) {
-    throw new RunRequestError(409, "Conversation context anchor does not match saved history");
-  }
+    const [existing] = await tx
+      .select()
+      .from(chatRunsTable)
+      .where(eq(chatRunsTable.id, input.runId));
 
-  return prior.context;
+    if (existing) {
+      if (!isDeepStrictEqual(runInputSchema.parse(existing.request), input)) {
+        throw new RunRequestError(409, "Run input collision");
+      }
+
+      return { run: existing.accepted, pending: existing.state === "pending" };
+    }
+
+    return acceptInTransaction(tx, thread, input, side);
+  });
+
+  return accepted;
 }
 
 function chatAdditions(
@@ -178,33 +293,11 @@ function chatAdditions(
   ];
 }
 
-async function acceptInTransaction(
+async function insertAcceptedRun(
   tx: Transaction,
-  thread: ThreadRow,
+  run: AcceptedRun,
   input: z.output<typeof runInputSchema>,
-  metadata?: Record<string, unknown>,
-) {
-  if (thread.revision !== input.baseRevision || thread.active_run_id) {
-    throw new RunRequestError(409, "Thread revision or claim conflict");
-  }
-
-  const priorContext = await committedModelContext(tx, thread);
-  const additions = chatAdditions(input, metadata);
-  const known = new Set([...thread.messages, ...priorContext].map((message) => message.id));
-
-  if (additions.some((message) => known.has(message.id))) {
-    throw new RunRequestError(409, "Message ID already exists");
-  }
-
-  const run: AcceptedRun = {
-    ...input,
-    messages: [...thread.messages, ...additions],
-    context: [...priorContext, ...additions],
-    prompt: openuiInstructions(),
-    model: MODEL,
-    build: BUILD,
-    ...(thread.parent_thread_id ? { side: true } : {}),
-  };
+): Promise<void> {
   const [inserted] = await tx
     .insert(chatRunsTable)
     .values({
@@ -230,58 +323,47 @@ async function acceptInTransaction(
     threadId: run.threadId,
     runId: run.runId,
   });
-
-  return { run, pending: true };
 }
 
-export async function persistRun(value: RunInput) {
-  const parsed = runInputSchema.safeParse(value);
-
-  if (!parsed.success) {
-    throw new RunRequestError(400, "Invalid run input");
+async function acceptInTransaction(
+  tx: Transaction,
+  thread: ThreadRow,
+  input: z.output<typeof runInputSchema>,
+  side?: SideRow,
+  metadata?: Record<string, unknown>,
+) {
+  if (thread.revision !== input.baseRevision || thread.active_run_id) {
+    throw new RunRequestError(409, "Thread revision or claim conflict");
   }
 
-  const input = parsed.data;
-  const db = await database();
+  const priorContext = await committedModelContext(tx, thread);
+  const additions = chatAdditions(input, metadata);
+  const known = new Set([...thread.messages, ...priorContext].map((entry) => entry.id));
 
-  return db.transaction(async (tx) => {
-    const side = await lockSide(tx, input.threadId);
+  if (additions.some((message) => known.has(message.id))) {
+    throw new RunRequestError(409, "Message ID already exists in history or context");
+  }
 
-    if (side) {
-      assertSideOpen(side);
-    }
+  const agent = agentRegistry.main;
+  const run: AcceptedRun = {
+    ...input,
+    messages: [...thread.messages, ...additions],
+    context: [...priorContext, ...additions],
+    prompt: agent.systemPrompt(),
+    model: agent.model,
+    build: BUILD,
+    ...(side ? { side: true } : {}),
+  };
+  await insertAcceptedRun(tx, run, input);
 
-    const [thread] = await tx
-      .select()
-      .from(threadsTable)
-      .where(eq(threadsTable.id, input.threadId))
-      .for("update");
-
-    if (!thread) {
-      throw new RunRequestError(404, "Unknown thread");
-    }
-
-    const [existing] = await tx
-      .select()
-      .from(chatRunsTable)
-      .where(eq(chatRunsTable.id, input.runId));
-
-    if (existing) {
-      if (!isDeepStrictEqual(existing.request, input)) {
-        throw new RunRequestError(409, "Run input collision");
-      }
-
-      return { run: existing.accepted, pending: existing.state === "pending" };
-    }
-
-    return acceptInTransaction(tx, thread, input);
-  });
+  return { run, pending: true };
 }
 
 export async function emit(runId: string, event: StreamChunk, conversation?: ConversationState) {
   const db = await database();
   await db.transaction(async (tx) => {
     const { run } = await lockRun(tx, runId);
+
     await appendEvent(tx, run, randomUUID(), event);
 
     if (conversation) {
@@ -332,21 +414,127 @@ export async function checkpointCompaction(
   });
 }
 
+export function nextThreadTitle(input: {
+  current: string;
+  history: readonly UIMessage[];
+  accepted: readonly UIMessage[];
+}): string {
+  if (input.current !== "" && input.history.length > 0) {
+    return input.current;
+  }
+
+  return threadTitle(input.accepted);
+}
+
+function threadTitle(messages: readonly UIMessage[]): string {
+  for (const message of messages) {
+    if (message.role !== "user" || message.metadata?.fromSummary === true) {
+      continue;
+    }
+
+    const text = message.parts
+      .filter((part) => part.type === "text")
+      .map((part) => part.content)
+      .join("");
+
+    if (text !== "") {
+      return text.slice(0, 10);
+    }
+  }
+
+  return "新對話";
+}
+
+async function failedConversation(
+  tx: Transaction,
+  run: RunRow,
+): Promise<ConversationState | undefined> {
+  const receipts = await tx
+    .select()
+    .from(chatEventsTable)
+    .where(eq(chatEventsTable.run_id, run.id));
+  const committed = receipts.some((receipt) => {
+    const event = parseCompactionEvent(receipt.payload);
+
+    return (
+      receipt.event_key === `compact:${event?.operationId}` &&
+      event?.runId === run.id &&
+      event.state === "done"
+    );
+  });
+
+  return committed ? readProjection(run.projection) : undefined;
+}
+
+function testingEventAppend(tx: Transaction, run: RunRow): AppendTestingEvent {
+  return async (key, event) => {
+    const sequence = run.next_sequence;
+    await appendEvent(tx, run, key, event);
+
+    return sequence;
+  };
+}
+
 function transferConversation(run: RunRow): ConversationState | undefined {
   return run.accepted.messages.at(-1)?.metadata?.sideChatTransfer
     ? { display: run.accepted.messages, context: run.accepted.context }
     : undefined;
 }
 
-function threadTitle(messages: readonly UIMessage[]) {
-  return (
-    messages
-      .find((message) => message.role === "user")
-      ?.parts.filter((part) => part.type === "text")
-      .map((part) => part.content)
-      .join("")
-      .slice(0, 10) || "新對話"
-  );
+async function committedConversation(
+  tx: Transaction,
+  run: RunRow,
+  conversation: ConversationState | undefined,
+): Promise<ConversationState | undefined> {
+  return conversation ?? (await failedConversation(tx, run)) ?? transferConversation(run);
+}
+
+async function commitThreadSnapshot(
+  tx: Transaction,
+  run: RunRow,
+  thread: ThreadRow,
+  messages: UIMessage[],
+): Promise<void> {
+  const title =
+    run.request.kind === "compact"
+      ? thread.title
+      : nextThreadTitle({
+          current: thread.title,
+          history: thread.messages,
+          accepted: run.accepted.messages,
+        });
+  await appendEvent(tx, run, "finished:snapshot", snapshot(messages));
+  await tx
+    .update(threadsTable)
+    .set({
+      messages,
+      title,
+      revision: sql`${threadsTable.revision} + 1`,
+      active_run_id: null,
+      updated_at: sql`now()`,
+    })
+    .where(eq(threadsTable.id, thread.id));
+}
+
+async function releaseFailedThread(tx: Transaction, run: RunRow, thread: ThreadRow) {
+  await appendEvent(tx, run, "failed:snapshot", snapshot(readProjection(run.projection).display));
+  await tx.update(threadsTable).set({ active_run_id: null }).where(eq(threadsTable.id, thread.id));
+}
+
+function terminalEvent(
+  succeeded: boolean,
+  threadId: string,
+  runId: string,
+  code: string,
+): StreamChunk {
+  return succeeded
+    ? { type: EventType.RUN_FINISHED, threadId, runId }
+    : {
+        type: EventType.RUN_ERROR,
+        message: "執行失敗，請重新連線查看已儲存的內容。",
+        code,
+        metadata: { tanstack: { runId, threadId } },
+      };
 }
 
 export async function finishRun(
@@ -354,6 +542,7 @@ export async function finishRun(
   conversation?: ConversationState,
   code = "execution_failed",
 ) {
+  const succeeded = conversation !== undefined;
   const db = await database();
   await db.transaction(async (tx) => {
     const { run, thread } = await lockRun(tx, runId);
@@ -363,55 +552,34 @@ export async function finishRun(
     }
 
     assertThreadClaim(run, thread);
-    const committed = conversation ?? transferConversation(run);
+    await closeUnfinishedTesting(
+      tx,
+      run.id,
+      testingFinishOutcome(code, succeeded),
+      testingEventAppend(tx, run),
+    );
+    const committed = await committedConversation(tx, run, conversation);
 
     if (committed) {
-      await appendEvent(tx, run, "finished:snapshot", snapshot(committed.display));
-      await tx
-        .update(threadsTable)
-        .set({
-          messages: committed.display,
-          title: threadTitle(committed.display),
-          revision: sql`${threadsTable.revision} + 1`,
-          active_run_id: null,
-          updated_at: sql`now()`,
-        })
-        .where(eq(threadsTable.id, thread.id));
+      await commitThreadSnapshot(tx, run, thread, committed.display);
+    } else {
+      await releaseFailedThread(tx, run, thread);
+    }
+
+    await appendEvent(tx, run, "terminal", terminalEvent(succeeded, thread.id, runId, code));
+
+    if (committed) {
       await tx
         .update(chatRunsTable)
         .set({
           projection: { ...projectConversation(committed), committedRevision: thread.revision + 1 },
         })
         .where(eq(chatRunsTable.id, runId));
-    } else {
-      await appendEvent(
-        tx,
-        run,
-        "failed:snapshot",
-        snapshot(readProjection(run.projection).display),
-      );
-      await tx
-        .update(threadsTable)
-        .set({ active_run_id: null })
-        .where(eq(threadsTable.id, thread.id));
     }
 
-    await appendEvent(
-      tx,
-      run,
-      "terminal",
-      conversation
-        ? { type: EventType.RUN_FINISHED, threadId: thread.id, runId }
-        : {
-            type: EventType.RUN_ERROR,
-            message: "Run failed; reconnect to view saved output",
-            code,
-            metadata: { tanstack: { runId, threadId: thread.id } },
-          },
-    );
     await tx
       .update(chatRunsTable)
-      .set({ state: conversation ? "succeeded" : "failed" })
+      .set({ state: succeeded ? "succeeded" : "failed" })
       .where(eq(chatRunsTable.id, runId));
   });
 }
@@ -426,6 +594,7 @@ export async function listPendingRuns() {
       and(
         eq(chatRunsTable.state, "pending"),
         sql`not exists (select 1 from ${sideChatsTable} where ${sideChatsTable.id} = ${chatRunsTable.thread_id} and ${sideChatsTable.state} <> 'open')`,
+        sql`not exists (select 1 from ${testingOperationsTable} where ${testingOperationsTable.id} = ${chatRunsTable.id} and ${testingOperationsTable.parent_run_id} = ${chatRunsTable.id})`,
       ),
     )
     .orderBy(chatRunsTable.created_at);
@@ -470,10 +639,14 @@ export async function hydrateThread(threadId: string) {
       messages = readProjection(run.projection).display;
     }
 
+    const published = await readPublishedThreadViewsInTransaction(tx, threadId);
+
     return {
       messages,
       revision: thread.revision,
       activeRun: thread.active_run_id ? { runId: thread.active_run_id } : null,
+      publishedTesting: published[0] ?? null,
+      publishedTasks: published.toReversed(),
     };
   });
 }
@@ -652,6 +825,7 @@ export async function transferSideSummary(id: string, text: string) {
         baseRevision: parent.revision,
         message: { id: runId, text },
       },
+      undefined,
       { sideChatTransfer: { sideChatId: id } },
     );
     await tx.update(sideChatsTable).set({ state: "closing" }).where(eq(sideChatsTable.id, id));
@@ -704,6 +878,7 @@ export async function purgeSideChat(id: string) {
 
     if (ids.length) {
       await tx.delete(chatEventsTable).where(inArray(chatEventsTable.run_id, ids));
+      await tx.delete(chatModelSlotsTable).where(inArray(chatModelSlotsTable.run_id, ids));
       await tx.delete(chatRunsTable).where(inArray(chatRunsTable.id, ids));
     }
 
@@ -787,4 +962,215 @@ export async function* observeRun(
 
     await pollWhileOpen(signal);
   }
+}
+
+async function withTestingRoot<T>(
+  ownerRunId: string,
+  work: (tx: Transaction, run: RunRow, thread: ThreadRow, append: AppendTestingEvent) => Promise<T>,
+): Promise<T> {
+  const db = await database();
+
+  return db.transaction(async (tx) => {
+    const locked = await lockRun(tx, ownerRunId);
+
+    if (locked.run.state !== "pending") {
+      throw new TestingPersistenceError(409, "Run is terminal");
+    }
+
+    assertThreadClaim(locked.run, locked.thread);
+
+    return work(tx, locked.run, locked.thread, testingEventAppend(tx, locked.run));
+  });
+}
+
+async function releaseStandaloneClaim(
+  tx: Transaction,
+  run: RunRow,
+  thread: ThreadRow,
+  outcome: RootRunOutcome,
+) {
+  if (thread.active_run_id === run.id) {
+    await tx
+      .update(threadsTable)
+      .set({ active_run_id: null })
+      .where(eq(threadsTable.id, thread.id));
+  }
+
+  if (run.state === "pending") {
+    const state = outcome === "completed" ? "succeeded" : "failed";
+    await tx.update(chatRunsTable).set({ state }).where(eq(chatRunsTable.id, run.id));
+    run.state = state;
+  }
+}
+
+export async function admitAttachedTesting(
+  parent: AcceptedRun,
+  callId: string,
+  intent: unknown,
+  now = new Date(),
+): Promise<TestingAdmission> {
+  const runtime = hostTestingRuntime({ model: parent.model, build: parent.build }, now);
+  const db = await database();
+
+  return db.transaction(async (tx) => {
+    const locked = await lockRun(tx, parent.runId);
+
+    if (locked.run.thread_id !== parent.threadId || locked.run.state !== "pending") {
+      throw new TestingPersistenceError(409, "Attached testing requires the active parent run");
+    }
+
+    assertThreadClaim(locked.run, locked.thread);
+
+    return admitAttachedInTransaction(tx, parent.runId, parent.threadId, callId, intent, runtime);
+  });
+}
+
+export async function reserveRoleTask(
+  ownerRunId: string,
+  operationId: string,
+  role: RoleId,
+  input: unknown,
+): Promise<RoleFrame | null> {
+  return withTestingRoot(ownerRunId, (tx) =>
+    reserveRoleTaskInTransaction(tx, operationId, ownerRunId, role, input),
+  );
+}
+
+export async function guardActualIO(input: ActualIoInput): Promise<ActualIoGuard> {
+  const db = await database();
+
+  return db.transaction(async (tx) => {
+    let owner: { run: RunRow; thread: ThreadRow };
+
+    try {
+      owner = await lockRun(tx, input.parentRunId);
+    } catch (error) {
+      if (error instanceof RunRequestError) {
+        return { state: "denied", reason: "scope" };
+      }
+
+      throw error;
+    }
+
+    if (owner.run.state !== "pending") {
+      return { state: "denied", reason: "terminal" };
+    }
+
+    if (
+      owner.thread.active_run_id !== owner.run.id ||
+      owner.thread.revision !== owner.run.request.baseRevision
+    ) {
+      return { state: "denied", reason: "scope" };
+    }
+
+    return guardActualIOInTransaction(tx, input, owner.thread.id);
+  });
+}
+
+export async function acceptRoleCompletion(
+  ownerRunId: string,
+  taskId: string,
+  completion: RoleCompletion,
+): Promise<{ ref: ArtifactRef; kind: ArtifactKind }> {
+  return withTestingRoot(ownerRunId, (tx) =>
+    acceptRoleCompletionInTransaction(tx, ownerRunId, taskId, completion),
+  );
+}
+
+export async function readTestingExecution(
+  ownerRunId: string,
+  operationId: string,
+): Promise<TestingExecution> {
+  return withTestingRoot(ownerRunId, (tx, run, thread) =>
+    readTestingExecutionInTransaction(tx, run.id, thread.id, operationId),
+  );
+}
+
+export async function publishProjection(
+  ownerRunId: string,
+  operationId: string,
+): Promise<TestView> {
+  return withTestingRoot(ownerRunId, (tx, _run, _thread, append) =>
+    publishProjectionInTransaction(tx, ownerRunId, operationId, append),
+  );
+}
+
+export async function cancelTesting(ownerRunId: string, operationId: string): Promise<TestView> {
+  return withTestingRoot(ownerRunId, (tx, _run, _thread, append) =>
+    cancelTestingInTransaction(tx, ownerRunId, operationId, append),
+  );
+}
+
+export async function closeTesting(
+  ownerRunId: string,
+  operationId: string,
+  rootOutcome: RootRunOutcome,
+): Promise<TestView> {
+  return withTestingRoot(ownerRunId, async (tx, run, thread, append) => {
+    const view = await closeTestingInTransaction(tx, ownerRunId, operationId, rootOutcome, append);
+    const [operation] = await tx
+      .select({
+        runtime: testingOperationsTable.runtime,
+        terminal_outcome: testingOperationsTable.terminal_outcome,
+      })
+      .from(testingOperationsTable)
+      .where(eq(testingOperationsTable.id, operationId));
+    const runtime = operation?.runtime as { mode?: string } | undefined;
+
+    if (runtime?.mode === "standalone" && operation?.terminal_outcome) {
+      await releaseStandaloneClaim(tx, run, thread, operation.terminal_outcome as RootRunOutcome);
+    }
+
+    return view;
+  });
+}
+
+function requireThreadId(threadId: string): void {
+  if (!z.uuid().safeParse(threadId).success) {
+    throw new RunRequestError(400, "Invalid thread ID");
+  }
+}
+
+export async function readPublishedTesting(
+  threadId: string,
+  runId: string,
+): Promise<TestView | null> {
+  requireThreadId(threadId);
+
+  return readPublishedTestingRow(threadId, runId);
+}
+
+export async function readPublishedThreadViews(threadId: string): Promise<readonly TestView[]> {
+  requireThreadId(threadId);
+
+  return readPublishedThreadViewsRow(threadId);
+}
+
+export async function recordRoleFailure(
+  ownerRunId: string,
+  taskId: string,
+  reasonCode: string,
+  issues?: readonly string[],
+): Promise<{ duplicate: boolean }> {
+  return withTestingRoot(ownerRunId, (tx) =>
+    recordRoleFailureInTransaction(tx, ownerRunId, taskId, reasonCode, issues),
+  );
+}
+
+export async function cancelPublishedTesting(threadId: string, runId: string): Promise<TestView> {
+  requireThreadId(threadId);
+  const selection = await selectTestingCancellation(threadId, runId);
+
+  if (selection.kind === "live") {
+    return cancelTesting(selection.parentRunId, selection.operationId);
+  }
+
+  const view =
+    selection.kind === "terminal" ? await readPublishedTestingRow(threadId, runId) : null;
+
+  if (!view) {
+    throw new RunRequestError(404, "Testing run was not found");
+  }
+
+  return view;
 }

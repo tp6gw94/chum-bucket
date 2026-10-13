@@ -35,7 +35,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { DBOS } from '@dbos-inc/dbos-sdk';
 import { eq } from 'drizzle-orm';
 import { threadsTable, chatRunsTable, sideChatsTable } from './server/db/schema.ts';
-import { database, BUILD, persistRun, openSideChat, hydrateThread } from './server/harness/run-store.ts';
+import { database, BUILD, PREVIOUS_BUILD, persistRun, openSideChat, hydrateThread } from './server/harness/run-store.ts';
 import { ensureStarted, launchChatRuntime, shutdownChatRuntime } from './server/harness/run.ts';
 const db = await database();
 `;
@@ -51,7 +51,7 @@ globalThis.fetch = async () => {
 `;
 
 test(
-  "a side chat left by a crashed process is discarded while the main run recovers",
+  "an ordinary old side turn does not block recovery of a current main run",
   { skip: !enabled, timeout: 60_000 },
   () => {
     const child = runProcess(
@@ -66,11 +66,13 @@ const side = await openSideChat(parentId);
 const accepted = await persistRun({threadId:side.id,runId:'abandoned-'+randomUUID(),baseRevision:0,message:{id:'abandoned-user',text:'STARTUP CHILD'}});
 await ensureStarted(accepted.run);
 while (!called) await delay(10);
+const oldSideRun = {...accepted.run,build:PREVIOUS_BUILD};
+await db.update(chatRunsTable).set({accepted:oldSideRun}).where(eq(chatRunsTable.id,oldSideRun.runId));
 const childId = side.id;
 const childRunId = accepted.run.runId;
 const id = randomUUID();
-await db.insert(threadsTable).values({id,title:'Crashed main',messages:[]});
-const mainAccepted = await persistRun({threadId:id,runId:'main-'+randomUUID(),baseRevision:0,message:{id:'main-user',text:'MAIN '+id}});
+await db.insert(threadsTable).values({id,title:'Legacy main',messages:[]});
+const mainAccepted = await persistRun({threadId:id,runId:'legacy-'+randomUUID(),baseRevision:0,message:{id:'legacy-user',text:'LEGACY MAIN '+id}});
 const run = mainAccepted.run;
 await ensureStarted(run);
 while (!called) await delay(10);
@@ -107,5 +109,46 @@ await shutdownChatRuntime();
       mainRoles: ["user", "assistant"],
       mainActive: null,
     });
+  },
+);
+
+test(
+  "a pending legacy main prevents cutover without changing it or ordinary side data",
+  { skip: !enabled, timeout: 60_000 },
+  () => {
+    const fixture = runProcess(
+      imports +
+        `
+const parentId = randomUUID();
+await db.insert(threadsTable).values({id:parentId,title:'Cutover parent',messages:[]});
+const side = await openSideChat(parentId);
+const main = await persistRun({threadId:parentId,runId:'legacy-cutover-'+randomUUID(),baseRevision:0,message:{id:'legacy-user',text:'Pending legacy main'}});
+await db.update(chatRunsTable).set({accepted:{...main.run,build:PREVIOUS_BUILD}}).where(eq(chatRunsTable.id,main.run.runId));
+const before = {run:(await db.select().from(chatRunsTable).where(eq(chatRunsTable.id,main.run.runId)))[0],side:(await db.select().from(sideChatsTable).where(eq(sideChatsTable.id,side.id)))[0],thread:(await db.select().from(threadsTable).where(eq(threadsTable.id,parentId)))[0]};
+console.log('EVIDENCE '+JSON.stringify({parentId,sideId:side.id,runId:main.run.runId,before}));
+await db.$client.end();
+`,
+    );
+    const result = runProcess(
+      imports +
+        `
+let calls = 0;
+globalThis.fetch = async () => {calls++;throw new Error('Unexpected external call');};
+let failure;
+try { await launchChatRuntime(); } catch(error) { failure = error.message; }
+console.log('EVIDENCE '+JSON.stringify({failure,calls}));
+`,
+    );
+    const snapshot = runProcess(
+      imports +
+        `
+const after = {run:(await db.select().from(chatRunsTable).where(eq(chatRunsTable.id,${JSON.stringify(fixture.runId)})))[0],side:(await db.select().from(sideChatsTable).where(eq(sideChatsTable.id,${JSON.stringify(fixture.sideId)})))[0],thread:(await db.select().from(threadsTable).where(eq(threadsTable.id,${JSON.stringify(fixture.parentId)})))[0]};
+console.log('EVIDENCE '+JSON.stringify({after}));
+await db.$client.end();
+`,
+    );
+    assert.match(String(result.failure), /Legacy main runs are active.*no records were changed/);
+    assert.equal(result.calls, 0);
+    assert.deepEqual(snapshot.after, fixture.before);
   },
 );

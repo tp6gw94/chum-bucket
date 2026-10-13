@@ -8,6 +8,7 @@ import {
 } from "@tanstack/ai";
 import { resolveDebugOption } from "@tanstack/ai/adapter-internals";
 import { advanceConversation, type ConversationState } from "./conversation";
+import { attachHandoffImage } from "./handoff-image";
 import {
   ContextOverflowError,
   snapshot,
@@ -15,13 +16,13 @@ import {
   throwProviderError,
   type ModelCall,
 } from "./model-turn";
-import type { ModelTool } from "./tools/atlassian";
 import { createToolEventBuffer, drainToolEvents } from "./tool-events";
+import type { ModelTool } from "./tools/atlassian";
 import type { RunTools } from "./tools";
 
 const MODEL_REQUEST_TIMEOUT_MS = 120_000;
 const TOOL_REQUEST_TIMEOUT_MS = 35_000;
-const MAX_TURN = 20;
+const MAIN_MAX_TURN = 20;
 
 const MODEL_RETRY: AgentRetry = {
   retriesAllowed: true,
@@ -60,6 +61,10 @@ export type AgentSession = Readonly<{
   tools: RunTools;
 }>;
 
+type ModelOutcome =
+  | { state: "done"; conversation: ConversationState; calls: ModelCall[] }
+  | { state: "overflow"; error: string };
+
 export type AgentCheckpoint = <T>(input: {
   name: string;
   retry?: AgentRetry;
@@ -67,67 +72,79 @@ export type AgentCheckpoint = <T>(input: {
   work: () => Promise<T>;
 }) => Promise<T>;
 
-export type AgentCompact = (input: {
-  conversation: ConversationState;
-  reason: "threshold" | "overflow";
-  turn: number;
-}) => Promise<ConversationState>;
+export type ChatCompaction = Readonly<{
+  kind: "chat";
+  compact: (input: {
+    conversation: ConversationState;
+    reason: "threshold" | "overflow" | "manual";
+    turn: number;
+  }) => Promise<ConversationState>;
+}>;
+
+type BoundedCompaction = Readonly<{
+  kind: "bounded";
+  maxTurn: number;
+}>;
+
+type AgentCompaction = ChatCompaction | BoundedCompaction;
+
+export type AgentOrchestration = (
+  call: ModelCall,
+) => Promise<{ state: "handled"; output: unknown; error?: boolean } | { state: "unhandled" }>;
 
 export type AgentLoopResult =
   | { state: "done"; conversation: ConversationState }
-  | { state: "limit"; conversation: ConversationState };
-
-type AgentLoopInput = {
-  session: AgentSession;
-  conversation: ConversationState;
-  model: string;
-  prompt: string;
-  checkpoint: AgentCheckpoint;
-  compact: AgentCompact;
-  signal: AbortSignal;
-};
-
-type ModelOutcome =
-  | { state: "done"; conversation: ConversationState; calls: ModelCall[] }
-  | { state: "overflow" };
+  | { state: "limit"; conversation: ConversationState }
+  | { state: "overflow"; conversation: ConversationState };
 
 async function modelStep(
   session: AgentSession,
-  input: { conversation: ConversationState; model: string; prompt: string; signal: AbortSignal },
+  input: {
+    conversation: ConversationState;
+    model: string;
+    prompt: string;
+    signal: AbortSignal;
+    finalTurn?: string;
+  },
 ): Promise<ModelOutcome> {
-  const { conversation, model, prompt, signal } = input;
+  const { conversation, model, prompt, signal, finalTurn } = input;
   signal.throwIfAborted();
   await session.assertExecution();
   await session.emit(session.runId, snapshot(conversation.display), conversation);
-  const tools = await session.tools.getModelTools(conversation.context);
+  const turn =
+    finalTurn === undefined
+      ? await session.tools.getModelTools(conversation.context)
+      : { definitions: [], systemPrompt: finalTurn };
+  signal.throwIfAborted();
+  await session.assertExecution();
+  const options: Parameters<AgentChatStream>[0] = {
+    model,
+    messages: convertMessagesToModelMessages(conversation.context),
+    systemPrompts: [prompt, turn.systemPrompt],
+    tools: turn.definitions,
+    logger: resolveDebugOption(false),
+    request: { signal: AbortSignal.any([signal, AbortSignal.timeout(MODEL_REQUEST_TIMEOUT_MS)]) },
+  };
   let result: Awaited<ReturnType<typeof streamModelTurn>>;
 
   try {
     let stream: AsyncIterable<AdapterYieldChunk>;
 
     try {
-      stream = await session.chatStream({
-        model,
-        messages: convertMessagesToModelMessages(conversation.context),
-        systemPrompts: [prompt, tools.systemPrompt],
-        tools: tools.definitions,
-        logger: resolveDebugOption(false),
-        request: {
-          signal: AbortSignal.any([signal, AbortSignal.timeout(MODEL_REQUEST_TIMEOUT_MS)]),
-        },
-      });
+      stream = await session.chatStream(options);
     } catch (error) {
       throwProviderError(error);
     }
 
     result = await streamModelTurn({
       messages: conversation.context,
+      protectedMessages: conversation.display,
       stream,
       append: (event) => session.emit(session.runId, event),
     });
   } catch (error) {
     if (error instanceof ContextOverflowError) {
-      return { state: "overflow" };
+      return { state: "overflow", error: error.message };
     }
 
     throw error;
@@ -140,11 +157,16 @@ async function modelStep(
   return { state: "done", conversation: next, calls: result.calls };
 }
 
-async function settleToolStep(
+export async function settleToolStep(
   session: AgentSession,
-  input: { conversation: ConversationState; call: ModelCall; output: unknown; error: boolean },
+  input: {
+    conversation: ConversationState;
+    call: ModelCall;
+    output: unknown;
+    error?: boolean;
+  },
 ): Promise<ConversationState> {
-  const { conversation, call, output, error } = input;
+  const { conversation, call, output, error = false } = input;
   const messages = conversation.context;
   const content = JSON.stringify(output);
 
@@ -163,14 +185,16 @@ async function settleToolStep(
   };
   const processor = new StreamProcessor({ initialMessages: structuredClone(messages) });
   processor.processChunk(event);
-  const next = JSON.parse(JSON.stringify(processor.getMessages())) as UIMessage[];
+  const encoded = JSON.stringify(processor.getMessages());
+  const next = JSON.parse(encoded) as UIMessage[];
   const owner = messages.find((message) =>
     message.parts.some((part) => part.type === "tool-call" && part.id === call.id),
   );
   const settled = advanceConversation(conversation, next, owner?.id);
-  await session.emit(session.runId, event, settled);
+  const updated = await attachHandoffImage(settled, call, output);
+  await session.emit(session.runId, event, updated);
 
-  return settled;
+  return updated;
 }
 
 async function executeToolStep(
@@ -179,6 +203,7 @@ async function executeToolStep(
 ): Promise<ConversationState> {
   const { conversation, call, signal } = input;
   signal.throwIfAborted();
+  const messages = conversation.context;
   await session.emit(session.runId, snapshot(conversation.display), conversation);
   const events = createToolEventBuffer(call.id);
   let output: unknown;
@@ -190,7 +215,7 @@ async function executeToolStep(
       abortSignal: AbortSignal.any([signal, AbortSignal.timeout(TOOL_REQUEST_TIMEOUT_MS)]),
       emitCustomEvent: (name: string, value: Record<string, unknown>) => events.emit(name, value),
     };
-    output = await session.tools.executeTool(conversation.context, call, context);
+    output = await session.tools.executeTool(messages, call, context);
   } catch (failure) {
     output = { error: failure instanceof Error ? failure.message.slice(0, 2000) : "Tool failed" };
     error = true;
@@ -202,36 +227,33 @@ async function executeToolStep(
   return settleToolStep(session, { conversation, call, output, error });
 }
 
-async function toolTurn(
+type AgentLoopInput = {
+  session: AgentSession;
+  conversation: ConversationState;
+  model: string;
+  prompt: string;
+  compaction: AgentCompaction;
+  checkpoint: AgentCheckpoint;
+  signal: AbortSignal;
+  orchestration?: AgentOrchestration;
+  finalTurn?: string;
+};
+
+type CompletedModel = Extract<ModelOutcome, { state: "done" }>;
+
+function modelAttempt(
   input: AgentLoopInput,
-  initial: ConversationState,
-  calls: readonly ModelCall[],
-  turn: number,
-): Promise<ConversationState> {
-  const { session, signal } = input;
-  let conversation = initial;
-
-  for (const [index, call] of calls.entries()) {
-    signal.throwIfAborted();
-    await session.assertExecution();
-    const current = conversation;
-    conversation = await input.checkpoint({
-      name: `tool:${turn}:${index}`,
-      work: () => executeToolStep(session, { conversation: current, call, signal }),
-    });
-  }
-
-  return conversation;
-}
-
-function modelAttempt(input: AgentLoopInput, conversation: ConversationState, name: string) {
+  conversation: ConversationState,
+  name: string,
+  finalTurn?: string,
+) {
   const { session, model, prompt, signal } = input;
 
   return input.checkpoint({
     name,
     retry: MODEL_RETRY,
     shouldRetry: () => !signal.aborted,
-    work: () => modelStep(session, { conversation, model, prompt, signal }),
+    work: () => modelStep(session, { conversation, model, prompt, signal, finalTurn }),
   });
 }
 
@@ -246,11 +268,12 @@ function resetModel(input: AgentLoopInput, conversation: ConversationState, name
 
 async function recoverOverflow(
   input: AgentLoopInput,
+  compaction: ChatCompaction,
   conversation: ConversationState,
   turn: number,
-): Promise<Extract<ModelOutcome, { state: "done" }>> {
+): Promise<CompletedModel> {
   await resetModel(input, conversation, `reset-model:${turn}:overflow`);
-  const compacted = await input.compact({ conversation, reason: "overflow", turn });
+  const compacted = await compaction.compact({ conversation, reason: "overflow", turn });
   const result = await modelAttempt(input, compacted, `model-overflow:${turn}`);
 
   if (result.state === "overflow") {
@@ -261,20 +284,75 @@ async function recoverOverflow(
   return result;
 }
 
-export async function runAgentLoop(input: AgentLoopInput): Promise<AgentLoopResult> {
+async function toolTurn(
+  input: AgentLoopInput,
+  initial: ConversationState,
+  calls: readonly ModelCall[],
+  turn: number,
+): Promise<ConversationState> {
   const { session, signal } = input;
-  let conversation = input.conversation;
+  let conversation = initial;
 
-  for (let turn = 0; turn < MAX_TURN; turn++) {
+  for (const [index, call] of calls.entries()) {
     signal.throwIfAborted();
     await session.assertExecution();
-    conversation = await input.compact({ conversation, reason: "threshold", turn });
-    const attempt = await modelAttempt(input, conversation, `model:${turn}`);
-    const result =
-      attempt.state === "done" ? attempt : await recoverOverflow(input, conversation, turn);
+    const orchestrated = input.orchestration ? await input.orchestration(call) : undefined;
+    conversation = await input.checkpoint({
+      name: `tool:${turn}:${index}`,
+      work: () =>
+        orchestrated?.state === "handled"
+          ? settleToolStep(session, {
+              conversation,
+              call,
+              output: orchestrated.output,
+              error: orchestrated.error ?? false,
+            })
+          : executeToolStep(session, { conversation, call, signal }),
+    });
+  }
+
+  return conversation;
+}
+
+async function completedModel(
+  input: AgentLoopInput,
+  attempt: ModelOutcome,
+  conversation: ConversationState,
+  turn: number,
+): Promise<CompletedModel | null> {
+  if (attempt.state === "done") {
+    return attempt;
+  }
+
+  return input.compaction.kind === "bounded"
+    ? null
+    : recoverOverflow(input, input.compaction, conversation, turn);
+}
+
+export async function runAgentLoop(input: AgentLoopInput): Promise<AgentLoopResult> {
+  const { session, compaction, signal } = input;
+  const maxTurn = compaction.kind === "bounded" ? compaction.maxTurn : MAIN_MAX_TURN;
+  let conversation = input.conversation;
+
+  for (let turn = 0; turn < maxTurn; turn++) {
+    signal.throwIfAborted();
+    await session.assertExecution();
+
+    if (compaction.kind === "chat") {
+      conversation = await compaction.compact({ conversation, reason: "threshold", turn });
+    }
+
+    const reserved = turn === maxTurn - 1 ? input.finalTurn : undefined;
+    const attempt = await modelAttempt(input, conversation, `model:${turn}`, reserved);
+    const result = await completedModel(input, attempt, conversation, turn);
+
+    if (!result) {
+      return { state: "overflow", conversation };
+    }
+
     conversation = result.conversation;
 
-    if (!result.calls.length) {
+    if (!result.calls.length || reserved !== undefined) {
       return { state: "done", conversation };
     }
 

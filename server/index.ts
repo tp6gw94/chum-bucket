@@ -4,6 +4,7 @@ import { Hono } from "hono";
 import chat, { compact } from "./chat";
 import thread from "./thread";
 import sideChat from "./side-chat";
+import testing from "./testing";
 import { launchChatRuntime, shutdownChatRuntime } from "./harness/run";
 
 const app = new Hono();
@@ -12,9 +13,10 @@ app.route("/api/chat", chat);
 app.route("/api/compact", compact);
 app.route("/api/thread", thread);
 app.route("/api/side-chat", sideChat);
+app.route("/api/testing", testing);
 
 await launchChatRuntime();
-const server = serve(app);
+const server = serve({ fetch: app.fetch, port: Number(process.env.PORT ?? 3000) });
 let stopping = false;
 
 async function shutdown() {

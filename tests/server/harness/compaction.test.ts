@@ -15,7 +15,7 @@ import {
   prepareCompaction,
   type CompactionEmit,
 } from "../../../server/harness/compaction";
-import { MODEL } from "../../../server/harness/run-store";
+import { MODEL } from "../../../server/harness/agents";
 import type { ModelTool } from "../../../server/harness/tools/atlassian";
 import type { RunTools } from "../../../server/harness/tools";
 

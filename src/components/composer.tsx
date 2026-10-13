@@ -1,12 +1,19 @@
-import { useEffect, useId, useRef, useState } from "react";
+import {
+  useEffect,
+  useRef,
+  useState,
+  type Dispatch,
+  type RefObject,
+  type SetStateAction,
+} from "react";
 import { useFormStatus } from "react-dom";
-import { EditorContent, useEditor } from "@tiptap/react";
+import { EditorContent, useEditor, type Editor } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
 import { SendIcon } from "lucide-react";
 import { cn } from "cn";
 
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import type { SendResult } from "../hooks/use-threads";
 import { commandSuggestions, composerKeyAction } from "../composer-commands";
 
@@ -19,6 +26,92 @@ const EDITOR_CLASS = cn(
   "md:text-sm",
 );
 
+const SEND_ERROR: Record<Exclude<SendResult, "succeeded">, string> = {
+  failed: "執行失敗，原文已保留。",
+  uncertain: "結果尚未確認，請重新載入對話，原文已保留。",
+};
+
+function thrownMessage(cause: unknown, fallback: string): string {
+  return cause instanceof Error ? cause.message : fallback;
+}
+
+function composerAvailable(disabled: boolean, busy: boolean, hasSend: boolean): boolean {
+  return !disabled && !busy && hasSend;
+}
+
+function composerCanSubmit(
+  text: string,
+  disabled: boolean,
+  busy: boolean,
+  hasSend: boolean,
+): boolean {
+  return text.trim().length > 0 && composerAvailable(disabled, busy, hasSend);
+}
+
+function errorAria(
+  error: string | null,
+  errorId: string,
+): { "aria-invalid": "true"; "aria-describedby": string } | Record<string, never> {
+  if (!error) {
+    return {};
+  }
+
+  return {
+    "aria-invalid": "true",
+    "aria-describedby": errorId,
+  };
+}
+
+type CommandInteraction = {
+  suggestions: ReturnType<typeof commandSuggestions>;
+  activeIndex: number;
+  submitText(value: string): Promise<void>;
+};
+
+function handleCommandKeyDown(
+  composing: boolean,
+  event: KeyboardEvent,
+  control: {
+    interaction: CommandInteraction;
+    form: HTMLFormElement | null;
+    dismiss(): void;
+    move(update: (index: number) => number): void;
+  },
+): boolean {
+  const current = control.interaction;
+  const action = composerKeyAction({
+    key: event.key,
+    shiftKey: event.shiftKey,
+    isComposing: event.isComposing,
+    keyCode: event.keyCode,
+    composing,
+    hasSuggestions: current.suggestions.length > 0,
+  });
+
+  if (action === "none") {
+    return false;
+  }
+
+  event.preventDefault();
+  const move = (offset: number) =>
+    control.move(
+      (index) => (index + offset + current.suggestions.length) % current.suggestions.length,
+    );
+  const handlers = {
+    dismiss: control.dismiss,
+    previous: () => move(-1),
+    next: () => move(1),
+    select: () =>
+      void current.submitText(
+        `/${current.suggestions[current.activeIndex % current.suggestions.length]!.name}`,
+      ),
+    submit: () => control.form?.requestSubmit(),
+  };
+  handlers[action]();
+
+  return true;
+}
+
 function SubmitButton({ disabled }: { disabled: boolean }) {
   const { pending } = useFormStatus();
 
@@ -30,7 +123,54 @@ function SubmitButton({ disabled }: { disabled: boolean }) {
   );
 }
 
-type Suggestion = ReturnType<typeof commandSuggestions>[number];
+function commandAria(
+  suggestions: CommandInteraction["suggestions"],
+  activeIndex: number,
+  listId: string,
+): Record<string, string> {
+  if (suggestions.length === 0) {
+    return {};
+  }
+
+  return {
+    "aria-controls": listId,
+    "aria-haspopup": "listbox",
+    "aria-activedescendant": `${listId}-${suggestions[activeIndex % suggestions.length]!.name}`,
+  };
+}
+
+async function submitComposerText(
+  value: string,
+  control: {
+    send?: (text: string) => Promise<SendResult>;
+    disabled: boolean;
+    busy: boolean;
+    clear(): void;
+    dismiss(): void;
+    error(message: string | null): void;
+  },
+) {
+  if (!control.send || !value.trim() || control.disabled || control.busy) {
+    return;
+  }
+
+  control.error(null);
+  control.dismiss();
+
+  try {
+    const result = await control.send(value.trim());
+
+    if (result === "succeeded") {
+      control.clear();
+
+      return;
+    }
+
+    control.error(SEND_ERROR[result]);
+  } catch (cause) {
+    control.error(thrownMessage(cause, "送出失敗，請稍後再試"));
+  }
+}
 
 function CommandMenu({
   suggestions,
@@ -38,10 +178,10 @@ function CommandMenu({
   listId,
   onSelect,
 }: {
-  suggestions: Suggestion[];
+  suggestions: CommandInteraction["suggestions"];
   activeIndex: number;
   listId: string;
-  onSelect: (text: string) => void;
+  onSelect(text: string): void;
 }) {
   if (suggestions.length === 0) {
     return null;
@@ -56,10 +196,11 @@ function CommandMenu({
         {suggestions.map((command, index) => (
           <Button
             key={command.name}
+            id={`${listId}-${command.name}`}
             type="button"
             role="option"
-            aria-selected={index === activeIndex}
-            variant={index === activeIndex ? "secondary" : "ghost"}
+            aria-selected={index === activeIndex % suggestions.length}
+            variant={index === activeIndex % suggestions.length ? "secondary" : "ghost"}
             tabIndex={-1}
             className="h-auto justify-start"
             onPointerDown={(event) => event.preventDefault()}
@@ -76,80 +217,135 @@ function CommandMenu({
   );
 }
 
-function useCommandMenu(text: string) {
-  const [focused, setFocused] = useState(false);
-  const [composing, setComposing] = useState(false);
-  const [dismissed, setDismissed] = useState(false);
-  const [activeIndex, setActiveIndex] = useState(0);
-  const listId = useId();
-  const suggestions = commandSuggestions({ text, focused, composing, dismissed });
-  const current = useRef({ suggestions, activeIndex });
-  current.current = { suggestions, activeIndex };
-
-  return {
-    suggestions,
-    activeIndex,
-    listId,
-    current,
-    setFocused,
-    setComposing,
-    dismiss: () => setDismissed(true),
-    reset: () => {
-      setDismissed(false);
-      setActiveIndex(0);
-    },
-    move: (step: number) => {
-      const count = current.current.suggestions.length;
-      setActiveIndex((index) => (index + step + count) % count);
-    },
-  };
-}
-
-type CommandMenuState = ReturnType<typeof useCommandMenu>;
-
-function handleCommandKey(
-  menu: CommandMenuState,
-  event: KeyboardEvent,
-  composing: boolean,
-  actions: { choose: (command: string) => void; submit: () => void },
-) {
-  const { suggestions, activeIndex } = menu.current.current;
-  const action = composerKeyAction({
-    key: event.key,
-    shiftKey: event.shiftKey,
-    isComposing: event.isComposing || composing,
-    keyCode: event.keyCode,
-    hasSuggestions: suggestions.length > 0,
-  });
-
-  if (action === "none") {
-    return false;
-  }
-
-  event.preventDefault();
-
-  if (action === "dismiss") {
-    menu.dismiss();
-  } else if (action === "previous" || action === "next") {
-    menu.move(action === "next" ? 1 : -1);
-  } else if (action === "select") {
-    actions.choose(`/${suggestions[activeIndex]!.name}`);
-  } else {
-    actions.submit();
-  }
-
-  return true;
-}
-
-function resultError(result: SendResult) {
-  if (result === "succeeded") {
+function ComposerError({ message, id }: { message: string | null; id: string }) {
+  if (!message) {
     return null;
   }
 
-  return result === "failed"
-    ? "執行失敗，原文已保留。"
-    : "結果尚未確認，請重新載入對話，原文已保留。";
+  return (
+    <p id={id} role="alert" className="text-xs text-destructive">
+      {message}
+    </p>
+  );
 }
+
+function ComposerPlaceholder({ visible, placeholder }: { visible: boolean; placeholder: string }) {
+  if (!visible) {
+    return null;
+  }
+
+  return (
+    <span
+      aria-hidden="true"
+      className="pointer-events-none absolute top-2 left-2.5 text-base text-muted-foreground md:text-sm"
+    >
+      {placeholder}
+    </span>
+  );
+}
+
+type Caret = { cursor: number; selected: boolean };
+
+function caretOf(editor: Editor): Caret {
+  return {
+    cursor: editor.state.doc.textBetween(0, editor.state.selection.from, "\n").length,
+    selected: !editor.state.selection.empty,
+  };
+}
+
+function useComposerEditor(options: {
+  disabled: boolean;
+  attributes: Record<string, string>;
+  interaction: RefObject<CommandInteraction>;
+  formRef: RefObject<HTMLFormElement | null>;
+  setComposing(composing: boolean): void;
+  setDismissed(dismissed: boolean): void;
+  setActiveIndex: Dispatch<SetStateAction<number>>;
+  setText(text: string): void;
+  setSelection(caret: Caret): void;
+  setFocused(focused: boolean): void;
+}) {
+  const { disabled } = options;
+  const editor = useEditor({
+    extensions: [StarterKit.configure({ link: false })],
+    content: "",
+    editable: !disabled,
+    editorProps: {
+      attributes: options.attributes,
+      handleDOMEvents: {
+        compositionstart: () => {
+          options.setComposing(true);
+
+          return false;
+        },
+        compositionend: () => {
+          options.setComposing(false);
+
+          return false;
+        },
+      },
+      handleKeyDown: (view, event) =>
+        handleCommandKeyDown(view.composing, event, {
+          interaction: options.interaction.current,
+          form: options.formRef.current,
+          dismiss: () => options.setDismissed(true),
+          move: options.setActiveIndex,
+        }),
+    },
+    onUpdate: ({ editor: current }) => {
+      options.setText(current.getText({ blockSeparator: "\n" }));
+      options.setSelection(caretOf(current));
+      options.setDismissed(false);
+      options.setActiveIndex(0);
+    },
+    onSelectionUpdate: ({ editor: current }) => {
+      options.setSelection(caretOf(current));
+    },
+    onFocus: () => options.setFocused(true),
+    onBlur: () => options.setFocused(false),
+  });
+
+  useEffect(() => {
+    editor.setEditable(!disabled);
+    editor.view.dom.toggleAttribute("data-disabled", disabled);
+  }, [editor, disabled]);
+
+  return editor;
+}
+
+function useComposerFields() {
+  const [text, setText] = useState("");
+  const [focused, setFocused] = useState(false);
+  const [composing, setComposing] = useState(false);
+  const [dismissed, setDismissed] = useState(false);
+  const [selection, setSelection] = useState<Caret>({ cursor: 0, selected: false });
+  const [activeIndex, setActiveIndex] = useState(0);
+
+  return {
+    text,
+    setText,
+    focused,
+    setFocused,
+    composing,
+    setComposing,
+    dismissed,
+    setDismissed,
+    selection,
+    setSelection,
+    activeIndex,
+    setActiveIndex,
+  };
+}
+
+type ComposerProps = Readonly<{
+  label: string;
+  placeholder: string;
+  hint: string;
+  onSend?: (text: string) => Promise<SendResult>;
+  disabled?: boolean;
+  busy?: boolean;
+  className?: string;
+}>;
 
 export function Composer({
   label,
@@ -159,122 +355,74 @@ export function Composer({
   disabled = false,
   busy = false,
   className,
-}: {
-  label: string;
-  placeholder: string;
-  hint: string;
-  onSend?: (text: string) => Promise<SendResult>;
-  disabled?: boolean;
-  busy?: boolean;
-  className?: string;
-}) {
-  const [text, setText] = useState("");
+}: ComposerProps) {
   const [error, setError] = useState<string | null>(null);
   const formRef = useRef<HTMLFormElement>(null);
-  const menu = useCommandMenu(text);
-  const canSubmit = text.trim().length > 0 && !disabled && !busy && Boolean(onSend);
+  const fields = useComposerFields();
+  const { text, activeIndex, setDismissed } = fields;
+  const suggestions = commandSuggestions({
+    text,
+    ...fields.selection,
+    focused: fields.focused && composerAvailable(disabled, busy, Boolean(onSend)),
+    composing: fields.composing,
+    dismissed: fields.dismissed,
+  });
+  const listId = `${label}-commands`;
+  const interaction = useRef<CommandInteraction>({
+    suggestions,
+    activeIndex,
+    submitText: async (_text: string) => {},
+  });
+  const canSubmit = composerCanSubmit(text, disabled, busy, Boolean(onSend));
   const errorId = `${label}-error`;
-
-  const editor = useEditor({
-    extensions: [StarterKit],
-    content: "",
-    editable: !disabled,
-    editorProps: {
-      attributes: {
-        class: EDITOR_CLASS,
-        role: "textbox",
-        "aria-multiline": "true",
-        "aria-label": label,
-        ...(error ? { "aria-invalid": "true", "aria-describedby": errorId } : {}),
-      },
-      handleDOMEvents: {
-        compositionstart: () => {
-          menu.setComposing(true);
-
-          return false;
-        },
-        compositionend: () => {
-          menu.setComposing(false);
-
-          return false;
-        },
-      },
-      handleKeyDown: (view, event) =>
-        handleCommandKey(menu, event, view.composing, {
-          choose,
-          submit: () => formRef.current?.requestSubmit(),
-        }),
+  const editor = useComposerEditor({
+    disabled,
+    attributes: {
+      class: EDITOR_CLASS,
+      role: "textbox",
+      "aria-multiline": "true",
+      "aria-label": label,
+      ...errorAria(error, errorId),
+      ...commandAria(suggestions, activeIndex, listId),
     },
-    onFocus: () => menu.setFocused(true),
-    onBlur: () => menu.setFocused(false),
-    onUpdate: ({ editor }) => {
-      setText(editor.getText({ blockSeparator: "\n" }));
-      menu.reset();
-    },
+    interaction,
+    formRef,
+    ...fields,
   });
 
-  function choose(command: string) {
-    editor.commands.setContent(command);
-    setText(command);
-    menu.dismiss();
-    queueMicrotask(() => formRef.current?.requestSubmit());
-  }
+  const submitText = (value: string) =>
+    submitComposerText(value, {
+      send: onSend,
+      disabled,
+      busy,
+      clear: () => editor.commands.clearContent(),
+      dismiss: () => setDismissed(true),
+      error: setError,
+    });
 
-  useEffect(() => {
-    editor.setEditable(!disabled);
-    editor.view.dom.toggleAttribute("data-disabled", disabled);
-  }, [editor, disabled]);
-
-  async function submit() {
-    const value = editor.getText({ blockSeparator: "\n" }).trim();
-
-    if (!value || disabled || busy || !onSend) {
-      return;
-    }
-
-    setError(null);
-
-    try {
-      const result = await onSend(value);
-      setError(resultError(result));
-
-      if (result === "succeeded") {
-        editor.commands.clearContent();
-      }
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "送出失敗，請稍後再試");
-    }
-  }
+  interaction.current = { suggestions, activeIndex, submitText };
 
   return (
     <form
       ref={formRef}
-      action={submit}
+      action={() => submitText(text)}
       className={cn("flex shrink-0 flex-col gap-2 bg-card px-4 py-3", className)}
     >
       <div className="relative">
         <CommandMenu
-          suggestions={menu.suggestions}
-          activeIndex={menu.activeIndex}
-          listId={menu.listId}
-          onSelect={choose}
+          suggestions={suggestions}
+          activeIndex={activeIndex}
+          listId={listId}
+          onSelect={(value) => void submitText(value)}
         />
-        <span
-          aria-hidden="true"
-          hidden={text.length > 0}
-          className="pointer-events-none absolute top-2 left-2.5 text-base text-muted-foreground md:text-sm"
-        >
-          {placeholder}
-        </span>
+        <ComposerPlaceholder visible={text.length === 0} placeholder={placeholder} />
         <EditorContent editor={editor} />
       </div>
       <div className="flex items-center gap-2">
         <span className="text-xs text-muted-foreground">{hint}</span>
         <SubmitButton disabled={!canSubmit} />
       </div>
-      <p id={errorId} role="alert" hidden={!error} className="text-xs text-destructive">
-        {error}
-      </p>
+      <ComposerError message={error} id={errorId} />
     </form>
   );
 }

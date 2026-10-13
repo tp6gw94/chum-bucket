@@ -1,4 +1,6 @@
-import { chumBucketDark, chumBucketLight } from "../src/theme";
+import assert from "node:assert/strict";
+import test from "node:test";
+import { chumBucketDark, chumBucketLight } from "../../src/theme";
 
 type Oklch = { l: number; c: number; h: number; a: number };
 
@@ -45,42 +47,24 @@ const contrast = (fg: string, bg: string): number => {
   return (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
 };
 
-const AA = 4.5;
-const failures: string[] = [];
-
-const check = (label: string, fg: string, bg: string) => {
-  const ratio = contrast(fg, bg);
-  const pass = ratio >= AA;
-
-  if (!pass) {
-    failures.push(`${label}: ${ratio.toFixed(2)}:1 (need ${AA})`);
-  }
-
-  console.log(`${pass ? "ok  " : "FAIL"} ${label.padEnd(34)} ${ratio.toFixed(2)}:1`);
-};
-
-for (const [mode, t] of [
+for (const [mode, theme] of [
   ["light", chumBucketLight],
   ["dark", chumBucketDark],
 ] as const) {
-  console.log(`--- ${mode} ---`);
-  check("body text on page", t.textNeutralPrimary!, t.background!);
-  check("body text on card", t.textNeutralPrimary!, t.foreground!);
-  check("secondary text on page", t.textNeutralSecondary!, t.background!);
-  check("secondary text on card", t.textNeutralSecondary!, t.foreground!);
-  check("label on accent button", t.textAccentPrimary!, t.interactiveAccentDefault!);
-  check("brand text on card", t.textBrand!, t.foreground!);
-  check("brand text on page", t.textBrand!, t.background!);
-}
+  const pairs = [
+    ["body text on page", theme.textNeutralPrimary!, theme.background!],
+    ["body text on card", theme.textNeutralPrimary!, theme.foreground!],
+    ["secondary text on page", theme.textNeutralSecondary!, theme.background!],
+    ["secondary text on card", theme.textNeutralSecondary!, theme.foreground!],
+    ["label on accent button", theme.textAccentPrimary!, theme.interactiveAccentDefault!],
+    ["brand text on card", theme.textBrand!, theme.foreground!],
+    ["brand text on page", theme.textBrand!, theme.background!],
+  ] as const;
 
-if (failures.length > 0) {
-  console.error(`\n${failures.length} contrast failure(s):`);
-
-  for (const f of failures) {
-    console.error(`  ${f}`);
+  for (const [label, foreground, background] of pairs) {
+    test(`${mode} theme: ${label} meets WCAG AA`, () => {
+      const ratio = contrast(foreground, background);
+      assert.ok(ratio >= 4.5, `${ratio.toFixed(2)}:1 must be at least 4.5:1`);
+    });
   }
-
-  process.exit(1);
 }
-
-console.log("\nall pairs meet WCAG AA");

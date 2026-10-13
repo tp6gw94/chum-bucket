@@ -94,3 +94,160 @@ test("canonical results update current calls without losing native text, metadat
     { type: "tool-result", toolCallId: "read-two", content: '{"ok":true}', state: "complete" },
   ]);
 });
+
+test("provider collisions with archived history reject before publishing content", async () => {
+  const emitted: unknown[] = [];
+  await assert.rejects(
+    streamModelTurn({
+      messages: [summary],
+      protectedMessages: [original],
+      stream: (async function* () {
+        yield { type: EventType.TEXT_MESSAGE_CONTENT, messageId: original.id, delta: "overwrite" };
+      })(),
+      append: async (event) => {
+        emitted.push(event);
+      },
+    }),
+    /collides/,
+  );
+  assert.deepEqual(emitted, []);
+  assert.deepEqual(original.parts, [
+    { type: "text", content: "Keep Safe and <ds_safety> in my original text" },
+  ]);
+});
+
+const archivedToolMessage: UIMessage = {
+  id: "archived-assistant",
+  role: "assistant",
+  parts: [
+    { type: "text", content: "Original tool answer" },
+    { type: "tool-call", id: "archived-tool", name: "read", arguments: "{}", state: "complete" },
+  ],
+};
+
+const archivedReferences: { name: string; event: StreamChunk }[] = [
+  {
+    name: "structured output start",
+    event: {
+      type: EventType.CUSTOM,
+      name: "structured-output.start",
+      value: { messageId: original.id },
+    },
+  },
+  {
+    name: "structured output completion",
+    event: {
+      type: EventType.CUSTOM,
+      name: "structured-output.complete",
+      value: { messageId: original.id, object: { replaced: true }, raw: '{"replaced":true}' },
+    },
+  },
+  {
+    name: "tool approval",
+    event: {
+      type: EventType.CUSTOM,
+      name: "approval-requested",
+      value: {
+        toolCallId: "archived-tool",
+        toolName: "read",
+        input: {},
+        approval: { id: "new-approval", needsApproval: true },
+      },
+    },
+  },
+  {
+    name: "encrypted tool signature",
+    event: {
+      type: EventType.REASONING_ENCRYPTED_VALUE,
+      subtype: "tool-call",
+      entityId: "archived-tool",
+      encryptedValue: "replacement-signature",
+    },
+  },
+];
+
+for (const { name, event } of archivedReferences) {
+  test(`provider ${name} cannot publish changes to archived history`, async () => {
+    const emitted: StreamChunk[] = [];
+    const history = structuredClone([original, archivedToolMessage]);
+    await assert.rejects(
+      streamModelTurn({
+        messages: [summary],
+        protectedMessages: history,
+        stream: (async function* () {
+          yield event;
+          yield { type: EventType.RUN_FINISHED, threadId: "provider", runId: "provider" };
+        })(),
+        append: async (chunk) => {
+          emitted.push(chunk);
+        },
+      }),
+      /collides/,
+    );
+    assert.deepEqual(emitted, []);
+    assert.deepEqual(history, [original, archivedToolMessage]);
+  });
+}
+
+test("new structured output is published without changing archived messages", async () => {
+  const emitted: StreamChunk[] = [];
+  const turn = await streamModelTurn({
+    messages: [summary],
+    protectedMessages: [original],
+    stream: (async function* () {
+      yield {
+        type: EventType.CUSTOM,
+        name: "structured-output.start",
+        value: { messageId: "new-structured" },
+      };
+      yield {
+        type: EventType.CUSTOM,
+        name: "structured-output.complete",
+        value: {
+          messageId: "new-structured",
+          object: { answer: "New answer" },
+          raw: '{"answer":"New answer"}',
+        },
+      };
+      yield { type: EventType.RUN_FINISHED, threadId: "provider", runId: "provider" };
+    })(),
+    append: async (chunk) => {
+      emitted.push(chunk);
+    },
+  });
+  const state = advanceConversation({ display: [original], context: [summary] }, turn.messages);
+  assert.deepEqual(state.display[0], original);
+  assert.equal(state.display[1]?.id, "new-structured");
+  assert.equal(JSON.stringify(state.display[1]).includes("New answer"), true);
+  assert.equal(emitted.length, 2);
+});
+
+test("display keeps a browser handoff image as its text reference while context keeps the image and other images stay intact", () => {
+  const image = {
+    type: "image" as const,
+    source: { type: "data" as const, value: "iVBORw0KGgo=", mimeType: "image/png" },
+  };
+  const pasted: UIMessage = {
+    id: "pasted",
+    role: "user",
+    parts: [{ type: "text", content: "See this" }, image],
+  };
+  const handoff: UIMessage = {
+    id: "handoff-image",
+    role: "user",
+    metadata: { browserHandoffImage: { caseId: "case-a", handoffId: "h1" } },
+    parts: [{ type: "text", content: "Labeled screenshot" }, image],
+  };
+  const state = advanceConversation({ display: [original], context: [original] }, [
+    original,
+    pasted,
+    handoff,
+  ]);
+
+  assert.deepEqual(state.context, [original, pasted, handoff]);
+  assert.deepEqual(state.display, [
+    original,
+    pasted,
+    { ...handoff, parts: [{ type: "text", content: "Labeled screenshot" }] },
+  ]);
+});

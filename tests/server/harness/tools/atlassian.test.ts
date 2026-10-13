@@ -9,7 +9,11 @@ import type { ToolExecutionContext, UIMessage } from "@tanstack/ai";
 import type { ModelCall } from "../../../../server/harness/model-turn";
 import { withAtlassianScope, type ModelTool } from "../../../../server/harness/tools/atlassian";
 import { read } from "../../../../server/harness/tools/fs";
-import { withRunTools, type RunTools } from "../../../../server/harness/tools/index";
+import {
+  withRunTools as withConversationTools,
+  type RunTools,
+} from "../../../../server/harness/tools/index";
+import { withCatalogTools as withRunTools } from "../../../fixtures/catalog-tools";
 import {
   allTools,
   coreTools,
@@ -57,24 +61,30 @@ const credentialForms = [
     ]),
   ),
 ];
+
 function safeError(pattern: RegExp) {
   return (error: Error) => {
     assert.match(error.message, pattern);
     assert.equal(error.cause, undefined);
+
     for (const secret of credentialForms) {
       assert.equal(error.message.includes(secret), false);
     }
+
     return true;
   };
 }
+
 async function withTemporaryDirectory(use: (directory: string) => Promise<void>) {
   const directory = await mkdtemp(join(tmpdir(), "chum-atlassian-"));
+
   try {
     await use(directory);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
 }
+
 const discoveryCall = (toolNames: string[]): ModelCall => ({
   id: "scope-discovery",
   name: discoveryName,
@@ -82,6 +92,7 @@ const discoveryCall = (toolNames: string[]): ModelCall => ({
   input: { toolNames },
 });
 let discoverySequence = 0;
+
 async function discover(tools: RunTools, toolNames: string[]): Promise<UIMessage[]> {
   const id = `discovery-call-${++discoverySequence}`;
   const argumentsText = JSON.stringify({ toolNames });
@@ -90,6 +101,7 @@ async function discover(tools: RunTools, toolNames: string[]): Promise<UIMessage
     { id, name: discoveryName, arguments: argumentsText, input: { toolNames } },
     context,
   );
+
   return [
     {
       id: `${id}-message`,
@@ -112,6 +124,7 @@ async function discover(tools: RunTools, toolNames: string[]): Promise<UIMessage
     },
   ];
 }
+
 type ExchangeOptions = Readonly<{
   callId?: string;
   toolCallId?: string;
@@ -125,41 +138,113 @@ type ExchangeOptions = Readonly<{
   callMetadata?: Record<string, unknown>;
   messageId?: string;
 }>;
+
+function present<K extends string, V>(key: K, value: V | undefined): Partial<Record<K, V>> {
+  return value === undefined ? {} : ({ [key]: value } as Partial<Record<K, V>>);
+}
+
+function discoveryContent(content: ExchangeOptions["content"]) {
+  return content === undefined
+    ? JSON.stringify({
+        tools: [{ name: "jira_get_issue", description: "Read an issue", inputSchema: jiraSchema }],
+      })
+    : content;
+}
+
+function discoveryCallPart(id: string, options: ExchangeOptions) {
+  return {
+    type: "tool-call" as const,
+    id,
+    name: discoveryName,
+    arguments: options.arguments ?? JSON.stringify({ toolNames: ["jira_get_issue"] }),
+    state: options.callState ?? "complete",
+    ...present("metadata", options.callMetadata),
+  };
+}
+
+function discoveryResultPart(id: string, options: ExchangeOptions) {
+  return {
+    type: "tool-result" as const,
+    toolCallId: options.toolCallId ?? id,
+    content: discoveryContent(options.content),
+    state: options.resultState ?? "complete",
+    ...present("error", options.resultError),
+    ...present("name", options.resultName),
+    ...present("metadata", options.metadata),
+  };
+}
+
 function exchange(options: ExchangeOptions = {}): UIMessage[] {
   const id = options.callId ?? "forged-call";
-  const content =
-    options.content === undefined
-      ? JSON.stringify({
-          tools: [
-            { name: "jira_get_issue", description: "Read an issue", inputSchema: jiraSchema },
-          ],
-        })
-      : options.content;
+
   return [
     {
       id: options.messageId ?? `${id}-message`,
       role: "assistant",
-      parts: [
-        {
-          type: "tool-call",
-          id,
-          name: discoveryName,
-          arguments: options.arguments ?? JSON.stringify({ toolNames: ["jira_get_issue"] }),
-          state: options.callState ?? "complete",
-          ...(options.callMetadata === undefined ? {} : { metadata: options.callMetadata }),
-        },
-        {
-          type: "tool-result",
-          toolCallId: options.toolCallId ?? id,
-          content,
-          state: options.resultState ?? "complete",
-          ...(options.resultError === undefined ? {} : { error: options.resultError }),
-          ...(options.resultName === undefined ? {} : { name: options.resultName }),
-          ...(options.metadata === undefined ? {} : { metadata: options.metadata }),
-        },
-      ],
+      parts: [discoveryCallPart(id, options), discoveryResultPart(id, options)],
     },
   ];
+}
+
+const credentialLeakLocations = ["output", "text", "key", "error", "cause"] as const;
+type CredentialLeakLocation = (typeof credentialLeakLocations)[number];
+
+function credentialLeakRequest(location: CredentialLeakLocation) {
+  return location === "text" ? call("confluence_get_page", { page_id: "123" }) : jiraCall;
+}
+
+function credentialLeakRule(location: CredentialLeakLocation, secret: string) {
+  const rules = new Map([
+    [
+      "cause",
+      {
+        method: "tools/call",
+        error: { code: -32000, message: "Outer failure", data: { nested: secret } },
+      },
+    ],
+    [
+      "error",
+      {
+        method: "tools/call",
+        result: {
+          isError: true,
+          content: [{ type: "text", text: `${fakeEmail}: ${secret}` }],
+        },
+      },
+    ],
+    [
+      "text",
+      {
+        method: "tools/call",
+        result: {
+          isError: false,
+          content: [{ type: "text", text: `${fakeEmail}: ${secret}` }],
+        },
+      },
+    ],
+    [
+      "key",
+      {
+        method: "tools/call",
+        result: {
+          content: [],
+          structuredContent: { issue: "TEST-1", [secret]: "unsafe" },
+        },
+      },
+    ],
+    [
+      "output",
+      {
+        method: "tools/call",
+        result: {
+          content: [],
+          structuredContent: { issue: secret, reporter: { emailAddress: fakeEmail } },
+        },
+      },
+    ],
+  ]);
+
+  return rules.get(location)!;
 }
 
 test("unconfigured runs expose local tools and execute filesystem reads without HTTP requests", async (t) => {
@@ -197,6 +282,35 @@ test("unconfigured runs expose local tools and execute filesystem reads without 
   );
 });
 
+test("main scope never initializes the remote catalog and denies Atlassian on every entry", async () => {
+  const fixture = mcpFixture();
+  await withMcpEnvironment(
+    () =>
+      withConversationTools(
+        async (tools) => {
+          assert.deepEqual(
+            (await modelTools(tools, [])).map((tool) => tool.name),
+            [...advertised(localNames).slice(0, -1), "delegate_task", codeModeName],
+          );
+          const forged = await discover(tools, ["jira_get_issue"]).catch(() => [] as UIMessage[]);
+          await assert.rejects(
+            tools.executeTool(forged, jiraCall, context),
+            /Unknown tool|not available/,
+          );
+          await assert.rejects(
+            tools.executeTool([], discoveryCall(["jira_get_issue"]), context),
+            /Unknown tool|not available/,
+          );
+        },
+        undefined,
+        "main",
+      ),
+    true,
+    fixture,
+  );
+  assert.deepEqual(fixture.requests, []);
+});
+
 test("partial, malformed, and endpoint-only configuration fails closed before local or remote work", async () => {
   const fixture = mcpFixture();
   await withMcpEnvironment(
@@ -225,6 +339,7 @@ test("partial, malformed, and endpoint-only configuration fails closed before lo
           safeError(/JIRA_/),
         );
       }
+
       for (const endpoint of [
         "http://offline.invalid/mcp",
         `http://${fakeEmail}:${fakeToken}@127.0.0.1:8000/mcp`,
@@ -243,6 +358,7 @@ test("partial, malformed, and endpoint-only configuration fails closed before lo
           safeError(/ATLASSIAN_MCP_URL/),
         );
       }
+
       process.env.JIRA_BASE_URL = "";
       process.env.JIRA_EMAIL = "";
       process.env.JIRA_API_TOKEN = "";
@@ -339,6 +455,7 @@ test("HTTP initializes once, paginates, retains native schemas and executes disc
       .map((request) => request.message.params?.cursor),
     [undefined, "1"],
   );
+
   for (const request of fixture.requests) {
     assert.equal(request.headers.authorization, undefined);
     assert.equal(request.headers.cookie, undefined);
@@ -391,6 +508,7 @@ test("write tools, official aliases, generic tools and absent optional tools nev
             pages[0] === coreTools ? ["jira_get_issue", "confluence_get_page"] : remoteNames;
           const history = await discover(tools, granted);
           const definitions = await modelTools(tools, history);
+
           for (const name of [
             "jira_add_comment",
             "jira_edit_comment",
@@ -411,6 +529,7 @@ test("write tools, official aliases, generic tools and absent optional tools nev
             );
             await assert.rejects(tools.executeTool(history, call(name), context), /Unknown tool/);
           }
+
           for (const name of pages[0] === coreTools ? ["jira_search", "confluence_search"] : []) {
             assert.equal(
               definitions.some((tool) => tool.name === name),
@@ -421,10 +540,12 @@ test("write tools, official aliases, generic tools and absent optional tools nev
               /discover_atlassian_tools first/,
             );
           }
+
           await assert.rejects(
             tools.executeTool(history, discoveryCall(["jira_delete_issue"]), context),
             /Unknown tool/,
           );
+
           if (pages[0] === coreTools) {
             await assert.rejects(
               tools.executeTool(
@@ -435,6 +556,7 @@ test("write tools, official aliases, generic tools and absent optional tools nev
               /unavailable: confluence_search/,
             );
           }
+
           assert.deepEqual(fixture.calls(), []);
         }),
       true,
@@ -502,12 +624,14 @@ test("initialization and catalog errors close the failed client and concurrent a
       () =>
         withRunTools(async (tools) => {
           const outcomes = await Promise.allSettled([modelTools(tools, []), modelTools(tools, [])]);
+
           for (const outcome of outcomes) {
             assert.equal(outcome.status, "rejected");
             safeError(/configured Atlassian credentials/)(
               (outcome as PromiseRejectedResult).reason,
             );
           }
+
           assert.equal(fixture.sessions.length, 1);
           assert.deepEqual(
             (await modelTools(tools, [])).map((tool) => tool.name),
@@ -566,7 +690,9 @@ test("terminated HTTP connections report safe failures and recover without resen
             );
             assert.equal(fixture.calls().length, 0);
           }
+
           const history = await discover(tools, ["jira_get_issue"]);
+
           if (method === "tools/call") {
             await assert.rejects(
               tools.executeTool(history, jiraCall, context),
@@ -574,6 +700,7 @@ test("terminated HTTP connections report safe failures and recover without resen
             );
             assert.equal(fixture.calls().length, 1);
           }
+
           assert.deepEqual(await tools.executeTool(history, jiraCall, context), {
             issue: "TEST-1",
           });
@@ -622,6 +749,7 @@ test("unawaited discovery cannot start a client after scope teardown", async () 
             modelTools(tools, []),
             /scope is closed|cancelled or timed out/,
           );
+
           return "completed";
         }),
         "completed",
@@ -669,6 +797,7 @@ test("cancellation before the first HTTP request reaches the service sends nothi
   let attempted: AbortSignal | undefined;
   t.mock.method(globalThis, "fetch", (input: string | URL | Request, init?: RequestInit) => {
     attempted = init?.signal ?? undefined;
+
     return gate.promise.then(() => realFetch(input, init));
   });
   await withMcpEnvironment(
@@ -680,9 +809,11 @@ test("cancellation before the first HTTP request reaches the service sends nothi
           abortSignal: controller.signal,
         }),
       );
+
       for (let attempt = 0; attempt < 500 && !attempted; attempt++) {
         await delay(1);
       }
+
       assert.ok(attempted, "Client never attempted a request");
       controller.abort();
       gate.resolve();
@@ -696,15 +827,29 @@ test("cancellation before the first HTTP request reaches the service sends nothi
 
 test("pre-cancelled calls never contact the service", async () => {
   const fixture = mcpFixture();
+  const defaultSignal = AbortSignal.abort();
+  const reason = new Error("operator cancelled before dispatch");
   await withMcpEnvironment(
     () =>
       withRunTools(async (tools) => {
         await assert.rejects(
           tools.executeTool([], discoveryCall(["jira_get_issue"]), {
             ...context,
-            abortSignal: AbortSignal.abort(),
+            abortSignal: defaultSignal,
           }),
-          /cancelled/,
+          (error) => {
+            assert.equal(error, defaultSignal.reason);
+            assert.equal((error as DOMException).name, "AbortError");
+
+            return true;
+          },
+        );
+        await assert.rejects(
+          tools.executeTool([], discoveryCall(["jira_get_issue"]), {
+            ...context,
+            abortSignal: AbortSignal.abort(reason),
+          }),
+          (error) => error === reason,
         );
         assert.deepEqual(fixture.requests, []);
       }),
@@ -764,8 +909,10 @@ for (const method of ["initialize", "tools/list", "tools/call"]) {
         if (ms === 60_000) {
           const handle = nodeSetTimeout(() => {}, 0);
           armed.set(handle, callback);
+
           return handle;
         }
+
         return nodeSetTimeout(callback, ms, ...args);
       },
     );
@@ -773,6 +920,7 @@ for (const method of ["initialize", "tools/list", "tools/call"]) {
       if (handle) {
         armed.delete(handle);
       }
+
       return nodeClearTimeout(handle);
     });
     const fixture = mcpFixture({ rules: [{ method, hang: true }] });
@@ -783,18 +931,22 @@ for (const method of ["initialize", "tools/list", "tools/call"]) {
           withRunTools(async (tools) => {
             history =
               method === "tools/call" ? await discover(tools, ["jira_get_issue"]) : undefined;
+
             if (method === "tools/call") {
               return tools.executeTool(history!, jiraCall, context);
             }
+
             return tools.executeTool([], discoveryCall(["jira_get_issue"]), context);
           }),
           safeError(/cancelled or timed out/),
         );
         await fixture.waitFor(method);
         assert.ok(armed.size > 0);
+
         for (const trigger of armed.values()) {
           trigger();
         }
+
         await rejected;
         await fixture.assertClosed();
         assert.ok(
@@ -815,9 +967,11 @@ test("cleared deadlines cannot abort a long-lived session after successful initi
     "setTimeout",
     (callback: () => void, ms?: number, ...args: unknown[]) => {
       const handle = nodeSetTimeout(callback, ms, ...args);
+
       if (ms === 60_000) {
         armed.add(handle);
       }
+
       return handle;
     },
   );
@@ -825,6 +979,7 @@ test("cleared deadlines cannot abort a long-lived session after successful initi
     if (handle) {
       cleared.add(handle);
     }
+
     return nodeClearTimeout(handle);
   });
   const fixture = mcpFixture();
@@ -855,16 +1010,20 @@ test("scope cleanup on success and primary callback failure leaves no in-flight 
       async () => {
         const result = withRunTools(async (tools) => {
           await modelTools(tools, []);
+
           if (failure) {
             throw new Error("Primary callback failure");
           }
+
           return "completed";
         });
+
         if (failure) {
           await assert.rejects(result, /^Error: Primary callback failure$/);
         } else {
           assert.equal(await result, "completed");
         }
+
         await fixture.assertClosed();
       },
       true,
@@ -934,6 +1093,7 @@ test("Jira and Confluence user emails matching the login remain readable in stru
       output: { id: "123", title: "Test page", author: { email: fakeEmail } },
     },
   ];
+
   for (const structured of [true, false]) {
     const fixture = mcpFixture({
       pages: [
@@ -954,6 +1114,7 @@ test("Jira and Confluence user emails matching the login remain readable in stru
       () =>
         withRunTools(async (tools) => {
           const history = await discover(tools, ["jira_get_issue", "confluence_get_page"]);
+
           for (const { request, output } of cases) {
             assert.deepEqual(
               await tools.executeTool(history, request, context),
@@ -1003,32 +1164,10 @@ test("credential forms in catalog descriptions and schemas, including forbidden 
 
 test("credential forms in remote output, keys and MCP errors never escape to callers", async () => {
   for (const secret of credentialForms) {
-    for (const location of ["output", "text", "key", "error", "cause"]) {
-      const request =
-        location === "text" ? call("confluence_get_page", { page_id: "123" }) : jiraCall;
+    for (const location of credentialLeakLocations) {
+      const request = credentialLeakRequest(location);
       const fixture = mcpFixture({
-        rules: [
-          {
-            method: "tools/call",
-            ...(location === "cause"
-              ? { error: { code: -32000, message: "Outer failure", data: { nested: secret } } }
-              : {
-                  result:
-                    location === "error" || location === "text"
-                      ? {
-                          isError: location === "error",
-                          content: [{ type: "text", text: `${fakeEmail}: ${secret}` }],
-                        }
-                      : {
-                          content: [],
-                          structuredContent:
-                            location === "key"
-                              ? { issue: "TEST-1", [secret]: "unsafe" }
-                              : { issue: secret, reporter: { emailAddress: fakeEmail } },
-                        },
-                }),
-          },
-        ],
+        rules: [credentialLeakRule(location, secret)],
       });
       await withMcpEnvironment(
         async () => {
@@ -1054,6 +1193,7 @@ test("local filesystem results and Error causes cannot reveal snapshot credentia
     async () =>
       withTemporaryDirectory(async (directory) => {
         const path = join(directory, "private.txt");
+
         for (const secret of credentialForms) {
           await writeFile(path, secret);
           await assert.rejects(
@@ -1061,6 +1201,7 @@ test("local filesystem results and Error causes cannot reveal snapshot credentia
             safeError(/configured Atlassian credentials/),
           );
         }
+
         const handler = t.mock.method(
           read as typeof read & { execute: NonNullable<typeof read.execute> },
           "execute",
@@ -1091,6 +1232,7 @@ test("composition failures and composed definitions cannot expose credentials", 
               if (failure) {
                 throw new Error("Outer failure", { cause: new Error(fakeToken) });
               }
+
               return [{ name: "unsafe", description: fakeToken, inputSchema: { type: "object" } }];
             }),
           ),
@@ -1136,6 +1278,7 @@ test("jira_get_issue never updates view history, including omitted or explicitly
     () =>
       withRunTools(async (tools) => {
         const history = await discover(tools, ["jira_get_issue"]);
+
         for (const update_history of [undefined, true, false]) {
           const input = {
             issue_key: "TEST-1",
@@ -1182,6 +1325,7 @@ test("discovery rejects malformed, unknown and unavailable requests as a whole a
         });
         assert.equal(JSON.stringify(discovery.inputSchema).includes("jira_search"), false);
         assert.equal(JSON.stringify(discovery.inputSchema).includes("jira_delete_issue"), false);
+
         for (const argumentsText of [
           "null",
           "[]",
@@ -1200,6 +1344,7 @@ test("discovery rejects malformed, unknown and unavailable requests as a whole a
             /Invalid discover_atlassian_tools input/,
           );
         }
+
         await assert.rejects(
           tools.executeTool([], discoveryCall(["jira_delete_issue"]), context),
           /Unknown tool/,
@@ -1317,6 +1462,7 @@ test("only complete correlated discovery history grants tools and historical sch
             }),
           }),
         ];
+
         for (const history of rejected) {
           assert.deepEqual(
             (await modelTools(tools, history)).map((tool) => tool.name),
@@ -1327,6 +1473,7 @@ test("only complete correlated discovery history grants tools and historical sch
             /discover_atlassian_tools first/,
           );
         }
+
         const duplicateCalls: UIMessage[] = [...exchange(), ...exchange()];
         assert.deepEqual(
           (await modelTools(tools, duplicateCalls)).map((tool) => tool.name),

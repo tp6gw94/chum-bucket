@@ -1,10 +1,20 @@
-import { PlusIcon, XIcon } from "lucide-react";
-import type { ReactNode } from "react";
-import type { CompactNotice, SendResult } from "../hooks/use-threads";
+import { ArrowDownIcon, PlusIcon, XIcon } from "lucide-react";
+import { useEffect, type ReactNode } from "react";
+import type { SendResult, CompactNotice } from "../hooks/use-threads";
+import { Marker, MarkerContent } from "@/components/ui/marker";
+import type { TestRunId, TestView } from "../../shared/testing";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Marker, MarkerContent } from "@/components/ui/marker";
+import {
+  MessageScroller,
+  MessageScrollerButton,
+  MessageScrollerContent,
+  MessageScrollerItem,
+  MessageScrollerProvider,
+  MessageScrollerViewport,
+  useMessageScroller,
+} from "@/components/ui/message-scroller";
 import { Composer } from "./composer";
 import { MessageList } from "./message-list";
 import { PaneShell } from "./pane-shell";
@@ -12,7 +22,116 @@ import { ProgressPanel } from "./progress-panel";
 import { StatusBadge } from "./status-badge";
 import { type Pane as PaneModel } from "./types";
 
-const DEFAULT_WIDTH = { main: 720, agent: 440 } as const;
+type PanePresentation = Readonly<{
+  defaultWidth: number;
+  placeholder: string;
+  hint: string;
+  emptyCopy: string;
+  progressLabel: string;
+}>;
+
+const EMPTY_TESTING_VIEWS: readonly TestView[] = [];
+
+const PANE_PRESENTATION: Record<PaneModel["kind"], PanePresentation> = {
+  main: {
+    defaultWidth: 720,
+    placeholder: "輸入訊息",
+    hint: "送出後會使用目前的 thread",
+    emptyCopy: "還沒有訊息，輸入第一則訊息開始對話。",
+    progressLabel: "主對話進度",
+  },
+  agent: {
+    defaultWidth: 440,
+    placeholder: "在固定主對話快照上繼續討論",
+    hint: "獨立討論，不會修改主對話。關閉後捨棄。",
+    emptyCopy: "附屬對話已建立，輸入訊息開始獨立討論。",
+    progressLabel: "附屬對話進度",
+  },
+};
+
+function paneShellLabel(pane: PaneModel): string {
+  return pane.kind === "main" ? "主對話" : `附屬對話：${pane.title}`;
+}
+
+function composerFieldLabel(pane: PaneModel): string {
+  const prefix = pane.kind === "main" ? "主對話" : pane.title;
+
+  return `${prefix}輸入-${pane.id}`;
+}
+
+function HydrationFeedback({
+  isHydrating,
+  hydrationError,
+}: {
+  isHydrating: boolean;
+  hydrationError?: string | null;
+}) {
+  return (
+    <>
+      {isHydrating ? (
+        <p role="status" className="px-4 text-sm">
+          正在載入對話…
+        </p>
+      ) : null}
+      {hydrationError ? (
+        <div role="alert" className="px-4 py-2 text-sm text-destructive">
+          <p>{hydrationError}</p>
+          <Button variant="outline" size="sm" onClick={() => window.location.reload()}>
+            重新載入
+          </Button>
+        </div>
+      ) : null}
+    </>
+  );
+}
+
+function PaneMessages({
+  pane,
+  presentation,
+  onSend,
+  actionsDisabled,
+  testingViews,
+  onCancelTesting,
+  activeRunId,
+}: {
+  pane: PaneModel;
+  presentation: PanePresentation;
+  onSend?: (text: string) => Promise<SendResult>;
+  actionsDisabled: boolean;
+  testingViews: readonly TestView[];
+  onCancelTesting?: (runId: TestRunId) => Promise<void>;
+  activeRunId?: string | null;
+}) {
+  return (
+    <>
+      {pane.messages.length === 0 ? (
+        <MessageScrollerItem className="m-auto">
+          <p className="text-sm text-muted-foreground">{presentation.emptyCopy}</p>
+        </MessageScrollerItem>
+      ) : null}
+      <MessageList
+        messages={pane.messages}
+        agent={pane.agent}
+        onSend={onSend}
+        disabled={actionsDisabled}
+        isStreaming={pane.status === "running"}
+        compacting={pane.status === "compacting"}
+        testingViews={pane.kind === "main" ? testingViews : EMPTY_TESTING_VIEWS}
+        onCancelTesting={onCancelTesting}
+        activeRunId={activeRunId}
+      />
+    </>
+  );
+}
+
+function TranscriptAutoFollow({ pane }: { pane: PaneModel }) {
+  const { scrollToEnd } = useMessageScroller();
+  useEffect(() => {
+    scrollToEnd({ behavior: "auto" });
+  }, [scrollToEnd, pane.messages, pane.status]);
+
+  return null;
+}
 
 const COMPACT_NOTICE_COPY: Record<CompactNotice, string> = {
   done: "上下文已整理，完整摘要與原文已保留。",
@@ -20,35 +139,30 @@ const COMPACT_NOTICE_COPY: Record<CompactNotice, string> = {
   failed: "整理上下文失敗，原文與上下文已保留。",
 };
 
-const PANE_COPY = {
-  main: {
-    label: () => "主對話",
-    empty: "還沒有訊息，輸入第一則訊息開始對話。",
-    progress: "主對話進度",
-    placeholder: "輸入訊息",
-    hint: "輸入 /compact 可整理上下文",
-  },
-  agent: {
-    label: (title: string) => `附屬對話：${title}`,
-    empty: "附屬對話已建立，輸入訊息開始獨立討論。",
-    progress: "附屬對話進度",
-    placeholder: "輸入附屬對話訊息",
-    hint: "附屬對話不會修改主對話，關閉後即刪除",
-  },
-} as const;
+function CompactNoticeMarker({ notice }: { notice?: CompactNotice | null }) {
+  if (!notice) {
+    return null;
+  }
+
+  return (
+    <Marker role={notice === "failed" ? "alert" : "status"}>
+      <MarkerContent>{COMPACT_NOTICE_COPY[notice]}</MarkerContent>
+    </Marker>
+  );
+}
 
 function PaneHeader({
   pane,
   onOpenAgentPane,
-  openDisabled,
-  headerAction,
   onClose,
+  headerAction,
+  openDisabled,
 }: {
   pane: PaneModel;
   onOpenAgentPane?: () => void;
-  openDisabled: boolean;
-  headerAction?: ReactNode;
   onClose?: () => void;
+  headerAction?: ReactNode;
+  openDisabled: boolean;
 }) {
   return (
     <header className="flex shrink-0 flex-col gap-2.5 border-b bg-card px-4 py-3">
@@ -76,60 +190,61 @@ function PaneHeader({
   );
 }
 
-function PaneMessages({
+function PaneTranscript({
   pane,
-  compactNotice,
+  presentation,
+  onSend,
+  actionsDisabled,
+  testingViews,
+  onCancelTesting,
+  activeRunId,
 }: {
   pane: PaneModel;
-  compactNotice?: CompactNotice | null;
+  presentation: PanePresentation;
+  onSend?: (text: string) => Promise<SendResult>;
+  actionsDisabled: boolean;
+  testingViews: readonly TestView[];
+  onCancelTesting?: (runId: TestRunId) => Promise<void>;
+  activeRunId?: string | null;
 }) {
-  const copy = PANE_COPY[pane.kind];
-
   return (
-    <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-4">
-      {pane.messages.length === 0 ? (
-        <p className="m-auto text-sm text-muted-foreground">{copy.empty}</p>
-      ) : (
-        <MessageList
-          messages={pane.messages}
-          agent={pane.agent}
-          isStreaming={pane.status === "running"}
-        />
-      )}
-      {compactNotice ? (
-        <Marker role={compactNotice === "failed" ? "alert" : "status"}>
-          <MarkerContent>{COMPACT_NOTICE_COPY[compactNotice]}</MarkerContent>
-        </Marker>
-      ) : null}
-      <ProgressPanel status={pane.status} label={copy.progress} lines={pane.progress} />
-    </div>
-  );
-}
-
-function HydrationState({ loading, error }: { loading: boolean; error?: string | null }) {
-  return (
-    <>
-      {loading ? (
-        <p role="status" className="px-4 text-sm">
-          正在載入對話…
-        </p>
-      ) : null}
-      {error ? (
-        <div role="alert" className="px-4 py-2 text-sm text-destructive">
-          <p>{error}</p>
-          <Button variant="outline" size="sm" onClick={() => window.location.reload()}>
-            重新載入
-          </Button>
-        </div>
-      ) : null}
-    </>
+    <MessageScrollerProvider autoScroll defaultScrollPosition="end">
+      <MessageScroller className="min-h-0 flex-1">
+        <MessageScrollerViewport aria-label={`${pane.title}對話訊息`} className="p-4">
+          <MessageScrollerContent className="gap-4">
+            <TranscriptAutoFollow pane={pane} />
+            <PaneMessages
+              pane={pane}
+              presentation={presentation}
+              onSend={onSend}
+              actionsDisabled={actionsDisabled}
+              testingViews={testingViews}
+              onCancelTesting={onCancelTesting}
+              activeRunId={activeRunId}
+            />
+            {pane.progress.length > 0 ? (
+              <MessageScrollerItem messageId="pane-progress">
+                <ProgressPanel
+                  status={pane.status}
+                  label={presentation.progressLabel}
+                  lines={pane.progress}
+                />
+              </MessageScrollerItem>
+            ) : null}
+          </MessageScrollerContent>
+        </MessageScrollerViewport>
+        <MessageScrollerButton direction="end">
+          <ArrowDownIcon />
+          <span className="sr-only">跳到最新</span>
+        </MessageScrollerButton>
+      </MessageScroller>
+    </MessageScrollerProvider>
   );
 }
 
 export function Pane({
   pane,
   onOpenAgentPane,
-  openDisabled = false,
   onClose,
   onSend,
   sendDisabled = false,
@@ -138,10 +253,13 @@ export function Pane({
   compactNotice,
   headerAction,
   footer,
+  openDisabled = false,
+  testingViews = EMPTY_TESTING_VIEWS,
+  onCancelTesting,
+  activeRunId,
 }: {
   pane: PaneModel;
   onOpenAgentPane?: () => void;
-  openDisabled?: boolean;
   onClose?: () => void;
   onSend?: (text: string) => Promise<SendResult>;
   sendDisabled?: boolean;
@@ -150,28 +268,39 @@ export function Pane({
   compactNotice?: CompactNotice | null;
   headerAction?: ReactNode;
   footer?: ReactNode;
+  openDisabled?: boolean;
+  testingViews?: readonly TestView[];
+  onCancelTesting?: (runId: TestRunId) => Promise<void>;
+  activeRunId?: string | null;
 }) {
-  const copy = PANE_COPY[pane.kind];
+  const presentation = PANE_PRESENTATION[pane.kind];
+  const actionsDisabled = sendDisabled || isHydrating || pane.status !== "idle" || !onSend;
 
   return (
-    <PaneShell
-      label={copy.label(pane.title)}
-      defaultWidth={pane.kind === "main" ? DEFAULT_WIDTH.main : DEFAULT_WIDTH.agent}
-    >
+    <PaneShell label={paneShellLabel(pane)} defaultWidth={presentation.defaultWidth}>
       <PaneHeader
         pane={pane}
         onOpenAgentPane={onOpenAgentPane}
-        openDisabled={openDisabled}
-        headerAction={headerAction}
         onClose={onClose}
+        headerAction={headerAction}
+        openDisabled={openDisabled}
       />
-      <PaneMessages pane={pane} compactNotice={compactNotice} />
-      <HydrationState loading={isHydrating} error={hydrationError} />
+      <PaneTranscript
+        pane={pane}
+        presentation={presentation}
+        onSend={onSend}
+        actionsDisabled={actionsDisabled}
+        testingViews={testingViews}
+        onCancelTesting={onCancelTesting}
+        activeRunId={activeRunId}
+      />
+      <CompactNoticeMarker notice={compactNotice} />
+      <HydrationFeedback isHydrating={isHydrating} hydrationError={hydrationError} />
       {footer}
       <Composer
-        label={`${pane.kind === "main" ? "主對話" : pane.title}輸入-${pane.id}`}
-        placeholder={copy.placeholder}
-        hint={copy.hint}
+        label={composerFieldLabel(pane)}
+        placeholder={presentation.placeholder}
+        hint={presentation.hint}
         onSend={onSend}
         disabled={sendDisabled || !onSend}
         className="border-t"

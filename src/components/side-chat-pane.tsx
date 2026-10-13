@@ -35,7 +35,7 @@ export function SummaryPreview({
   return (
     <Card
       size="sm"
-      className="mx-3 mb-3 max-h-80 shrink-0 overflow-y-auto"
+      className="mx-3 mb-3 max-h-[40vh] shrink-0 overflow-y-auto"
       aria-label={`${title}摘要預覽`}
     >
       <CardHeader>

@@ -8,9 +8,10 @@ import {
 } from "@tanstack/ai";
 import { resolveDebugOption } from "@tanstack/ai/adapter-internals";
 import { compactionEvent } from "../../shared/compaction-event";
-import { compactionSystemPrompt, sideSummarySystemPrompt, summaryPreamble } from "./prompts";
+import { summaryModelTasks, type SummaryPurpose } from "./agents";
+import { summaryPreamble } from "./prompts";
 import { streamModelTurn } from "./model-turn";
-import { MODEL, checkpointCompaction } from "./run-store";
+import { checkpointCompaction } from "./run-store";
 import type { ConversationState } from "./conversation";
 import type { RunTools } from "./tools";
 import type { ModelTool } from "./tools/atlassian";
@@ -26,12 +27,6 @@ const SUMMARY_TIMEOUT_MS = 30_000;
 const SUMMARY_MAX_TOKENS = 2_000;
 const SUMMARY_MAX_CHARS = 8_000;
 const COMPLETE_TOOL_CALL_STATES = new Set(["complete", "error"]);
-const SUMMARY_PROMPTS = {
-  compaction: compactionSystemPrompt,
-  "side-summary": sideSummarySystemPrompt,
-} as const;
-
-type SummaryPurpose = keyof typeof SUMMARY_PROMPTS;
 
 export type CompactionPlan = Readonly<{
   previousSummary: string | null;
@@ -328,9 +323,11 @@ export async function summarizeTranscript(
   signal?: AbortSignal,
 ): Promise<string> {
   signal?.throwIfAborted();
+  const task = summaryModelTasks[purpose];
   const { deepinfra } = await import("./provider");
-  const stream = deepinfra(MODEL).chatStream({
-    model: MODEL,
+  const adapter = deepinfra(task.model);
+  const stream = adapter.chatStream({
+    model: task.model,
     messages: [
       {
         role: "user",
@@ -340,7 +337,7 @@ export async function summarizeTranscript(
         }),
       },
     ],
-    systemPrompts: [SUMMARY_PROMPTS[purpose]],
+    systemPrompts: [task.systemPrompt],
     tools: [],
     logger: resolveDebugOption(false),
     modelOptions: { max_tokens: SUMMARY_MAX_TOKENS },

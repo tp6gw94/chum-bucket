@@ -1,4 +1,6 @@
+import { convertSchemaToJsonSchema, type JSONSchema } from "@tanstack/ai";
 import { z } from "zod";
+import { fileToolOutput } from "./fs";
 
 const jiraUser = z.looseObject({
   account_id: z.string().optional(),
@@ -44,7 +46,10 @@ const confluencePage = z.looseObject({
   content: z.looseObject({ value: z.string(), format: z.string().optional() }).optional(),
 });
 
-export const atlassianOutputSchemas: ReadonlyMap<string, z.ZodType> = new Map<string, z.ZodType>([
+const outputSchemas = new Map<string, z.ZodType>([
+  ["read", fileToolOutput],
+  ["write", fileToolOutput],
+  ["edit", fileToolOutput],
   ["jira_get_issue", jiraIssue],
   [
     "jira_search",
@@ -60,3 +65,11 @@ export const atlassianOutputSchemas: ReadonlyMap<string, z.ZodType> = new Map<st
   ["confluence_search", z.array(confluencePage)],
   ["confluence_get_comments", z.array(z.looseObject({ id: z.string() }))],
 ]);
+
+export const toolOutputSchemas: ReadonlyMap<string, JSONSchema> = new Map(
+  [...outputSchemas].flatMap(([name, schema]) => {
+    const converted = convertSchemaToJsonSchema(schema);
+
+    return converted ? [[name, converted] as const] : [];
+  }),
+);

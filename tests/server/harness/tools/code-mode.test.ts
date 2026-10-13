@@ -10,7 +10,8 @@ import {
   composeCodeModeTurn,
   type CodeModePolicy,
 } from "../../../../server/harness/tools/code-mode";
-import { withRunTools, type RunTools } from "../../../../server/harness/tools/index";
+import type { RunTools } from "../../../../server/harness/tools/index";
+import { withCatalogTools as withRunTools } from "../../../fixtures/catalog-tools";
 import {
   coreTools,
   fakeToken,
@@ -61,6 +62,11 @@ const compose = (
   policy: Partial<CodeModePolicy>,
   dispatch: Dispatch = async () => ({ ok: true }),
 ) => composeCodeModeTurn({ definitions: [readDefinition], dispatch, guard: () => {}, policy });
+
+const composeEmpty = (
+  policy: Partial<CodeModePolicy>,
+  dispatch: Dispatch = async () => ({ ok: true }),
+) => composeCodeModeTurn({ definitions: [], dispatch, guard: () => {}, policy });
 
 const rejection = (promise: Promise<unknown>) =>
   promise.then(
@@ -167,6 +173,8 @@ test("the model turn documents exactly the bindings the sandbox exposes", async 
     );
     assert.match(turn.systemPrompt, /interface External_readOutput \{\n {2}content: Array</);
     assert.match(turn.systemPrompt, /Promise<unknown>;/);
+    assert.match(turn.systemPrompt, /Every file, network, or service operation goes through/);
+    assert.doesNotMatch(turn.systemPrompt, /isolated with no network or filesystem access/);
   });
 });
 
@@ -189,6 +197,110 @@ test("discovered Atlassian bindings declare the unwrapped output fields", async 
     },
     true,
     fixture,
+  );
+});
+
+test("codemode executes TypeScript with genuinely empty bindings and projects its events", async () => {
+  const turn = composeEmpty({ timeoutMs: 5000 });
+  assert.match(turn.definition.description, /No external functions are available/);
+  assert.match(turn.systemPrompt, /No external functions are available/);
+  assert.match(turn.systemPrompt, /- The sandbox has no network or filesystem access\./);
+  assert.doesNotMatch(turn.systemPrompt, /Promise\.all/);
+  assert.doesNotMatch(turn.definition.description, /external_/);
+  assert.doesNotMatch(turn.systemPrompt, /external_/);
+
+  const events: { name: string; value: Record<string, unknown> }[] = [];
+  const code = `
+    const values: number[] = [2, 4, 6].map((value: number) => value * 3);
+    console.log("computed");
+    return { values, total: values.reduce((sum, value) => sum + value, 0) };
+  `;
+  const result = (await turn.execute(
+    { code },
+    context({
+      emitCustomEvent: (name, value) => events.push({ name, value }),
+    }),
+  )) as CodeModeResult;
+
+  assert.deepEqual(result, {
+    success: true,
+    result: { values: [6, 12, 18], total: 36 },
+    logs: ["computed"],
+  });
+  assert.deepEqual(
+    events.map(({ name }) => name),
+    ["code_mode:execution_started", "code_mode:console", "code_mode:execution_finished"],
+  );
+  assert.equal(events[0]!.value.codeLength, code.length);
+  assert.deepEqual(events[1]!.value, { level: "log", byteLength: 8 });
+  assert.equal(events[2]!.value.phase, "execute");
+  assert.equal(events[2]!.value.success, true);
+});
+
+test("empty bindings retain source, result, console, timeout and cancellation bounds", async () => {
+  await assert.rejects(
+    composeEmpty({ maxSourceBytes: 32, timeoutMs: 5000 }).execute(
+      { code: `const value = 1; ${" ".repeat(64)}return value;` },
+      context(),
+    ),
+    /source exceeds 32 bytes/,
+  );
+  await assert.rejects(
+    composeEmpty({ maxResultBytes: 32, timeoutMs: 5000 }).execute(
+      { code: `return "x".repeat(128);` },
+      context(),
+    ),
+    /result is too large/,
+  );
+
+  const bounded = (await composeEmpty({
+    maxConsoleEntries: 2,
+    maxConsoleBytes: 64,
+    maxConsoleEntryBytes: 32,
+    timeoutMs: 5000,
+  }).execute(
+    {
+      code: `for (let index = 0; index < 20; index++) console.log("x".repeat(100)); return "done";`,
+    },
+    context(),
+  )) as CodeModeResult;
+  assert.equal(bounded.success, true);
+  assert.ok((bounded.logs?.length ?? 0) <= 2);
+  assert.ok(Buffer.byteLength(bounded.logs?.join("") ?? "", "utf8") <= 64);
+
+  const memoryLimited = (await composeEmpty({
+    memoryLimitMb: 8,
+    timeoutMs: 5000,
+  }).execute({ code: `return "x".repeat(20_000_000);` }, context())) as CodeModeResult;
+  assert.equal(memoryLimited.success, false);
+  assert.match(memoryLimited.error?.message ?? "", /memory|allocation/i);
+
+  const started = Date.now();
+  const timed = (await composeEmpty({ timeoutMs: 250 }).execute(
+    { code: "while (true) {}" },
+    context(),
+  )) as CodeModeResult;
+  assert.equal(timed.success, false);
+  assert.match(timed.error?.message ?? "", /timed out/i);
+  assert.ok(Date.now() - started < 5000);
+  const controller = new AbortController();
+  const cancelled = composeEmpty({ timeoutMs: 350 }).execute(
+    { code: "while (true) {}" },
+    context({ abortSignal: controller.signal }),
+  );
+  setTimeout(() => controller.abort(), 25);
+  await assert.rejects(cancelled, /cancelled/);
+  const afterCancellation = (await composeEmpty({ timeoutMs: 5000 }).execute(
+    { code: "return 7;" },
+    context(),
+  )) as CodeModeResult;
+  assert.equal(afterCancellation.result, 7);
+  await assert.rejects(
+    composeEmpty({ timeoutMs: 5000 }).execute(
+      { code: "return 1;" },
+      context({ abortSignal: AbortSignal.abort() }),
+    ),
+    /cancelled/,
   );
 });
 
@@ -285,7 +397,7 @@ test("code mode events stay metadata-only and arrive in execution order", async 
   await withRunTools(async (tools) => {
     const events: { name: string; value: Record<string, unknown> }[] = [];
     const code = `
-      console.log("guest-message");
+      console.log("guest-message 中文");
       const file = await external_read({ path: ${JSON.stringify(relativePath)} });
       return file.content.map((part) => part.text).join("");
     `;
@@ -307,6 +419,7 @@ test("code mode events stay metadata-only and arrive in execution order", async 
     assert.equal(events[0]!.value.codeLength, code.length);
     assert.equal(events[1]!.value.function, "external_read");
     assert.equal(typeof events[1]!.value.argumentBytes, "number");
+    assert.deepEqual(events[3]!.value, { level: "log", byteLength: 20 });
     assert.equal(events[4]!.value.success, true);
     const serialized = JSON.stringify(events);
     assert.equal(serialized.includes("file-payload"), false);

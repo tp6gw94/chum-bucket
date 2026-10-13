@@ -1,6 +1,19 @@
+import type { JSONSchema } from "@tanstack/ai";
+
+export type ModelToolShape = Readonly<{
+  name: string;
+  description: string;
+  inputSchema: JSONSchema;
+}>;
+
 export type Environment = Readonly<Record<string, string | undefined>>;
 
-export type AtlassianToolPolicy = Readonly<{ required: boolean }>;
+export const defaultAtlassianEndpoint = "http://127.0.0.1:8000/mcp";
+export const discoveryToolName = "discover_atlassian_tools";
+
+export type ToolRoute = "direct" | "codemode";
+export type AtlassianToolPolicy = Readonly<{ required: boolean; routes?: readonly ToolRoute[] }>;
+export type AtlassianCatalog = ReadonlyMap<string, ModelToolShape>;
 
 export const atlassianTools: ReadonlyMap<string, AtlassianToolPolicy> = new Map([
   ["jira_get_issue", { required: true }],
@@ -12,7 +25,24 @@ export const atlassianTools: ReadonlyMap<string, AtlassianToolPolicy> = new Map(
 
 export const atlassianToolNames: readonly string[] = [...atlassianTools.keys()];
 
-export const defaultAtlassianEndpoint = "http://127.0.0.1:8000/mcp";
+const exposedToolNames = new Set(
+  [...atlassianTools]
+    .filter(([, policy]) => policy.required || policy.routes?.includes("direct"))
+    .map(([name]) => name),
+);
+
+export const exposedAtlassianToolNames: readonly string[] = [...exposedToolNames];
+
+export type AtlassianToolFactory = Readonly<{
+  names: readonly string[];
+  create: (catalog: AtlassianCatalog) => readonly ModelToolShape[];
+}>;
+
+export const atlassianToolFactory: AtlassianToolFactory = {
+  names: exposedAtlassianToolNames,
+  create: (catalog) =>
+    [...catalog].filter(([name]) => exposedToolNames.has(name)).map(([, definition]) => definition),
+};
 
 export type AtlassianConfiguration =
   | Readonly<{ mode: "local" }>
@@ -50,18 +80,27 @@ function jiraUrl(value: string): URL {
   return url;
 }
 
-const loopbackHosts = new Set(["127.0.0.1", "[::1]"]);
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "[::1]"]);
+const FORBIDDEN_ENDPOINT_FIELDS = ["username", "password", "search", "hash"] as const;
 
 function endpoint(value: string): string {
-  const url = URL.parse(value);
-  const valid =
-    url !== null &&
-    !/\s/.test(value) &&
-    url.protocol === "http:" &&
-    loopbackHosts.has(url.hostname) &&
-    [url.username, url.password, url.search, url.hash].every((part) => part === "");
+  let url: URL;
 
-  if (!valid) {
+  try {
+    url = new URL(value);
+  } catch {
+    return fail(
+      "ATLASSIAN_MCP_URL must be a loopback HTTP URL without credentials, query, or fragment",
+    );
+  }
+
+  if (
+    value !== value.trim() ||
+    /\s/.test(value) ||
+    url.protocol !== "http:" ||
+    !LOOPBACK_HOSTS.has(url.hostname) ||
+    FORBIDDEN_ENDPOINT_FIELDS.some((field) => Boolean(url[field]))
+  ) {
     return fail(
       "ATLASSIAN_MCP_URL must be a loopback HTTP URL without credentials, query, or fragment",
     );

@@ -54,7 +54,7 @@ test("an independent child has a close action but no nested fork control", () =>
     />,
   );
   assert.match(html, /關閉/);
-  assert.match(html, /附屬對話已建立/);
+  assert.match(html, /固定主對話快照/);
   assert.doesNotMatch(html, /開啟附屬對話/);
   const main = renderToStaticMarkup(
     <Pane pane={{ ...pane, kind: "main" }} onOpenAgentPane={() => {}} openDisabled />,

@@ -1,7 +1,13 @@
 {
   // This file is JSONC: fallow reads these comments; generic JSON tools may not.
   "$schema": "./node_modules/fallow/schema.json",
-  "entry": ["src/index.{ts,tsx,js,jsx}", "src/main.{ts,tsx,js,jsx}", "tests/verification/*.mjs"],
+  "entry": [
+    "src/index.{ts,tsx,js,jsx}",
+    "src/main.{ts,tsx,js,jsx}",
+    "tests/verification/*.mjs",
+    "demo-site/shop.js",
+    "demo-site/styles.css"
+  ],
   "ignorePatterns": ["docs/**/*.sketch.ts"],
   "ignoreExports": [{ "file": "components/ui/message.tsx", "exports": ["MessageGroup"] }],
   "duplicates": {

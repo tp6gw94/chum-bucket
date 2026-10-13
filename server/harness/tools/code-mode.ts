@@ -10,6 +10,8 @@ import {
   stripTypeScript,
   toolsToBindings,
   type CodeModeTool,
+  type CodeModeToolResult,
+  type IsolateContext,
   type IsolateDriver,
 } from "@tanstack/ai-code-mode";
 import { createQuickJSIsolateDriver } from "@tanstack/ai-isolate-quickjs";
@@ -66,6 +68,156 @@ const defaultPolicy: CodeModePolicy = {
 };
 
 const quickjsDriver: IsolateDriver = createQuickJSIsolateDriver();
+
+type Finish = (result: CodeModeToolResult, phase: string) => CodeModeToolResult;
+type Attempt<T> =
+  | Readonly<{ ok: true; value: T }>
+  | Readonly<{ ok: false; result: CodeModeToolResult }>;
+type ExecutionResult = Awaited<ReturnType<IsolateContext["execute"]>>;
+
+const consoleLevels = [
+  ["ERROR: ", "error"],
+  ["WARN: ", "warn"],
+  ["INFO: ", "info"],
+] as const;
+
+function failureResult(failure: unknown, name: string, useFailureName = false): CodeModeToolResult {
+  return {
+    success: false,
+    error: {
+      message: failure instanceof Error ? failure.message : String(failure),
+      name: useFailureName && failure instanceof Error ? failure.name : name,
+      ...(failure instanceof Error && failure.stack !== undefined ? { stack: failure.stack } : {}),
+    },
+  };
+}
+
+async function attempt<T>(
+  work: () => Promise<T>,
+  name: string,
+  useFailureName: boolean,
+): Promise<Attempt<T>> {
+  try {
+    return { ok: true, value: await work() };
+  } catch (failure) {
+    return { ok: false, result: failureResult(failure, name, useFailureName) };
+  }
+}
+
+function consoleEntry(log: string): Readonly<{ level: string; message: string }> {
+  const match = consoleLevels.find(([prefix]) => log.startsWith(prefix));
+
+  return match
+    ? { level: match[1], message: log.slice(match[0].length) }
+    : { level: "log", message: log };
+}
+
+function executionOutcome(executionResult: ExecutionResult): CodeModeToolResult {
+  if (executionResult.success) {
+    return { success: true, result: executionResult.value, logs: executionResult.logs };
+  }
+
+  const error = executionResult.error;
+
+  return {
+    success: false,
+    error: error
+      ? {
+          message: error.message,
+          name: error.name,
+          ...(error.stack !== undefined ? { stack: error.stack } : {}),
+        }
+      : { message: "Unknown execution error", name: "UnknownError" },
+    logs: executionResult.logs,
+  };
+}
+
+async function executeIsolated(
+  isolateContext: IsolateContext,
+  code: string,
+  emit: (name: string, payload: Record<string, unknown>) => void,
+): Promise<CodeModeToolResult> {
+  const executionResult = await isolateContext.execute(code);
+
+  for (const log of executionResult.logs ?? []) {
+    emit("code_mode:console", { ...consoleEntry(log), timestamp: Date.now() });
+  }
+
+  return executionOutcome(executionResult);
+}
+
+function finisher(
+  emit: (name: string, payload: Record<string, unknown>) => void,
+  startedAt: number,
+): Finish {
+  return (result, phase) => {
+    emit("code_mode:execution_finished", {
+      timestamp: Date.now(),
+      durationMs: Date.now() - startedAt,
+      phase,
+      success: result.success,
+      logCount: result.logs?.length ?? 0,
+      error: result.error,
+    });
+
+    return result;
+  };
+}
+
+async function executeWithoutBindings(
+  code: string,
+  policy: CodeModePolicy,
+  transpile: (code: string) => string | Promise<string>,
+  emit: (name: string, payload: Record<string, unknown>) => void,
+): Promise<CodeModeToolResult> {
+  const finish = finisher(emit, Date.now());
+  let isolateContext: IsolateContext | null = null;
+
+  if (!code) {
+    return finish(
+      {
+        success: false,
+        error: { message: "typescriptCode must be a non-empty string", name: "ValidationError" },
+      },
+      "validate-input",
+    );
+  }
+
+  emit("code_mode:execution_started", { timestamp: Date.now(), codeLength: code.length });
+
+  try {
+    const stripped = await attempt(async () => transpile(code), "TypeScriptError", false);
+
+    if (!stripped.ok) {
+      return finish(stripped.result, "transpile");
+    }
+
+    const created = await attempt(
+      () =>
+        quickjsDriver.createContext({
+          bindings: {},
+          timeout: policy.timeoutMs,
+          memoryLimit: policy.memoryLimitMb,
+        }),
+      "CreateContextError",
+      true,
+    );
+
+    if (!created.ok) {
+      return finish(created.result, "create-context");
+    }
+
+    isolateContext = created.value;
+
+    return finish(await executeIsolated(isolateContext, stripped.value, emit), "execute");
+  } catch (failure) {
+    return finish(failureResult(failure, "Error", true), "unhandled");
+  } finally {
+    if (isolateContext) {
+      await isolateContext.dispose();
+    }
+  }
+}
 
 const consoleRuntime = `(maxEntries, maxBytes, maxEntry) => {
   const seen = { entries: 0, bytes: 0 };
@@ -239,7 +391,7 @@ type CodeModeBoundary = Readonly<{
 
 type CustomEmit = ToolExecutionContext["emitCustomEvent"];
 type EmitOptions = Parameters<CustomEmit>[2];
-type ComposedCodeMode = ReturnType<typeof createCodeMode>;
+type ComposedCodeMode = ReturnType<typeof createCodeMode> | undefined;
 type CodeModeRequest = { typescriptCode: string };
 
 function stopped(state: CodeModeState): CodeModeBoundaryError {
@@ -477,7 +629,10 @@ function parseRequest(
     guarded(boundary, value);
     const parsed = parseWithStandardSchema<{ code: string }>(codeModeInputSchema, value);
     const request = { typescriptCode: parsed.code };
-    parseWithStandardSchema<CodeModeRequest>(composed.tool.inputSchema, request);
+
+    if (composed) {
+      parseWithStandardSchema<CodeModeRequest>(composed.tool.inputSchema, request);
+    }
 
     return request;
   } catch (failure) {
@@ -497,12 +652,23 @@ function runSandbox(
 ): Promise<unknown> {
   const emit = context.emitCustomEvent;
 
-  return composed.tool.execute!(request, {
-    ...context,
-    emitCustomEvent: (name, payload, options) => {
-      onSandboxEvent(boundary, emit, controller, name, payload, options);
+  if (composed) {
+    return composed.tool.execute!(request, {
+      ...context,
+      emitCustomEvent: (name, payload, options) => {
+        onSandboxEvent(boundary, emit, controller, name, payload, options);
+      },
+    });
+  }
+
+  return executeWithoutBindings(
+    request.typescriptCode,
+    boundary.policy,
+    (code) => transpileSource(boundary, code),
+    (name, payload) => {
+      onSandboxEvent(boundary, emit, controller, name, payload);
     },
-  });
+  );
 }
 
 async function executeTurn(
@@ -561,14 +727,17 @@ export function composeCodeModeTurn(input: {
     .map((definition) =>
       sandboxTool(boundary, input.dispatch, definition, input.outputSchemas?.get(definition.name)),
     );
-  const composed = createCodeMode({
-    driver: quickjsDriver,
-    tools: sandboxTools,
-    timeout: policy.timeoutMs,
-    memoryLimit: policy.memoryLimitMb,
-    onSecretParameter: "ignore",
-    transpile: (code: string) => transpileSource(boundary, code),
-  });
+  const composed =
+    sandboxTools.length > 0
+      ? createCodeMode({
+          driver: quickjsDriver,
+          tools: sandboxTools,
+          timeout: policy.timeoutMs,
+          memoryLimit: policy.memoryLimitMb,
+          onSecretParameter: "ignore",
+          transpile: (code: string) => transpileSource(boundary, code),
+        })
+      : undefined;
   const bindings = toolsToBindings(sandboxTools, "external_");
   const entries = Object.entries(bindings);
   const systemPrompt = codeModeSystemPrompt({

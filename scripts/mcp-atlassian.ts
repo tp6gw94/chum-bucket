@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { config as loadEnv } from "dotenv";
 import {
   atlassianToolNames,
@@ -54,54 +54,54 @@ function killGroup(pid: number, signal: NodeJS.Signals) {
   }
 }
 
-function launch(env: Environment) {
+const SERVICE_ARGS = [
+  "--from",
+  "mcp-atlassian==0.23.1",
+  "mcp-atlassian",
+  "--transport",
+  "streamable-http",
+  "--host",
+  "127.0.0.1",
+  "--port",
+  "8000",
+  "--path",
+  "/mcp",
+  "--read-only",
+  "--enabled-tools",
+  atlassianToolNames.join(","),
+];
+
+type ServiceConfiguration = Extract<
+  ReturnType<typeof readAtlassianConfiguration>,
+  { mode: "http" }
+>;
+
+function fail(message: string): undefined {
+  console.error(message);
+  process.exitCode = 1;
+
+  return undefined;
+}
+
+function serviceConfiguration(env: Environment): ServiceConfiguration | undefined {
   let configuration;
 
   try {
     configuration = readAtlassianConfiguration(env);
   } catch (failure) {
-    console.error(
-      failure instanceof Error ? failure.message : "Atlassian configuration is invalid",
-    );
-    process.exitCode = 1;
-
-    return;
+    return fail(failure instanceof Error ? failure.message : "Atlassian configuration is invalid");
   }
 
   if (configuration.mode === "local") {
-    console.error(
+    return fail(
       "Configure JIRA_BASE_URL, JIRA_EMAIL, and JIRA_API_TOKEN to start the Atlassian MCP service",
     );
-    process.exitCode = 1;
-
-    return;
   }
 
-  const child = spawn(
-    "uvx",
-    [
-      "--from",
-      "mcp-atlassian==0.23.1",
-      "mcp-atlassian",
-      "--transport",
-      "streamable-http",
-      "--host",
-      "127.0.0.1",
-      "--port",
-      "8000",
-      "--path",
-      "/mcp",
-      "--read-only",
-      "--enabled-tools",
-      atlassianToolNames.join(","),
-    ],
-    {
-      env: childEnvironment(env, configuration.serviceEnvironment),
-      cwd: process.cwd(),
-      detached: process.platform !== "win32",
-      stdio: ["ignore", "ignore", "ignore"],
-    },
-  );
+  return configuration;
+}
+
+function supervise(child: ChildProcess) {
   let terminating = false;
   let killer: NodeJS.Timeout | undefined;
 
@@ -145,6 +145,22 @@ function launch(env: Environment) {
     );
     process.exitCode = code ?? 1;
   });
+}
+
+function launch(env: Environment) {
+  const configuration = serviceConfiguration(env);
+
+  if (!configuration) {
+    return;
+  }
+
+  const child = spawn("uvx", SERVICE_ARGS, {
+    env: childEnvironment(env, configuration.serviceEnvironment),
+    cwd: process.cwd(),
+    detached: process.platform !== "win32",
+    stdio: ["ignore", "ignore", "ignore"],
+  });
+  supervise(child);
   console.log(`Starting Atlassian MCP service at ${SERVICE_URL}`);
 }
 

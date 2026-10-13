@@ -1,24 +1,18 @@
-import {
-  convertSchemaToJsonSchema,
-  type JSONSchema,
-  type ToolExecutionContext,
-  type UIMessage,
-} from "@tanstack/ai";
+import { convertSchemaToJsonSchema, type ToolExecutionContext, type UIMessage } from "@tanstack/ai";
 import { createMCPClient, type MCPClient } from "@tanstack/ai-mcp";
 import { z } from "zod";
 import type { ModelCall } from "../model-turn";
 import {
   atlassianTools,
+  discoveryToolName,
   readAtlassianConfiguration,
   type AtlassianConfiguration,
+  type AtlassianCatalog,
+  type ModelToolShape as ModelTool,
 } from "./atlassian-policy";
 
-export type ModelTool = Readonly<{
-  name: string;
-  description: string;
-  inputSchema: JSONSchema;
-}>;
-export type AtlassianCatalog = ReadonlyMap<string, ModelTool>;
+export { discoveryToolName };
+export type { AtlassianCatalog, ModelToolShape as ModelTool } from "./atlassian-policy";
 export type LocalToolHandler = (input: unknown, context: ToolExecutionContext) => Promise<unknown>;
 export type AtlassianScope = Readonly<{
   getModelTools: (
@@ -49,8 +43,6 @@ type RemoteSession = Readonly<{
 }>;
 
 const MCP_TIMEOUT_MS = 60_000;
-
-export const discoveryToolName = "discover_atlassian_tools";
 
 const discoveryRequestSchema = z.object({ toolNames: z.array(z.string()).min(1) }).strict();
 
@@ -679,10 +671,9 @@ async function invokeRemote(
     throw new ToolBoundaryError("Unknown tool");
   }
 
-  const output = await withAbort(
-    entry.handler(remoteToolInput(call), { ...context, abortSignal: signal }),
-    signal,
-  );
+  signal.throwIfAborted();
+  const output = await entry.handler(remoteToolInput(call), { ...context, abortSignal: signal });
+  signal.throwIfAborted();
   guardCredentials(output, config);
 
   return output;
@@ -747,112 +738,147 @@ async function runRemoteTool(
   }
 }
 
+type ScopeState = {
+  configuration: Promise<AtlassianConfiguration> | undefined;
+  remote: RemoteSession | undefined;
+  closed: boolean;
+};
+
+type HttpConfiguration = Extract<AtlassianConfiguration, { mode: "http" }>;
+
+function assertScopeOpen(state: ScopeState): void {
+  if (state.closed) {
+    throw new ToolBoundaryError("Tool scope is closed");
+  }
+}
+
+async function scopeConfiguration(
+  state: ScopeState,
+  signal: AbortSignal | undefined,
+): Promise<AtlassianConfiguration> {
+  const config = await (state.configuration ??= Promise.resolve().then(() =>
+    readAtlassianConfiguration(process.env),
+  ));
+  signal?.throwIfAborted();
+  assertScopeOpen(state);
+
+  return config;
+}
+
+function scopeRemote(state: ScopeState, config: HttpConfiguration): RemoteSession {
+  assertScopeOpen(state);
+
+  if (!state.remote) {
+    const controller = new AbortController();
+    const deadlines = new Set<AbortSignal>();
+    const session: RemoteSession = {
+      controller,
+      deadlines,
+      catalog: openRemote(config, controller, deadlines).catch((failure: unknown) => {
+        if (state.remote === session) {
+          state.remote = undefined;
+        }
+
+        throw failure;
+      }),
+    };
+    state.remote = session;
+  }
+
+  return state.remote;
+}
+
+async function retireSession(state: ScopeState, session: RemoteSession): Promise<void> {
+  if (state.remote === session) {
+    state.remote = undefined;
+  }
+
+  session.controller.abort();
+  const catalog = await session.catalog.catch(() => undefined);
+  await catalog?.close();
+}
+
+async function scopedModelTools(
+  state: ScopeState,
+  signal: AbortSignal | undefined,
+  messages: readonly UIMessage[],
+  compose: (remote: AtlassianCatalog) => ModelTool[],
+): Promise<ModelTool[]> {
+  const config = await scopeConfiguration(state, signal);
+  const session = config.mode === "http" ? scopeRemote(state, config) : undefined;
+
+  try {
+    const catalog = await session?.catalog;
+    const definitions = compose(selectDefinitions(catalog, grantedNames(messages, config)));
+    const advertised = advertisedTools(definitions, session, catalog);
+    guardCredentials(advertised, config);
+
+    return structuredClone(advertised);
+  } catch (failure) {
+    if (session) {
+      await retireSession(state, session);
+    }
+
+    guardCredentials(failure, config);
+    throw new Error(failure instanceof Error ? failure.message : "Tool composition failed");
+  }
+}
+
+async function scopedTool(
+  state: ScopeState,
+  signal: AbortSignal | undefined,
+  ...[messages, call, context, local]: Parameters<AtlassianScope["executeTool"]>
+): Promise<unknown> {
+  const config = await scopeConfiguration(state, signal);
+
+  if (local) {
+    return executeLocalTool(local, call, context, config);
+  }
+
+  if (config.mode === "local") {
+    throw new Error("Unknown tool");
+  }
+
+  const names = authorizeRemoteCall(messages, call, config);
+
+  if (context.abortSignal?.aborted) {
+    throw new ToolBoundaryError("Atlassian MCP tool was cancelled");
+  }
+
+  return runRemoteTool(
+    names,
+    call,
+    context,
+    config,
+    (remoteConfig) => scopeRemote(state, remoteConfig),
+    (session) => retireSession(state, session),
+  );
+}
+
 export async function withAtlassianScope<T>(
   use: (scope: AtlassianScope) => Promise<T>,
+  signal?: AbortSignal,
 ): Promise<T> {
-  let configuration: Promise<AtlassianConfiguration> | undefined;
-  let remote: RemoteSession | undefined;
-  let closed = false;
-
-  const getConfiguration = async () => {
-    const config = await (configuration ??= Promise.resolve().then(() =>
-      readAtlassianConfiguration(process.env),
-    ));
-
-    if (closed) {
-      throw new ToolBoundaryError("Tool scope is closed");
-    }
-
-    return config;
-  };
-
-  const getRemote = (config: Extract<AtlassianConfiguration, { mode: "http" }>) => {
-    if (closed) {
-      throw new ToolBoundaryError("Tool scope is closed");
-    }
-
-    if (!remote) {
-      const controller = new AbortController();
-      const deadlines = new Set<AbortSignal>();
-      const session: RemoteSession = {
-        controller,
-        deadlines,
-        catalog: openRemote(config, controller, deadlines).catch((failure: unknown) => {
-          if (remote === session) {
-            remote = undefined;
-          }
-
-          throw failure;
-        }),
-      };
-      remote = session;
-    }
-
-    return remote;
-  };
-
-  const retire = async (session: RemoteSession) => {
-    if (remote === session) {
-      remote = undefined;
-    }
-
-    session.controller.abort();
-    const catalog = await session.catalog.catch(() => undefined);
-    await catalog?.close();
-  };
+  const state: ScopeState = { configuration: undefined, remote: undefined, closed: false };
+  const onAbort = () => state.remote?.controller.abort();
+  signal?.addEventListener("abort", onAbort, { once: true });
 
   try {
     return await use({
       async guard() {
-        const config = await getConfiguration();
+        const config = await scopeConfiguration(state, signal);
 
         return (value: unknown) => guardCredentials(value, config);
       },
-      async getModelTools(messages, compose) {
-        const config = await getConfiguration();
-        const session = config.mode === "http" ? getRemote(config) : undefined;
-
-        try {
-          const catalog = await session?.catalog;
-          const definitions = compose(selectDefinitions(catalog, grantedNames(messages, config)));
-          const advertised = advertisedTools(definitions, session, catalog);
-          guardCredentials(advertised, config);
-
-          return structuredClone(advertised);
-        } catch (failure) {
-          if (session) {
-            await retire(session);
-          }
-
-          guardCredentials(failure, config);
-          throw new Error(failure instanceof Error ? failure.message : "Tool composition failed");
-        }
-      },
-      async executeTool(messages, call, context, local) {
-        const config = await getConfiguration();
-
-        if (local) {
-          return executeLocalTool(local, call, context, config);
-        }
-
-        if (config.mode === "local") {
-          throw new Error("Unknown tool");
-        }
-
-        const names = authorizeRemoteCall(messages, call, config);
-
-        if (context.abortSignal?.aborted) {
-          throw new ToolBoundaryError("Atlassian MCP tool was cancelled");
-        }
-
-        return runRemoteTool(names, call, context, config, getRemote, retire);
-      },
+      getModelTools: (messages, compose) => scopedModelTools(state, signal, messages, compose),
+      executeTool: (...args) => scopedTool(state, signal, ...args),
     });
   } finally {
-    closed = true;
+    state.closed = true;
+    signal?.removeEventListener("abort", onAbort);
 
-    if (remote) {
-      await retire(remote).catch(() => undefined);
+    if (state.remote) {
+      await retireSession(state, state.remote).catch(() => undefined);
     }
   }
 }

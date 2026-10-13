@@ -3,10 +3,10 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 
-const root = fileURLToPath(new URL("..", import.meta.url));
+const root = fileURLToPath(new URL("../..", import.meta.url));
 export default defineConfig({
   root,
-  envDir: fileURLToPath(new URL("./no-env", import.meta.url)),
+  envDir: fileURLToPath(new URL("../../scripts/no-env", import.meta.url)),
   plugins: [tailwindcss(), react({ compiler: true })],
   resolve: { alias: { "@": root } },
   server: {

@@ -8,8 +8,7 @@
     "dev:client": "vite",
     "dev:server": "tsx watch server/index.ts",
     "typecheck": "tsc -p tsconfig.json && tsc -p tests/tsconfig.json",
-    "check:contrast": "tsx scripts/check-contrast.ts",
-    "check:openui": "tsx scripts/check-openui-parse.ts",
+    "test": "node tests/runner.mjs",
     "prebuild": "pnpm run generate",
     "build": "vite build",
     "start": "tsx server/index.ts",
@@ -18,10 +17,10 @@
     "db:push": "drizzle-kit push",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
-    "lint:fix": "oxlint --fix-dangerously",
     "lint": "oxlint && fallow",
+    "lint:fix": "oxlint --fix-dangerously",
     "mcp:atlassian": "tsx scripts/mcp-atlassian.ts",
-    "test": "node tests/runner.mjs"
+    "dev:thread-browser": "vite --config tests/scripts/thread-browser-vite.mjs"
   },
   "dependencies": {
     "@base-ui/react": "^1.8.0",

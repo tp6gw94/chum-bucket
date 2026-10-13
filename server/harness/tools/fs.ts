@@ -1,6 +1,7 @@
 import { createReadTool, createWriteTool, createEditTool } from "@earendil-works/pi-coding-agent";
 import { toolDefinition, type ToolExecutionContext } from "@tanstack/ai";
 import { z } from "zod";
+import { Worker } from "node:worker_threads";
 
 const nativeRead = createReadTool(process.cwd());
 const nativeWrite = createWriteTool(process.cwd());
@@ -17,7 +18,7 @@ const editInput = z.object({
   edits: z.array(z.object({ oldText: z.string(), newText: z.string() })),
 });
 
-const fileOutput = z.object({
+export const fileToolOutput = z.object({
   content: z.array(
     z.union([
       z.object({ type: z.literal("text"), text: z.string() }),
@@ -38,16 +39,44 @@ export const read = toolDefinition({
   name: nativeRead.name,
   description: nativeRead.description,
   inputSchema: nativeRead.parameters,
-  outputSchema: fileOutput,
-}).server(async (input, context) =>
-  nativeRead.execute(requireToolCallId(context), readInput.parse(input), context?.abortSignal),
-);
+}).server(async (input, context) => {
+  context?.abortSignal?.throwIfAborted();
+  const worker = new Worker(new URL("./read-worker.mjs", import.meta.url), {
+    workerData: {
+      cwd: process.cwd(),
+      id: requireToolCallId(context),
+      input: readInput.parse(input),
+    },
+  });
+  let onAbort: (() => void) | undefined;
+
+  try {
+    return await new Promise<unknown>((resolve, reject) => {
+      onAbort = () => reject(new Error("Read was cancelled"));
+      context?.abortSignal?.addEventListener("abort", onAbort, { once: true });
+      worker.once("message", (message: { result?: unknown; error?: string }) =>
+        message.error ? reject(new Error(message.error)) : resolve(message.result),
+      );
+      worker.once("error", reject);
+      worker.once("exit", () => reject(new Error("Read worker exited")));
+
+      if (context?.abortSignal?.aborted) {
+        onAbort();
+      }
+    });
+  } finally {
+    if (onAbort) {
+      context?.abortSignal?.removeEventListener("abort", onAbort);
+    }
+
+    await worker.terminate();
+  }
+});
 
 export const write = toolDefinition({
   name: nativeWrite.name,
   description: nativeWrite.description,
   inputSchema: nativeWrite.parameters,
-  outputSchema: fileOutput,
 }).server(async (input, context) =>
   nativeWrite.execute(requireToolCallId(context), writeInput.parse(input), context?.abortSignal),
 );
@@ -56,7 +85,6 @@ export const edit = toolDefinition({
   name: nativeEdit.name,
   description: nativeEdit.description,
   inputSchema: nativeEdit.parameters,
-  outputSchema: fileOutput,
 }).server(async (input, context) =>
   nativeEdit.execute(requireToolCallId(context), editInput.parse(input), context?.abortSignal),
 );

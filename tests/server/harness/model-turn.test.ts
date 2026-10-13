@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { createServer } from "node:http";
+import { once } from "node:events";
 import { test } from "node:test";
 import { openaiCompatibleText } from "@tanstack/ai-openai/compatible";
 import { resolveDebugOption } from "@tanstack/ai/adapter-internals";
@@ -16,6 +18,244 @@ import {
 } from "../../../server/harness/model-turn";
 import type { ModelTool } from "../../../server/harness/tools/atlassian";
 
+test("offline HTTP SSE smoke exposes safe overflow and a complete provider response", async () => {
+  let requests = 0;
+  const server = createServer(async (request, response) => {
+    for await (const _chunk of request) {
+    }
+
+    requests++;
+
+    if (requests === 1) {
+      response.writeHead(400, { "Content-Type": "application/json" });
+      response.end(
+        JSON.stringify({
+          error: { code: "context_length_exceeded", message: "Private provider payload" },
+        }),
+      );
+
+      return;
+    }
+
+    response.writeHead(200, { "Content-Type": "text/event-stream" });
+    response.end(
+      [
+        {
+          choices: [
+            {
+              index: 0,
+              delta: { role: "assistant", content: "Recovered over HTTP" },
+              finish_reason: null,
+            },
+          ],
+        },
+        { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+      ]
+        .map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`)
+        .join("") + "data: [DONE]\n\n",
+    );
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const adapter = openaiCompatibleText("offline-model", {
+    apiKey: "offline",
+    baseURL: `http://127.0.0.1:${address.port}/v1`,
+  });
+  const invoke = () =>
+    streamModelTurn({
+      messages: [],
+      stream: adapter.chatStream({
+        model: "offline-model",
+        messages: [{ role: "user", content: "Continue" }],
+        tools: [],
+        logger: resolveDebugOption(false),
+      }),
+      append: async () => {},
+    });
+
+  try {
+    await assert.rejects(
+      invoke(),
+      (error: unknown) =>
+        error instanceof ContextOverflowError &&
+        error.message === "Model context capacity exceeded",
+    );
+    const result = await invoke();
+    assert.deepEqual(result.calls, []);
+    assert.deepEqual(
+      result.messages
+        .flatMap((message) => message.parts)
+        .filter((part) => part.type === "text")
+        .map((part) => part.content),
+      ["Recovered over HTTP"],
+    );
+    assert.equal(requests, 2);
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+  }
+});
+
+test("provider overflow classification is allowlisted for streamed and thrown failures", async () => {
+  const overflowMessage =
+    "This model's maximum context length is 8192 tokens. However, you requested 10000 tokens.";
+  const cases = [
+    {
+      error: { code: "context_length_exceeded", message: "private provider diagnostic" },
+      overflow: true,
+    },
+    {
+      error: { error: { code: "max_context_length_exceeded" }, message: "private" },
+      overflow: true,
+    },
+    { error: { code: "400", message: overflowMessage }, overflow: true },
+    { error: { message: overflowMessage }, overflow: true },
+    { error: { code: "invalid_request_error", message: overflowMessage }, overflow: false },
+    { error: { code: "429", message: overflowMessage }, overflow: false },
+    {
+      error: { status: 503, code: "context_length_exceeded", message: "Unavailable" },
+      overflow: false,
+    },
+    { error: { status: 401, code: "context_length_exceeded", message: "Denied" }, overflow: false },
+    { error: { code: "ECONNRESET", message: overflowMessage }, overflow: false },
+    { error: { code: "context_length_exceeded", message: "Rate limit exceeded" }, overflow: false },
+    { error: { message: "Input too long" }, overflow: false },
+  ];
+
+  for (const fixture of cases) {
+    for (const streamed of [false, true]) {
+      const failure = Object.assign(new Error(fixture.error.message), fixture.error);
+
+      async function* stream(): AsyncGenerator<AdapterYieldChunk> {
+        if (streamed) {
+          yield { type: EventType.RUN_ERROR, message: failure.message, rawEvent: failure };
+        } else {
+          throw failure;
+        }
+      }
+
+      await assert.rejects(
+        streamModelTurn({ messages: [], stream: stream(), append: async () => {} }),
+        (error: unknown) => {
+          assert.equal(
+            error instanceof ContextOverflowError,
+            fixture.overflow,
+            JSON.stringify(fixture),
+          );
+
+          if (fixture.overflow) {
+            assert.equal((error as Error).message, "Model context capacity exceeded");
+          }
+
+          return true;
+        },
+      );
+    }
+  }
+});
+
+test("local append and protected-history failures never become provider overflow", async () => {
+  const failure = Object.assign(new Error("context_length_exceeded"), {
+    code: "context_length_exceeded",
+  });
+
+  async function* stream(): AsyncGenerator<AdapterYieldChunk> {
+    yield { type: EventType.TEXT_MESSAGE_START, messageId: "fresh", role: "assistant" };
+  }
+
+  await assert.rejects(
+    streamModelTurn({
+      messages: [],
+      stream: stream(),
+      append: async () => {
+        throw failure;
+      },
+    }),
+    (error: unknown) => error === failure,
+  );
+
+  async function* collision(): AsyncGenerator<AdapterYieldChunk> {
+    yield { type: EventType.TEXT_MESSAGE_START, messageId: "archived", role: "assistant" };
+  }
+
+  await assert.rejects(
+    streamModelTurn({
+      messages: [],
+      protectedMessages: [{ id: "archived", role: "assistant", parts: [] }],
+      stream: collision(),
+      append: async () => {},
+    }),
+    /collides with conversation history/,
+  );
+});
+
+test("iterator cleanup preserves primary provider and local failures", async () => {
+  const overflow = Object.assign(new Error("private overflow"), {
+    code: "context_length_exceeded",
+  });
+  const ordinary = new Error("ordinary provider failure");
+  const local = Object.assign(new Error("local failure"), { code: "context_length_exceeded" });
+
+  for (const fixture of [
+    { source: "next", failure: overflow, overflow: true },
+    { source: "next", failure: ordinary, overflow: false },
+    { source: "append", failure: local, overflow: false },
+    { source: "event", failure: overflow, overflow: true },
+  ]) {
+    let closed = false;
+    const stream: AsyncIterable<AdapterYieldChunk> = {
+      [Symbol.asyncIterator]() {
+        return {
+          async next() {
+            if (fixture.source === "next") {
+              throw fixture.failure;
+            }
+
+            const value: AdapterYieldChunk =
+              fixture.source === "event"
+                ? {
+                    type: EventType.RUN_ERROR,
+                    message: fixture.failure.message,
+                    rawEvent: fixture.failure,
+                  }
+                : { type: EventType.TEXT_MESSAGE_START, messageId: "fresh", role: "assistant" };
+
+            return { done: false, value };
+          },
+          async return() {
+            closed = true;
+            throw Object.assign(new Error("cleanup failure"), { code: "context_length_exceeded" });
+          },
+        };
+      },
+    };
+    await assert.rejects(
+      streamModelTurn({
+        messages: [],
+        stream,
+        append: async () => {
+          throw fixture.failure;
+        },
+      }),
+      (error: unknown) => {
+        if (fixture.overflow) {
+          assert.ok(error instanceof ContextOverflowError);
+          assert.equal(error.message, "Model context capacity exceeded");
+        } else {
+          assert.equal(error, fixture.failure);
+        }
+
+        return true;
+      },
+    );
+    assert.equal(closed, true);
+  }
+});
+
 type ToolCallEnd = Extract<StreamChunk, { type: "TOOL_CALL_END" }>;
 
 const messages: UIMessage[] = [
@@ -31,6 +271,7 @@ function compatibleStream(definition: ModelTool, argumentsJson: string, strict: 
         tools: { function: { name: string; strict?: boolean } }[];
       };
       assert.equal(body.tools[0]?.function.strict, strict);
+
       return new Response(
         [
           {
@@ -59,6 +300,7 @@ function compatibleStream(definition: ModelTool, argumentsJson: string, strict: 
       );
     },
   });
+
   return adapter.chatStream({
     model: "offline-model",
     messages: convertMessagesToModelMessages(messages),
@@ -277,38 +519,3 @@ for (const argumentsJson of ["{", "", "null", "[]", '"text"', "1", "true"]) {
     );
   });
 }
-
-test("context overflow is recognized whether the provider throws or streams RUN_ERROR", async () => {
-  const overflowText =
-    "This model's maximum context length is 131072 tokens. However, you requested 140000 tokens.";
-  const thrown = (error: unknown) =>
-    streamModelTurn({
-      messages: [],
-      stream: (async function* () {
-        throw error;
-      })(),
-      append: async () => {},
-    });
-  const streamed = (event: Record<string, unknown>) =>
-    streamModelTurn({
-      messages: [],
-      stream: (async function* () {
-        yield { type: "RUN_ERROR", ...event } as never;
-      })(),
-      append: async () => {},
-    });
-
-  await assert.rejects(thrown({ code: "context_length_exceeded" }), ContextOverflowError);
-  await assert.rejects(thrown({ status: 400, message: overflowText }), ContextOverflowError);
-  await assert.rejects(streamed({ message: overflowText }), ContextOverflowError);
-  await assert.rejects(streamed({ message: overflowText, code: "400" }), ContextOverflowError);
-
-  for (const error of [
-    { status: 429, message: overflowText },
-    { status: 503, message: "Service Unavailable" },
-    new TypeError("fetch failed"),
-    { status: 400, message: "Invalid tool schema" },
-  ]) {
-    await assert.rejects(thrown(error), (cause) => !(cause instanceof ContextOverflowError));
-  }
-});

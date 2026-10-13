@@ -1,29 +1,23 @@
 import {
   convertSchemaToJsonSchema,
-  type JSONSchema,
-  type SchemaInput,
+  parseWithStandardSchema,
   type Tool,
   type ToolExecutionContext,
   type UIMessage,
 } from "@tanstack/ai";
+import { agentRegistry, allowsTool } from "../agents";
 import type { ModelCall } from "../model-turn";
 import {
   withAtlassianScope,
   ToolBoundaryError,
-  type AtlassianCatalog,
   type LocalToolHandler,
   type ModelTool,
 } from "./atlassian";
-import { atlassianOutputSchemas } from "./atlassian-output";
 import { codeModeToolName, composeCodeModeTurn } from "./code-mode";
-import { getFigma } from "./get-figma";
-import { read, write, edit } from "./fs";
+import { toolOutputSchemas } from "./output-schemas";
+import { DELEGATE_TASK_TOOL } from "./delegate-task";
 
-type Registration = Readonly<{
-  definition: ModelTool;
-  handler: LocalToolHandler;
-}>;
-type Catalog = ReadonlyMap<string, Registration>;
+export { DELEGATE_TASK_TOOL };
 
 export type ModelToolTurn = Readonly<{
   definitions: ModelTool[];
@@ -39,73 +33,52 @@ export type RunTools = Readonly<{
   ) => Promise<unknown>;
 }>;
 
-function jsonSchemaOf(schema: SchemaInput | undefined): JSONSchema {
-  const converted = convertSchemaToJsonSchema(schema);
+function modelDefinition(tool: Pick<Tool, "name" | "description" | "inputSchema">): ModelTool {
+  const inputSchema = convertSchemaToJsonSchema(tool.inputSchema);
 
-  if (!converted) {
+  if (!inputSchema) {
     throw new ToolBoundaryError("Tool schema is unavailable");
   }
 
-  return converted;
+  return { name: tool.name, description: tool.description, inputSchema };
 }
 
-function registration(
-  tool: Pick<Tool, "name" | "description" | "inputSchema">,
-  handler: Registration["handler"],
-): Registration {
-  return {
-    definition: {
-      name: tool.name,
-      description: tool.description,
-      inputSchema: jsonSchemaOf(tool.inputSchema),
-    },
-    handler,
-  };
+function localHandler(tool: Tool): LocalToolHandler {
+  return async (input, context) =>
+    tool.execute!(parseWithStandardSchema(tool.inputSchema, input), context);
 }
 
-const localCatalog: Catalog = new Map(
-  [
-    registration(getFigma, async (input, context) =>
-      getFigma.execute!(getFigma.inputSchema.parse(input), context),
-    ),
-    registration(read, async (input, context) => read.execute!(input, context)),
-    registration(write, async (input, context) => write.execute!(input, context)),
-    registration(edit, async (input, context) => edit.execute!(input, context)),
-  ].map((entry) => [entry.definition.name, entry]),
-);
-
-const outputSchemas: ReadonlyMap<string, JSONSchema> = new Map(
-  [
-    ...atlassianOutputSchemas,
-    ...[read, write, edit].map((tool) => [tool.name, tool.outputSchema] as const),
-  ].map(([name, schema]) => [name, jsonSchemaOf(schema)]),
-);
-
-function mergeLocalDefinitions(remote: AtlassianCatalog): ModelTool[] {
-  const definitions = new Map([...localCatalog].map(([name, entry]) => [name, entry.definition]));
-
-  for (const [name, definition] of remote) {
-    if (definitions.has(name)) {
-      throw new ToolBoundaryError("Atlassian MCP catalog is invalid");
-    }
-
-    definitions.set(name, definition);
-  }
-
-  return [...definitions.values()];
-}
-
-export async function withRunTools<T>(use: (tools: RunTools) => Promise<T>): Promise<T> {
+export async function withRunTools<T>(
+  use: (tools: RunTools) => Promise<T>,
+  signal?: AbortSignal,
+  runScope: "main" | "side" = "main",
+): Promise<T> {
   return withAtlassianScope(async (scope) => {
     const pending = new Set<Promise<unknown>>();
 
     const dispatchFor =
       (messages: readonly UIMessage[]) => (call: ModelCall, context: ToolExecutionContext) => {
+        context.abortSignal?.throwIfAborted();
+        signal?.throwIfAborted();
+
+        if (call.name === "run_tests") {
+          throw new ToolBoundaryError("run_tests is retired; use delegate_task");
+        }
+
+        if (call.name === DELEGATE_TASK_TOOL) {
+          throw new ToolBoundaryError("delegate_task is direct-only on the main run");
+        }
+
+        if (!allowsTool("main", call.name, "direct")) {
+          throw new ToolBoundaryError("Unknown tool");
+        }
+
+        const tool = agentRegistry.main.tools.find((reference) => reference.name === call.name);
         const work = scope.executeTool(
           messages,
           call,
           context,
-          localCatalog.get(call.name)?.handler,
+          tool?.execute ? localHandler(tool) : undefined,
         );
         pending.add(work);
         void work.then(
@@ -117,16 +90,24 @@ export async function withRunTools<T>(use: (tools: RunTools) => Promise<T>): Pro
       };
 
     const buildTurn = async (messages: readonly UIMessage[]) => {
-      const definitions = await scope.getModelTools(messages, mergeLocalDefinitions);
+      const definitions = agentRegistry.main.tools.map(modelDefinition);
+      const bindable = definitions.filter((definition) =>
+        allowsTool("main", definition.name, "codemode"),
+      );
+      const advertised = definitions.filter(
+        (definition) =>
+          allowsTool("main", definition.name, "codemode") ||
+          (runScope === "main" && allowsTool("main", definition.name, "direct")),
+      );
       const guard = await scope.guard();
       const turn = composeCodeModeTurn({
-        definitions,
+        definitions: bindable,
         dispatch: dispatchFor(messages),
         guard,
-        outputSchemas,
+        outputSchemas: toolOutputSchemas,
       });
 
-      return { definitions, turn };
+      return { definitions: advertised, turn };
     };
 
     try {
@@ -140,6 +121,10 @@ export async function withRunTools<T>(use: (tools: RunTools) => Promise<T>): Pro
           };
         },
         async executeTool(messages, call, context) {
+          if (call.name === DELEGATE_TASK_TOOL) {
+            throw new ToolBoundaryError("delegate_task is direct-only on the main run");
+          }
+
           if (call.name !== codeModeToolName) {
             return dispatchFor(messages)(call, context);
           }
@@ -152,5 +137,5 @@ export async function withRunTools<T>(use: (tools: RunTools) => Promise<T>): Pro
     } finally {
       await Promise.allSettled(pending);
     }
-  });
+  }, signal);
 }
