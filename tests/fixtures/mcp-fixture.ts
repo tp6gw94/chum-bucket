@@ -4,9 +4,9 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import type { AddressInfo } from "node:net";
 import { setTimeout as delay } from "node:timers/promises";
 
-const fakeEmail = "mcp-test@example.invalid";
+export const fakeEmail = "mcp-test@example.invalid";
 export const fakeToken = "offline-atlassian-token-7319";
-const fakeBaseUrl = "https://offline.atlassian.net";
+export const fakeBaseUrl = "https://offline.atlassian.net";
 export const jiraSchema = {
   type: "object" as const,
   properties: {
@@ -27,7 +27,7 @@ type WireTool = {
   inputSchema: Record<string, unknown>;
   outputSchema?: Record<string, unknown>;
 };
-const coreTools: WireTool[] = [
+export const coreTools: WireTool[] = [
   {
     name: "jira_get_issue",
     description: "Read an issue",

@@ -24,7 +24,7 @@ test("thread API rejects invalid creation and lookup requests", async () => {
   assert.equal(lookup.status, 400);
 });
 
-test("thread creation accepts only an empty object and stores an empty transcript", async () => {
+test("thread creation accepts only an empty object and stores an empty revision", async () => {
   let stored: unknown;
   const id = "d08035f1-07df-49f3-b2d0-5cf5cb2b1e74";
   const insert = mock.method(
@@ -35,7 +35,7 @@ test("thread creation accepts only an empty object and stores an empty transcrip
         values(value: { title: string; messages: unknown[] }) {
           stored = value;
           return {
-            returning: async () => [{ id, ...value, updated_at: new Date(0) }],
+            returning: async () => [{ id, ...value, revision: 0, updated_at: new Date(0) }],
           };
         },
       }) as unknown as ReturnType<typeof db.insert>,
@@ -52,6 +52,7 @@ test("thread creation accepts only an empty object and stores an empty transcrip
       id,
       title: "新對話",
       messages: [],
+      revision: 0,
       updatedAt: new Date(0).toISOString(),
     });
   } finally {

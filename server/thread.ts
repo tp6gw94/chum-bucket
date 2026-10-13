@@ -30,6 +30,7 @@ app.post("/", async (c) => {
     title: thread.title,
     messages: thread.messages,
     updatedAt: thread.updated_at,
+    revision: thread.revision,
   });
 });
 
@@ -54,6 +55,7 @@ app.get("/:threadId", async (c) => {
     .select({
       id: threadsTable.id,
       messages: threadsTable.messages,
+      revision: threadsTable.revision,
     })
     .from(threadsTable)
     .where(eq(threadsTable.id, threadId));

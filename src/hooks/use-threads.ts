@@ -256,12 +256,22 @@ export function useThread(threadId: string) {
     let submitted = false;
 
     try {
+      const response = await fetch(`/api/thread/${encodeURIComponent(threadId)}`);
+
+      if (!response.ok) {
+        throw new Error(`載入對話失敗（HTTP ${response.status}）`);
+      }
+
+      const { revision } = z
+        .object({ revision: z.number().int().nonnegative() })
+        .parse(await response.json());
+
       if (!owner.mounted) {
         throw new Error("頁面已離開");
       }
 
       submitted = true;
-      await chat.sendMessage(text);
+      await chat.sendMessage(text, { body: { baseRevision: revision } });
     } catch (cause) {
       if (!submitted) {
         publish("ready");
