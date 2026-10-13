@@ -74,13 +74,16 @@ function scriptedSession(steps: Step[]) {
       })();
     },
     tools: {
-      getModelTools: async () => [
-        {
-          name: "jira_get_issue",
-          description: "Read an issue",
-          inputSchema: { type: "object", properties: { issue_key: { type: "string" } } },
-        },
-      ],
+      getModelTools: async () => ({
+        definitions: [
+          {
+            name: "jira_get_issue",
+            description: "Read an issue",
+            inputSchema: { type: "object", properties: { issue_key: { type: "string" } } },
+          },
+        ],
+        systemPrompt: "",
+      }),
       executeTool: async (_messages, call) => {
         counts.tool++;
         return { issue: (call.input as { issue_key: string }).issue_key };

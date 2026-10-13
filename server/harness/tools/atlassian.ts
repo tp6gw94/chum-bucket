@@ -31,6 +31,7 @@ export type AtlassianScope = Readonly<{
     context: ToolExecutionContext,
     local: LocalToolHandler | undefined,
   ) => Promise<unknown>;
+  guard: () => Promise<(value: unknown) => void>;
 }>;
 
 type RemoteRegistration = Readonly<{
@@ -49,7 +50,7 @@ type RemoteSession = Readonly<{
 
 const MCP_TIMEOUT_MS = 60_000;
 
-const discoveryToolName = "discover_atlassian_tools";
+export const discoveryToolName = "discover_atlassian_tools";
 
 const discoveryRequestSchema = z.object({ toolNames: z.array(z.string()).min(1) }).strict();
 
@@ -87,7 +88,7 @@ function discoveryDefinition(names: readonly string[]): ModelTool {
   };
 }
 
-class ToolBoundaryError extends Error {}
+export class ToolBoundaryError extends Error {}
 
 function parseDiscoveryRequest(argumentsText: string): readonly string[] | undefined {
   let parsed: unknown;
@@ -448,6 +449,23 @@ function assertCatalogEntry(
   }
 }
 
+function unwrapResult(tool: McpToolList[number], output: unknown): unknown {
+  const wrapped = (tool.outputSchema as Record<string, unknown> | undefined)?.[
+    "x-fastmcp-wrap-result"
+  ];
+  const result = (output as { result?: unknown } | undefined)?.result;
+
+  if (wrapped !== true || typeof result !== "string") {
+    return output;
+  }
+
+  try {
+    return JSON.parse(result);
+  } catch {
+    return result;
+  }
+}
+
 function remoteRegistration(tool: McpToolList[number]): RemoteRegistration {
   const inputSchema = convertSchemaToJsonSchema(tool.inputSchema);
 
@@ -457,7 +475,7 @@ function remoteRegistration(tool: McpToolList[number]): RemoteRegistration {
 
   return {
     definition: { name: tool.name, description: tool.description, inputSchema },
-    handler: async (input, context) => tool.execute!(input, context),
+    handler: async (input, context) => unwrapResult(tool, await tool.execute!(input, context)),
   };
 }
 
@@ -613,6 +631,11 @@ async function executeLocalTool(
     return output;
   } catch (failure) {
     guardCredentials(failure, config);
+
+    if (failure instanceof ToolBoundaryError) {
+      throw failure;
+    }
+
     throw new Error(failure instanceof Error ? failure.message : "Tool failed");
   }
 }
@@ -780,6 +803,11 @@ export async function withAtlassianScope<T>(
 
   try {
     return await use({
+      async guard() {
+        const config = await getConfiguration();
+
+        return (value: unknown) => guardCredentials(value, config);
+      },
       async getModelTools(messages, compose) {
         const config = await getConfiguration();
         const session = config.mode === "http" ? getRemote(config) : undefined;

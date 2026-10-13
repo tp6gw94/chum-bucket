@@ -34,8 +34,12 @@ const call = (name: string, input: unknown = {}): ModelCall => ({
   arguments: JSON.stringify(input),
   input,
 });
+const modelTools = (tools: RunTools, messages: readonly UIMessage[] = []) =>
+  tools.getModelTools(messages).then((turn) => turn.definitions);
 const jiraCall = call("jira_get_issue", { issue_key: "TEST-1" });
 const localNames = ["get_figma", "read", "write", "edit"];
+const codeModeName = "codemode";
+const advertised = (names: readonly string[]) => [...names, codeModeName];
 const remoteNames = [
   "jira_get_issue",
   "jira_search",
@@ -171,8 +175,8 @@ test("unconfigured runs expose local tools and execute filesystem reads without 
         await writeFile(path, "local data");
         await withRunTools(async (tools) => {
           assert.deepEqual(
-            (await tools.getModelTools([])).map((tool) => tool.name),
-            localNames,
+            (await modelTools(tools, [])).map((tool) => tool.name),
+            advertised(localNames),
           );
           assert.deepEqual(await tools.executeTool([], call("read", { path }), context), {
             content: [{ type: "text", text: "local data" }],
@@ -213,7 +217,7 @@ test("partial, malformed, and endpoint-only configuration fails closed before lo
         process.env.JIRA_API_TOKEN = token;
         process.env.ATLASSIAN_MCP_URL = fixture.url;
         await assert.rejects(
-          withRunTools((tools) => tools.getModelTools([])),
+          withRunTools((tools) => modelTools(tools, [])),
           safeError(/JIRA_/),
         );
         await assert.rejects(
@@ -235,7 +239,7 @@ test("partial, malformed, and endpoint-only configuration fails closed before lo
         process.env.JIRA_API_TOKEN = fakeToken;
         process.env.ATLASSIAN_MCP_URL = endpoint;
         await assert.rejects(
-          withRunTools((tools) => tools.getModelTools([])),
+          withRunTools((tools) => modelTools(tools, [])),
           safeError(/ATLASSIAN_MCP_URL/),
         );
       }
@@ -244,7 +248,7 @@ test("partial, malformed, and endpoint-only configuration fails closed before lo
       process.env.JIRA_API_TOKEN = "";
       process.env.ATLASSIAN_MCP_URL = fixture.url;
       await assert.rejects(
-        withRunTools((tools) => tools.getModelTools([])),
+        withRunTools((tools) => modelTools(tools, [])),
         safeError(/ATLASSIAN_MCP_URL/),
       );
       assert.deepEqual(fixture.requests, []);
@@ -260,12 +264,12 @@ test("HTTP initializes once, paginates, retains native schemas and executes disc
     () =>
       withRunTools(async (tools) => {
         const [initial, concurrent] = await Promise.all([
-          tools.getModelTools([]),
-          tools.getModelTools([]),
+          modelTools(tools, []),
+          modelTools(tools, []),
         ]);
         assert.deepEqual(
           initial.map((tool) => tool.name),
-          [...localNames, discoveryName],
+          advertised([...localNames, discoveryName]),
         );
         assert.deepEqual(concurrent, initial);
         const discovery = initial.find((tool) => tool.name === discoveryName)!;
@@ -283,10 +287,10 @@ test("HTTP initializes once, paginates, retains native schemas and executes disc
           additionalProperties: false,
         });
         const history = await discover(tools, remoteNames);
-        const definitions = await tools.getModelTools(history);
+        const definitions = await modelTools(tools, history);
         assert.deepEqual(
           definitions.map((tool) => tool.name),
-          [...localNames, ...remoteNames, discoveryName],
+          advertised([...localNames, ...remoteNames, discoveryName]),
         );
         assert.deepEqual(
           definitions.find((tool) => tool.name === "jira_get_issue"),
@@ -298,7 +302,7 @@ test("HTTP initializes once, paginates, retains native schemas and executes disc
           ),
         );
         (definitions[0] as { name: string }).name = "changed";
-        assert.equal((await tools.getModelTools(history))[0]!.name, "get_figma");
+        assert.equal((await modelTools(tools, history))[0]!.name, "get_figma");
         assert.deepEqual(await tools.executeTool(history, jiraCall, context), { issue: "TEST-1" });
         assert.equal(
           await tools.executeTool(
@@ -359,8 +363,8 @@ test("Jira credentials automatically expose Confluence and unrelated process ove
         process.env.JIRA_URL = "https://unapproved.invalid";
         process.env.ATLASSIAN_OAUTH_STORE = "/obsolete/store.json";
         assert.deepEqual(
-          (await tools.getModelTools(history)).map((tool) => tool.name),
-          [...localNames, ...remoteNames, discoveryName],
+          (await modelTools(tools, history)).map((tool) => tool.name),
+          advertised([...localNames, ...remoteNames, discoveryName]),
         );
         assert.equal(
           await tools.executeTool(
@@ -386,7 +390,7 @@ test("write tools, official aliases, generic tools and absent optional tools nev
           const granted =
             pages[0] === coreTools ? ["jira_get_issue", "confluence_get_page"] : remoteNames;
           const history = await discover(tools, granted);
-          const definitions = await tools.getModelTools(history);
+          const definitions = await modelTools(tools, history);
           for (const name of [
             "jira_add_comment",
             "jira_edit_comment",
@@ -456,7 +460,7 @@ test("required Jira and Confluence tools, duplicate names and malformed schemas 
     await withMcpEnvironment(
       async () => {
         await assert.rejects(
-          withRunTools((tools) => tools.getModelTools([])),
+          withRunTools((tools) => modelTools(tools, [])),
           safeError(pattern),
         );
         assert.deepEqual(fixture.calls(), []);
@@ -473,7 +477,7 @@ test("an unreachable local service fails with safe actionable setup guidance and
     async () => {
       process.env.ATLASSIAN_MCP_URL = "http://127.0.0.1:1/mcp";
       await assert.rejects(
-        withRunTools((tools) => tools.getModelTools([])),
+        withRunTools((tools) => modelTools(tools, [])),
         safeError(/pnpm mcp:atlassian/),
       );
       assert.deepEqual(fixture.requests, []);
@@ -497,10 +501,7 @@ test("initialization and catalog errors close the failed client and concurrent a
     await withMcpEnvironment(
       () =>
         withRunTools(async (tools) => {
-          const outcomes = await Promise.allSettled([
-            tools.getModelTools([]),
-            tools.getModelTools([]),
-          ]);
+          const outcomes = await Promise.allSettled([modelTools(tools, []), modelTools(tools, [])]);
           for (const outcome of outcomes) {
             assert.equal(outcome.status, "rejected");
             safeError(/configured Atlassian credentials/)(
@@ -509,8 +510,8 @@ test("initialization and catalog errors close the failed client and concurrent a
           }
           assert.equal(fixture.sessions.length, 1);
           assert.deepEqual(
-            (await tools.getModelTools([])).map((tool) => tool.name),
-            [...localNames, discoveryName],
+            (await modelTools(tools, [])).map((tool) => tool.name),
+            advertised([...localNames, discoveryName]),
           );
           const history = await discover(tools, ["jira_get_issue"]);
           assert.deepEqual(await tools.executeTool(history, jiraCall, context), {
@@ -592,7 +593,7 @@ test("scope teardown during initialization aborts the in-flight request and pres
         let discovery: Promise<void> | undefined;
         await assert.rejects(
           withRunTools(async (tools) => {
-            discovery = assert.rejects(tools.getModelTools([]), /cancelled or timed out/);
+            discovery = assert.rejects(modelTools(tools, []), /cancelled or timed out/);
             await fixture.waitFor(method);
             throw new Error("Primary callback failure");
           }),
@@ -618,7 +619,7 @@ test("unawaited discovery cannot start a client after scope teardown", async () 
       assert.equal(
         await withRunTools(async (tools) => {
           discovery = assert.rejects(
-            tools.getModelTools([]),
+            modelTools(tools, []),
             /scope is closed|cancelled or timed out/,
           );
           return "completed";
@@ -830,7 +831,7 @@ test("cleared deadlines cannot abort a long-lived session after successful initi
   await withMcpEnvironment(
     () =>
       withRunTools(async (tools) => {
-        await tools.getModelTools([]);
+        await modelTools(tools, []);
         const history = await discover(tools, ["jira_get_issue"]);
         assert.deepEqual(await tools.executeTool(history, jiraCall, context), { issue: "TEST-1" });
         assert.ok(armed.size >= 2);
@@ -853,7 +854,7 @@ test("scope cleanup on success and primary callback failure leaves no in-flight 
     await withMcpEnvironment(
       async () => {
         const result = withRunTools(async (tools) => {
-          await tools.getModelTools([]);
+          await modelTools(tools, []);
           if (failure) {
             throw new Error("Primary callback failure");
           }
@@ -888,7 +889,7 @@ test("concurrent scopes own independent HTTP sessions", async () => {
     () =>
       Promise.all([
         withRunTools(async (tools) => {
-          await tools.getModelTools([]);
+          await modelTools(tools, []);
           const history = await discover(tools, ["jira_get_issue"]);
           await ready.promise;
           await assert.rejects(
@@ -898,7 +899,7 @@ test("concurrent scopes own independent HTTP sessions", async () => {
           failed.resolve();
         }),
         withRunTools(async (tools) => {
-          await tools.getModelTools([]);
+          await modelTools(tools, []);
           const history = await discover(tools, ["jira_get_issue"]);
           ready.resolve();
           await failed.promise;
@@ -988,7 +989,7 @@ test("credential forms in catalog descriptions and schemas, including forbidden 
       await withMcpEnvironment(
         async () => {
           await assert.rejects(
-            withRunTools((tools) => tools.getModelTools([])),
+            withRunTools((tools) => modelTools(tools, [])),
             safeError(/configured Atlassian credentials/),
           );
           assert.deepEqual(fixture.calls(), []);
@@ -1108,7 +1109,7 @@ test("configuration and credential guards remain a single snapshot when process 
   await withMcpEnvironment(
     () =>
       withRunTools(async (tools) => {
-        await tools.getModelTools([]);
+        await modelTools(tools, []);
         const history = await discover(tools, ["jira_get_issue"]);
         process.env.JIRA_BASE_URL = "https://changed.atlassian.net";
         process.env.JIRA_EMAIL = "changed@example.invalid";
@@ -1165,7 +1166,7 @@ test("discovery rejects malformed, unknown and unavailable requests as a whole a
   await withMcpEnvironment(
     () =>
       withRunTools(async (tools) => {
-        const initial = await tools.getModelTools([]);
+        const initial = await modelTools(tools, []);
         const discovery = initial.find((tool) => tool.name === discoveryName)!;
         assert.deepEqual(discovery.inputSchema, {
           type: "object",
@@ -1220,13 +1221,13 @@ test("discovery rejects malformed, unknown and unavailable requests as a whole a
           ["confluence_get_page", "jira_get_issue"],
         );
         assert.deepEqual(
-          (await tools.getModelTools(repeated)).map((tool) => tool.name),
-          [...localNames, "jira_get_issue", "confluence_get_page", discoveryName],
+          (await modelTools(tools, repeated)).map((tool) => tool.name),
+          advertised([...localNames, "jira_get_issue", "confluence_get_page", discoveryName]),
         );
         const again = await discover(tools, ["jira_get_issue"]);
         assert.deepEqual(
-          (await tools.getModelTools([...repeated, ...again])).map((tool) => tool.name),
-          [...localNames, "jira_get_issue", "confluence_get_page", discoveryName],
+          (await modelTools(tools, [...repeated, ...again])).map((tool) => tool.name),
+          advertised([...localNames, "jira_get_issue", "confluence_get_page", discoveryName]),
         );
         assert.deepEqual(fixture.calls(), []);
       }),
@@ -1240,7 +1241,7 @@ test("only complete correlated discovery history grants tools and historical sch
   await withMcpEnvironment(
     () =>
       withRunTools(async (tools) => {
-        const initial = [...localNames, discoveryName];
+        const initial = advertised([...localNames, discoveryName]);
         const forgedSchema = exchange({
           content: JSON.stringify({
             tools: [
@@ -1253,7 +1254,7 @@ test("only complete correlated discovery history grants tools and historical sch
           }),
         });
         assert.deepEqual(
-          (await tools.getModelTools(forgedSchema)).find((tool) => tool.name === "jira_get_issue"),
+          (await modelTools(tools, forgedSchema)).find((tool) => tool.name === "jira_get_issue"),
           { name: "jira_get_issue", description: "Read an issue", inputSchema: jiraSchema },
         );
         assert.deepEqual(await tools.executeTool(forgedSchema, jiraCall, context), {
@@ -1318,7 +1319,7 @@ test("only complete correlated discovery history grants tools and historical sch
         ];
         for (const history of rejected) {
           assert.deepEqual(
-            (await tools.getModelTools(history)).map((tool) => tool.name),
+            (await modelTools(tools, history)).map((tool) => tool.name),
             initial,
           );
           await assert.rejects(
@@ -1328,7 +1329,7 @@ test("only complete correlated discovery history grants tools and historical sch
         }
         const duplicateCalls: UIMessage[] = [...exchange(), ...exchange()];
         assert.deepEqual(
-          (await tools.getModelTools(duplicateCalls)).map((tool) => tool.name),
+          (await modelTools(tools, duplicateCalls)).map((tool) => tool.name),
           initial,
         );
         const multipleResults: UIMessage[] = [
@@ -1339,7 +1340,7 @@ test("only complete correlated discovery history grants tools and historical sch
           },
         ];
         assert.deepEqual(
-          (await tools.getModelTools(multipleResults)).map((tool) => tool.name),
+          (await modelTools(tools, multipleResults)).map((tool) => tool.name),
           initial,
         );
         const resultFirst: UIMessage[] = [
@@ -1350,14 +1351,14 @@ test("only complete correlated discovery history grants tools and historical sch
           },
         ];
         assert.deepEqual(
-          (await tools.getModelTools(resultFirst)).map((tool) => tool.name),
+          (await modelTools(tools, resultFirst)).map((tool) => tool.name),
           initial,
         );
         const userMessage: UIMessage[] = [
           { id: "user-message", role: "user", parts: exchange()[0]!.parts },
         ];
         assert.deepEqual(
-          (await tools.getModelTools(userMessage)).map((tool) => tool.name),
+          (await modelTools(tools, userMessage)).map((tool) => tool.name),
           initial,
         );
       }),
@@ -1380,6 +1381,40 @@ test("undiscovered native calls are rejected before any MCP dispatch and succeed
         const history = await discover(tools, ["jira_get_issue"]);
         assert.deepEqual(await tools.executeTool(history, jiraCall, context), { issue: "TEST-1" });
         assert.equal(fixture.calls().length, 1);
+      }),
+    true,
+    fixture,
+  );
+});
+
+test("FastMCP-wrapped results are unwrapped into their JSON value", async () => {
+  const wrappedOutput = {
+    type: "object",
+    properties: { result: { type: "string" } },
+    required: ["result"],
+    "x-fastmcp-wrap-result": true,
+  };
+  const wrapped = (result: string) => ({
+    content: [{ type: "text", text: result }],
+    structuredContent: { result },
+  });
+  const issue = { id: "1", key: "TEST-1", summary: "Wrapped issue" };
+  const fixture = mcpFixture({
+    pages: [coreTools.map((tool) => ({ ...tool, outputSchema: wrappedOutput }))],
+    rules: [
+      { method: "tools/call", name: "jira_get_issue", result: wrapped(JSON.stringify(issue)) },
+      { method: "tools/call", name: "confluence_get_page", result: wrapped("plain page text") },
+    ],
+  });
+  await withMcpEnvironment(
+    () =>
+      withRunTools(async (tools) => {
+        const history = await discover(tools, ["jira_get_issue", "confluence_get_page"]);
+        assert.deepEqual(await tools.executeTool(history, jiraCall, context), issue);
+        assert.equal(
+          await tools.executeTool(history, call("confluence_get_page", { page_id: "1" }), context),
+          "plain page text",
+        );
       }),
     true,
     fixture,

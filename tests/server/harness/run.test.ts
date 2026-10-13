@@ -44,6 +44,8 @@ import {
 } from "../../../server/harness/run-store";
 
 const deferred = () => Promise.withResolvers<void>();
+const modelTools = (tools: RunTools, messages: readonly UIMessage[] = []) =>
+  tools.getModelTools(messages).then((turn) => turn.definitions);
 const readSchema = convertSchemaToJsonSchema(read.inputSchema);
 assert.ok(readSchema);
 const readDefinitions: ModelTool[] = [
@@ -963,7 +965,7 @@ test("real compatible adapter preserves native MCP schema advertisement and cano
     () =>
       withRunTools(async (tools) => {
         const history = await discoveryHistory(tools, ["jira_get_issue"]);
-        const definitions = await tools.getModelTools(history);
+        const definitions = await modelTools(tools, history);
         assert.deepEqual(
           definitions.find((tool) => tool.name === "jira_get_issue")!.inputSchema,
           jiraSchema,
@@ -1050,7 +1052,7 @@ test("representative confluence_search MCP catalog and real adapter dispatch can
     () =>
       withRunTools(async (tools) => {
         const history = await discoveryHistory(tools, ["confluence_search"]);
-        const definitions = await tools.getModelTools(history);
+        const definitions = await modelTools(tools, history);
         assert.deepEqual(
           definitions.find((tool) => tool.name === "confluence_search"),
           representativeConfluenceSearch,
@@ -1617,7 +1619,7 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
       }) {
         assert.deepEqual(
           options.tools?.map((tool) => tool.name),
-          ["get_figma", "read", "write", "edit"],
+          ["get_figma", "read", "write", "edit", "codemode"],
         );
         assert.ok(options.tools?.every((tool) => !("execute" in tool) && tool.inputSchema));
         if (rejectedStream) {
@@ -1891,7 +1893,7 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
         }) {
           assert.deepEqual(
             options.tools?.map((tool) => tool.name),
-            ["get_figma", "read", "write", "edit"],
+            ["get_figma", "read", "write", "edit", "codemode"],
           );
           assert.ok(options.tools?.every((tool) => !("execute" in tool) && tool.inputSchema));
           for (const native of [
@@ -2062,7 +2064,7 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
             if (!toolIds.length) {
               assert.deepEqual(
                 options.tools?.map((tool) => tool.name),
-                ["get_figma", "read", "write", "edit", "discover_atlassian_tools"],
+                ["get_figma", "read", "write", "edit", "discover_atlassian_tools", "codemode"],
               );
               yield {
                 type: EventType.TEXT_MESSAGE_START,
@@ -2093,6 +2095,7 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
                   "jira_search",
                   "confluence_get_page",
                   "discover_atlassian_tools",
+                  "codemode",
                 ],
               );
               assert.deepEqual(
