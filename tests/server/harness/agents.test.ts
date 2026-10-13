@@ -87,7 +87,12 @@ test("role definitions keep distinct responsibilities within their capabilities"
   assert.deepEqual(Object.keys(roleRegistry), ROLE_IDS);
   assert.deepEqual(
     ROLE_IDS.map((role) => [...toolNamesFor(role)].sort()),
-    [["confluence_get_page", "jira_get_issue"], [], ["verify_ac"], ["get_figma", "verify_ui"]],
+    [
+      ["confluence_get_page", "jira_add_comment", "jira_get_issue"],
+      [],
+      ["verify_ac"],
+      ["get_figma", "verify_ui"],
+    ],
   );
   assert.equal(new Set(ROLE_IDS.map((role) => roleRegistry[role].systemPrompt)).size, 4);
   assert.match(
@@ -338,6 +343,7 @@ test("registry tools are the advertised definitions and factories, not a name li
 test("QA roles keep their capability policy inside the shared registry", () => {
   assert.deepEqual([...toolNamesFor("atlassian")].sort(), [
     "confluence_get_page",
+    "jira_add_comment",
     "jira_get_issue",
   ]);
   assert.equal(allowsTool("atlassian", "discover_atlassian_tools", "direct"), true);

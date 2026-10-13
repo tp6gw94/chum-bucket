@@ -1,11 +1,20 @@
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
+import { DBOS } from "@dbos-inc/dbos-sdk";
 import { z } from "zod";
 import type { StreamChunk } from "@tanstack/ai";
 import { acceptRun } from "./harness/run";
+import { approvalDecisionKey, toolApprovalDecisionSchema } from "../shared/tool-approval";
+import type {
+  ToolApprovalDecision,
+  ToolApprovalRequest,
+  ToolApprovalView,
+} from "../shared/tool-approval";
 import {
   checkCursor,
   hydrateThread,
   observeRun,
+  readToolApprovalRequest,
+  readToolApprovals,
   RunRequestError,
   chatInputSchema,
   compactInputSchema,
@@ -161,6 +170,94 @@ compact.post("/", async (c) => {
   await checkCursor(input.runId, cursor);
 
   return eventResponse((signal) => observeRun(input.runId, cursor, signal), c.req.raw.signal);
+});
+
+function requireApprovalDecisionOrigin(c: Context) {
+  if (c.req.header("X-Tool-Approval") !== "1") {
+    throw new RunRequestError(409, "Same-origin main thread required");
+  }
+
+  const origin = c.req.header("Origin");
+  const referer = c.req.header("Referer");
+  const claimed = origin || (referer ? URL.parse(referer)?.origin : undefined);
+  const sameFetchSite = c.req.header("Sec-Fetch-Site") === "same-origin";
+  const sameOrigin = claimed !== undefined && claimed === new URL(c.req.url).origin;
+
+  if (!sameFetchSite && !sameOrigin) {
+    throw new RunRequestError(409, "Invalid approval origin");
+  }
+}
+
+async function approvalDecisionCommand(c: Context) {
+  const id = z.uuid().safeParse(c.req.param("id"));
+  const command = toolApprovalDecisionSchema.safeParse(await c.req.json().catch(() => null));
+
+  if (!id.success || !command.success) {
+    throw new RunRequestError(400, "Invalid approval decision");
+  }
+
+  return { approvalId: id.data, command: command.data };
+}
+
+function boundApproval(
+  view: ToolApprovalView | undefined,
+  command: ToolApprovalDecision,
+): view is ToolApprovalView {
+  return (
+    !!view &&
+    view.tool === command.tool &&
+    view.digest === command.digest &&
+    view.threadId === command.threadId
+  );
+}
+
+async function deliverApprovalDecision(
+  approval: ToolApprovalView,
+  request: ToolApprovalRequest,
+  approved: boolean,
+): Promise<void> {
+  try {
+    await DBOS.send(
+      request.childWorkflowId,
+      {
+        approvalId: approval.approvalId,
+        tool: approval.tool,
+        digest: approval.digest,
+        approved,
+      },
+      request.topic,
+      approvalDecisionKey(approval.approvalId),
+    );
+  } catch {
+    throw new RunRequestError(409, "Approval delivery was not accepted");
+  }
+}
+
+app.post("/approvals/:id/decision", async (c) => {
+  requireApprovalDecisionOrigin(c);
+
+  const { approvalId, command } = await approvalDecisionCommand(c);
+  const approval = (await readToolApprovals(command.threadId)).find(
+    (view) => view.approvalId === approvalId,
+  );
+
+  if (!boundApproval(approval, command)) {
+    throw new RunRequestError(409, "Approval request mismatch");
+  }
+
+  if (approval.state !== "pending") {
+    throw new RunRequestError(409, "Approval is no longer pending");
+  }
+
+  const request = await readToolApprovalRequest(command.threadId, approvalId);
+
+  if (!request) {
+    throw new RunRequestError(409, "Approval request mismatch");
+  }
+
+  await deliverApprovalDecision(approval, request, command.approved);
+
+  return c.json({ ok: true, approvalId });
 });
 
 app.post("/", async (c) => {

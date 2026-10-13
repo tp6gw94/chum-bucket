@@ -214,7 +214,11 @@ async function discoveryHistory(
 }
 
 test("role catalog derives from the domain authority", () => {
-  assert.deepEqual(testingRoleToolNames("atlassian"), ["jira_get_issue", "confluence_get_page"]);
+  assert.deepEqual(testingRoleToolNames("atlassian"), [
+    "jira_get_issue",
+    "jira_add_comment",
+    "confluence_get_page",
+  ]);
   assert.deepEqual(testingRoleToolNames("planner"), []);
   assert.deepEqual(testingRoleToolNames("ac"), ["verify_ac"]);
   assert.deepEqual(testingRoleToolNames("ui"), ["verify_ui", "get_figma"]);
@@ -313,6 +317,40 @@ test("role cancellation reaches zero-binding codemode before sandbox execution",
   assert.equal(harness.invocations.length, 0);
 });
 
+test("discovered comments have no actual Code Mode callable or stub", async () => {
+  const fixture = mcpFixture();
+  await withMcpEnvironment(
+    async () => {
+      const harness = fixtureHost({ fixture: hostFixture });
+      await withTestingRoleTools(
+        { role: "atlassian", intent, requirements: null, plan: null, host: harness.host },
+        async (tools) => {
+          const history = await discoveryHistory(tools, ["jira_add_comment"]);
+          const turn = await tools.getModelTools(history);
+          assert.ok(turn.definitions.some((definition) => definition.name === "jira_add_comment"));
+          assert.doesNotMatch(turn.systemPrompt, /external_jira_add_comment/);
+          const outcome = (await tools.executeTool(
+            history,
+            modelCall("codemode", { code: "return typeof external_jira_add_comment;" }),
+            context,
+          )) as { result: unknown };
+          assert.equal(outcome.result, "undefined");
+          assert.equal(
+            fixture.requests.filter(
+              (request) =>
+                request.message.method === "tools/call" &&
+                request.message.params?.name === "jira_add_comment",
+            ).length,
+            0,
+          );
+        },
+      );
+    },
+    true,
+    fixture,
+  );
+});
+
 test("atlassian role restricts discovery and reads and returns the raw read output", async () => {
   const fixture = mcpFixture();
   await withMcpEnvironment(
@@ -355,7 +393,11 @@ test("atlassian role restricts discovery and reads and returns the raw read outp
           const toolNames = (
             discovery.inputSchema.properties as Record<string, { items?: { enum?: unknown } }>
           ).toolNames;
-          assert.deepEqual(toolNames?.items?.enum, ["jira_get_issue", "confluence_get_page"]);
+          assert.deepEqual(toolNames?.items?.enum, [
+            "jira_get_issue",
+            "jira_add_comment",
+            "confluence_get_page",
+          ]);
           await assert.rejects(
             () =>
               tools.executeTool(
@@ -403,7 +445,7 @@ test("atlassian role restricts discovery and reads and returns the raw read outp
                 modelCall("jira_add_comment", { issue_key: "PROJ-1" }),
                 context,
               ),
-            /Unknown tool/,
+            /require durable orchestration approval/,
           );
           assert.equal(harness.invocations.length, 1);
 

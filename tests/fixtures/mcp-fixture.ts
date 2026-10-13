@@ -88,6 +88,16 @@ export const allTools: WireTool[] = [
   ].map((name) => ({
     name,
     description: `Native ${name}`,
+    ...(name === "jira_add_comment"
+      ? {
+          outputSchema: {
+            type: "object",
+            properties: { result: { type: "string" } },
+            required: ["result"],
+            "x-fastmcp-wrap-result": true,
+          },
+        }
+      : {}),
     inputSchema: { type: "object", properties: {} },
   })),
 ];

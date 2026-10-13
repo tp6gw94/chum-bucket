@@ -234,7 +234,12 @@ export function scriptedEvents(options, control = {}) {
 
     if (toolOutputs.length === 0) {
       return toolEvents(identity, "discover_atlassian_tools", {
-        toolNames: [...new Set(sources.map(readTool))],
+        toolNames: [
+          ...new Set([
+            ...sources.map(readTool),
+            ...(control.jiraComment ? ["jira_add_comment"] : []),
+          ]),
+        ],
       });
     }
 
@@ -248,6 +253,13 @@ export function scriptedEvents(options, control = {}) {
       const source = requested[reads];
 
       return toolEvents(identity, readTool(source), readInput(source));
+    }
+
+    if (control.jiraComment && reads === requested.length) {
+      return toolEvents(identity, "jira_add_comment", {
+        issue_key: "CHUM-42",
+        body: "Approval fixture **exact body**\nSecond line. No live Jira write.",
+      });
     }
 
     return textEvents(

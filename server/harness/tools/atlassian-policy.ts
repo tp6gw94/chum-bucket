@@ -17,6 +17,7 @@ export type AtlassianCatalog = ReadonlyMap<string, ModelToolShape>;
 
 export const atlassianTools: ReadonlyMap<string, AtlassianToolPolicy> = new Map([
   ["jira_get_issue", { required: true }],
+  ["jira_add_comment", { required: false, routes: ["direct"] }],
   ["jira_search", { required: false }],
   ["confluence_get_page", { required: true }],
   ["confluence_search", { required: false }],
@@ -157,10 +158,12 @@ export function readAtlassianConfiguration(env: Environment): AtlassianConfigura
       CONFLUENCE_URL: new URL("/wiki", jira).href,
       CONFLUENCE_USERNAME: email,
       CONFLUENCE_API_TOKEN: token,
-      READ_ONLY_MODE: "true",
+      READ_ONLY_MODE: "false",
+      ATLASSIAN_RETRY_TOTAL: "0",
+      ATLASSIAN_RETRY_INCLUDE_WRITES: "false",
       PYTHON_DOTENV_DISABLED: "1",
       ALLOW_GLOBAL_CRED_FALLBACK: "true",
-      TOOLSETS: "jira_issues,confluence_pages,confluence_comments",
+      TOOLSETS: "jira_issues,jira_comments,confluence_pages,confluence_comments",
       ENABLED_TOOLS: atlassianToolNames.join(","),
     },
     secrets: secretsFor(email, token),

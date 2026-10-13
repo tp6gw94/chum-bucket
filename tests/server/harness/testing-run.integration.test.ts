@@ -1016,6 +1016,7 @@ test(
     const result = await handle.getResult();
     assert.equal(result.state, "finished");
     assert.equal(result.task?.result, null);
+    assert.equal(result.comment, null);
     assert.equal(providerCalls.length, calls);
     const view = (await hydrateThread(thread.id)).publishedTasks[0]!;
     assert.deepEqual(view.progress.rows.atlassian, {

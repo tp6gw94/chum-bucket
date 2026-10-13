@@ -1,4 +1,6 @@
 import { setTimeout as delay } from "node:timers/promises";
+import { gateToolApproval } from "./tool-approval";
+import type { ModelCall } from "./model-turn";
 import { createPlaywrightFixture } from "./playwright-check";
 import { DBOS } from "@dbos-inc/dbos-sdk";
 import type { UIMessage } from "@tanstack/ai";
@@ -1032,6 +1034,21 @@ function reviewCompletion(
   );
 }
 
+async function orchestrateComment(run: ChildRun, call: ModelCall) {
+  return gateToolApproval(
+    {
+      parentRunId: run.input.parentRunId,
+      operationId: run.input.operationId,
+      taskId: run.input.taskId,
+      childWorkflowId: run.input.childWorkflowId,
+      attemptNonce: run.input.attemptNonce,
+      role: run.input.role,
+    },
+    call,
+    run.signal,
+  );
+}
+
 const FEEDBACK_TURNS = 2;
 const CONTEXT_OVERFLOW_ISSUE = "Model context capacity exceeded";
 
@@ -1086,6 +1103,7 @@ async function runRoleLoops(run: ChildRun, tools: RunTools): Promise<TestingChil
       compaction: { kind: "bounded", maxTurn },
       finalTurn: roleFinalTurnPrompt(input.role),
       checkpoint: prefixed(checkpoint, prefix),
+      orchestration: (call) => orchestrateComment(run, call),
       signal,
     });
   const passes = rolePassTurns(execution.runtime, input.role);

@@ -2,6 +2,12 @@ import { convertSchemaToJsonSchema, type ToolExecutionContext, type UIMessage } 
 import { createMCPClient, type MCPClient } from "@tanstack/ai-mcp";
 import { z } from "zod";
 import type { ModelCall } from "../model-turn";
+import { RunRequestError } from "../run-store";
+import {
+  toolArgumentSchemas,
+  type Presentation,
+  type ToolArguments,
+} from "../../../shared/tool-approval";
 import {
   atlassianTools,
   discoveryToolName,
@@ -839,6 +845,10 @@ async function scopedTool(
     throw new Error("Unknown tool");
   }
 
+  if (call.name === "jira_add_comment") {
+    throw new ToolBoundaryError("Unknown tool: Jira comments require durable approval");
+  }
+
   const names = authorizeRemoteCall(messages, call, config);
 
   if (context.abortSignal?.aborted) {
@@ -854,6 +864,138 @@ async function scopedTool(
     (session) => retireSession(state, session),
   );
 }
+
+export async function sendApprovedJiraComment(
+  input: unknown,
+  expectedSite: string,
+  signal: AbortSignal,
+): Promise<unknown> {
+  const payload = toolArgumentSchemas.jira_add_comment.parse(input);
+  const state: ScopeState = { configuration: undefined, remote: undefined, closed: false };
+  const config = await scopeConfiguration(state, signal);
+
+  if (config.mode !== "http") {
+    throw new Error("Atlassian MCP is not configured");
+  }
+
+  if (config.serviceEnvironment.JIRA_URL !== expectedSite) {
+    throw new Error("Jira site changed after approval");
+  }
+
+  guardCredentials(payload, config);
+
+  try {
+    const output = await runRemoteTool(
+      undefined,
+      {
+        id: "approved-comment",
+        name: "jira_add_comment",
+        input: payload,
+        arguments: JSON.stringify(payload),
+      },
+      { abortSignal: signal, emitCustomEvent: () => undefined },
+      config,
+      (remoteConfig) => scopeRemote(state, remoteConfig),
+      (session) => retireSession(state, session),
+    );
+    const native = z.object({ result: z.string() }).strict().safeParse(output);
+
+    return native.success ? JSON.parse(native.data.result) : output;
+  } finally {
+    state.closed = true;
+
+    if (state.remote) {
+      await retireSession(state, state.remote).catch(() => undefined);
+    }
+  }
+}
+
+const jiraCommentContextSchema = z.strictObject({
+  site: z.url(),
+  visibility: z.literal("jira-default"),
+  policy: z.literal("jira-comment-v1"),
+});
+
+function configuredJiraSite(): string {
+  let configuration: ReturnType<typeof readAtlassianConfiguration>;
+
+  try {
+    configuration = readAtlassianConfiguration(process.env);
+  } catch {
+    throw new RunRequestError(409, "Jira site is not configured");
+  }
+
+  if (configuration.mode !== "http") {
+    throw new RunRequestError(409, "Jira site is not configured");
+  }
+
+  return configuration.serviceEnvironment.JIRA_URL;
+}
+
+function jiraSources(intent: unknown): readonly { kind: string; issueKey?: string }[] {
+  const sources = (intent as { sources?: { kind: string; issueKey?: string }[] } | null)?.sources;
+
+  return Array.isArray(sources) ? sources : [];
+}
+
+export type JiraCommentApproval = Readonly<{
+  role: string;
+  parse: (raw: unknown) => ToolArguments["jira_add_comment"];
+  scope: (intent: unknown, input: ToolArguments["jira_add_comment"]) => void;
+  context: () => Record<string, unknown>;
+  present: (
+    input: ToolArguments["jira_add_comment"],
+    context: Record<string, unknown>,
+  ) => Presentation;
+  dispatch: (
+    input: ToolArguments["jira_add_comment"],
+    context: Record<string, unknown>,
+    signal: AbortSignal,
+  ) => Promise<Readonly<{ externalId: string }>>;
+}>;
+
+export const jiraCommentApproval: JiraCommentApproval = {
+  role: "atlassian",
+  parse: (raw) => toolArgumentSchemas.jira_add_comment.parse(raw),
+  scope: (intent, input) => {
+    if (
+      !jiraSources(intent).some(
+        (source) => source.kind === "jira" && source.issueKey === input.issue_key,
+      )
+    ) {
+      throw new RunRequestError(409, "Issue is outside delegated sources");
+    }
+  },
+  context: () =>
+    jiraCommentContextSchema.parse({
+      site: configuredJiraSite(),
+      visibility: "jira-default",
+      policy: "jira-comment-v1",
+    }),
+  present: (input, context) => ({
+    title: `Jira 留言核准 · ${input.issue_key}`,
+    destination: jiraCommentContextSchema.parse(context).site,
+    warnings: ["Jira 預設可見性，並非私人留言。"],
+  }),
+  dispatch: async (input, context, signal) => {
+    const output = await sendApprovedJiraComment(
+      input,
+      jiraCommentContextSchema.parse(context).site,
+      signal,
+    );
+
+    if (
+      output &&
+      typeof output === "object" &&
+      "id" in output &&
+      (typeof output.id === "string" || typeof output.id === "number")
+    ) {
+      return { externalId: String(output.id) };
+    }
+
+    throw new Error("Jira comment response carried no comment id");
+  },
+};
 
 export async function withAtlassianScope<T>(
   use: (scope: AtlassianScope) => Promise<T>,

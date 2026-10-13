@@ -22,6 +22,16 @@ THREAD_TEST_ORIGIN=http://127.0.0.1:4187 pnpm test tests/scripts/thread-browser.
 
 測試攔截整個 API，不使用真實後端或資料庫。預設使用專案安裝的 Playwright；可用 `PLAYWRIGHT_MODULE` 指向其他 ESM 模組，或用 `CHROMIUM_EXECUTABLE` 指定瀏覽器執行檔。
 
+## Jira 核准重啟恢復
+
+```bash
+JIRA_COMMENT_RECOVERY_DATABASE_URL=postgresql://USER:PASSWORD@HOST:PORT/TEST_DB pnpm test tests/scripts/jira-comment-recovery.test.js
+```
+
+只對**已建好 schema 的隔離測試資料庫**執行。測試會寫入 thread、run、事件與 DBOS 紀錄，並強制終止及重啟自己建立的 worker。模型與 Jira 都是 fixture；不呼叫真實服務。它不使用日常 `DATABASE_URL` 作為預設，也不負責刪除測試資料庫。
+
+三個情境為等待核准時重啟、外部接受後結果未保存時重啟，以及取消後重啟。第二種情境容許重複送出，不代表外部 exactly-once 保證。若任何情境失敗，會停止後續情境並清理 worker。
+
 ## 真實 Jev 與瀏覽器
 
 ```bash

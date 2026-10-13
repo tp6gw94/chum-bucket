@@ -20,6 +20,7 @@ import {
   type TestingRequestInput,
 } from "../../shared/testing";
 import type { ModelCall } from "./model-turn";
+import { toolArgumentSchemas } from "../../shared/tool-approval";
 import { allowsTool, roleRegistry, toolNamesFor } from "./agents";
 import {
   checksForRole,
@@ -301,12 +302,23 @@ async function atlassianRoleTools(
         .map((definition) =>
           definition.name === discoveryToolName
             ? restrictedDiscovery(definition, [...allowed])
-            : definition,
+            : definition.name === "jira_add_comment"
+              ? {
+                  ...definition,
+                  description:
+                    "Propose this exact Jira comment for human approval. Never sends before approval. Rejection is final for this task. Continue reading the requested sources; the host assembles the requirements artifact.",
+                  inputSchema: convertSchemaToJsonSchema(toolArgumentSchemas.jira_add_comment)!,
+                }
+              : definition,
         );
     },
     dispatch: (messages) => async (call, context, route) => {
       if (call.name !== discoveryToolName && !allowed.has(call.name)) {
         throw new Error("Unknown tool");
+      }
+
+      if (call.name === "jira_add_comment") {
+        throw new Error("Jira comments require durable orchestration approval");
       }
 
       if (call.name === discoveryToolName) {

@@ -66,7 +66,6 @@ const SERVICE_ARGS = [
   "8000",
   "--path",
   "/mcp",
-  "--read-only",
   "--enabled-tools",
   atlassianToolNames.join(","),
 ];

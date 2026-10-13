@@ -1599,6 +1599,18 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
       },
     },
     {
+      matches: (text) => text.includes("payload->>'name' in"),
+      execute: (values) =>
+        events
+          .filter((event) => runs.get(String(event.run_id))?.thread_id === String(values[0]))
+          .filter((event) => {
+            const name = (event.payload as { name?: unknown }).name;
+
+            return name === "tool.approval.requested" || name === "tool.approval.resolved";
+          })
+          .map((event) => ({ payload: event.payload })),
+    },
+    {
       matches: (text) => text.includes("testing_") && !text.includes("from chat_runs"),
       execute: () => [],
     },

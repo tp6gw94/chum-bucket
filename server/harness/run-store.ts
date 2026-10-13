@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { setTimeout as delay } from "node:timers/promises";
+import { DBOS } from "@dbos-inc/dbos-sdk";
 import { and, eq, gt, inArray, sql } from "drizzle-orm";
 import { EventType, type StreamChunk, type UIMessage } from "@tanstack/ai";
 import { z } from "zod";
@@ -17,6 +18,15 @@ import { agentRegistry, type AgentModel } from "./agents";
 import { snapshot } from "./model-turn";
 import { projectConversation, readProjection, type ConversationState } from "./conversation";
 import { compactionEvent, parseCompactionEvent } from "../../shared/compaction-event";
+import {
+  TOOL_APPROVAL_REQUESTED_EVENT,
+  TOOL_APPROVAL_RESOLVED_EVENT,
+  approvalCancelKey,
+  parseToolApprovalEvent,
+  projectToolApprovals,
+  type ToolApprovalRequest,
+  type ToolApprovalView,
+} from "../../shared/tool-approval";
 import {
   type ArtifactKind,
   type ArtifactRef,
@@ -640,6 +650,7 @@ export async function hydrateThread(threadId: string) {
     }
 
     const published = await readPublishedThreadViewsInTransaction(tx, threadId);
+    const approvals = thread.parent_thread_id ? [] : await readToolApprovals(threadId);
 
     return {
       messages,
@@ -647,8 +658,217 @@ export async function hydrateThread(threadId: string) {
       activeRun: thread.active_run_id ? { runId: thread.active_run_id } : null,
       publishedTesting: published[0] ?? null,
       publishedTasks: published.toReversed(),
+      approvals,
     };
   });
+}
+
+async function approvalEventsForRun(runId: string): Promise<unknown[]> {
+  const db = await database();
+  const rows = await db
+    .select({ payload: chatEventsTable.payload })
+    .from(chatEventsTable)
+    .where(
+      and(
+        eq(chatEventsTable.run_id, runId),
+        sql`${chatEventsTable.payload}->>'name' in ('${sql.raw(TOOL_APPROVAL_REQUESTED_EVENT)}', '${sql.raw(TOOL_APPROVAL_RESOLVED_EVENT)}')`,
+      ),
+    )
+    .orderBy(chatEventsTable.sequence);
+
+  return rows.map((row) => row.payload);
+}
+
+export async function readToolApprovals(threadId: string): Promise<ToolApprovalView[]> {
+  requireThreadId(threadId);
+  const db = await database();
+  const [thread] = await db.select().from(threadsTable).where(eq(threadsTable.id, threadId));
+
+  if (!thread || thread.parent_thread_id) {
+    throw new RunRequestError(404, "Unknown main thread");
+  }
+
+  const rows = await db
+    .select({ payload: chatEventsTable.payload })
+    .from(chatEventsTable)
+    .innerJoin(chatRunsTable, eq(chatRunsTable.id, chatEventsTable.run_id))
+    .where(
+      and(
+        eq(chatRunsTable.thread_id, threadId),
+        sql`${chatEventsTable.payload}->>'name' in ('${sql.raw(TOOL_APPROVAL_REQUESTED_EVENT)}', '${sql.raw(TOOL_APPROVAL_RESOLVED_EVENT)}')`,
+      ),
+    )
+    .orderBy(chatRunsTable.created_at, chatEventsTable.sequence);
+  const events = rows.map((row) => row.payload);
+  const requests: ToolApprovalRequest[] = [];
+
+  for (const chunk of events) {
+    const parsed = parseToolApprovalEvent(chunk);
+
+    if (parsed?.kind === "requested") {
+      requests.push(parsed.request);
+    }
+  }
+
+  const operationIds = [...new Set(requests.map((request) => request.operationId))];
+  const cancelled = new Set<string>();
+
+  if (operationIds.length > 0) {
+    const operations = await db
+      .select({ id: testingOperationsTable.id })
+      .from(testingOperationsTable)
+      .where(
+        and(
+          inArray(testingOperationsTable.id, operationIds),
+          sql`${testingOperationsTable.cancel_accepted_at} is not null`,
+        ),
+      );
+
+    for (const operation of operations) {
+      cancelled.add(operation.id);
+    }
+  }
+
+  const lifecycle = new Map<string, "cancelled">();
+
+  for (const request of requests) {
+    if (cancelled.has(request.operationId)) {
+      lifecycle.set(request.approvalId, "cancelled");
+    }
+  }
+
+  return projectToolApprovals(events, lifecycle);
+}
+
+export async function readToolApprovalRequest(
+  threadId: string,
+  approvalId: string,
+): Promise<ToolApprovalRequest | null> {
+  requireThreadId(threadId);
+  const db = await database();
+  const rows = await db
+    .select({ payload: chatEventsTable.payload })
+    .from(chatEventsTable)
+    .innerJoin(chatRunsTable, eq(chatRunsTable.id, chatEventsTable.run_id))
+    .where(
+      and(
+        eq(chatRunsTable.thread_id, threadId),
+        sql`${chatEventsTable.payload}->>'name' = '${sql.raw(TOOL_APPROVAL_REQUESTED_EVENT)}'`,
+      ),
+    )
+    .orderBy(chatRunsTable.created_at, chatEventsTable.sequence);
+
+  for (const row of rows) {
+    const parsed = parseToolApprovalEvent(row.payload);
+
+    if (parsed?.kind === "requested" && parsed.request.approvalId === approvalId) {
+      return parsed.request;
+    }
+  }
+
+  return null;
+}
+
+type CommentOutcome = Readonly<{
+  status: "approved" | "succeeded" | "rejected" | "expired" | "cancelled";
+  externalId: string | null;
+  message: string;
+}>;
+
+const COMMENT_MESSAGES: Record<CommentOutcome["status"], (externalId: string | null) => string> = {
+  succeeded: (externalId) =>
+    `The Jira comment was posted (externalId ${externalId}). Report that it was posted.`,
+  rejected: () =>
+    "The user rejected the Jira comment. It was not posted. Tell the user it was not posted and do not delegate this comment again unless the user asks for it again in a new message.",
+  expired: () =>
+    "The Jira comment approval expired. It was not posted. Tell the user it was not posted.",
+  cancelled: () =>
+    "The Jira comment approval was cancelled. It was not posted. Tell the user it was not posted.",
+  approved: () =>
+    "The user approved the Jira comment but delivery was never confirmed. Do not claim it was posted and do not delegate it again. Tell the user the delivery is unconfirmed.",
+};
+
+export function commentOutcomeOf(
+  events: readonly unknown[],
+  operationId: string,
+): CommentOutcome | null {
+  const latest = events
+    .map(parseToolApprovalEvent)
+    .findLast((event) => event?.kind === "requested" && event.request.operationId === operationId);
+
+  if (latest?.kind !== "requested") {
+    return null;
+  }
+
+  const view = projectToolApprovals(events).find(
+    (candidate) => candidate.approvalId === latest.request.approvalId,
+  )!;
+  const status = view.state === "pending" ? "cancelled" : view.state;
+  const externalId = view.receipt?.externalId ?? null;
+
+  return { status, externalId, message: COMMENT_MESSAGES[status](externalId) };
+}
+
+export async function readCommentOutcome(
+  runId: string,
+  operationId: string,
+): Promise<CommentOutcome | null> {
+  return commentOutcomeOf(await approvalEventsForRun(runId), operationId);
+}
+
+export async function hasFinalApprovalDenial(runId: string, taskId: string): Promise<boolean> {
+  const events = await approvalEventsForRun(runId);
+  const requests = new Map<string, ToolApprovalRequest>();
+  const final = new Set<string>();
+
+  for (const chunk of events) {
+    const parsed = parseToolApprovalEvent(chunk);
+
+    if (!parsed) {
+      continue;
+    }
+
+    if (parsed.kind === "requested") {
+      requests.set(parsed.request.approvalId, parsed.request);
+    } else if (["rejected", "expired", "cancelled"].includes(parsed.resolution.state)) {
+      final.add(parsed.resolution.approvalId);
+    }
+  }
+
+  return [...final].some((approvalId) => requests.get(approvalId)?.taskId === taskId);
+}
+
+async function wakePendingApprovals(ownerRunId: string, operationId: string): Promise<void> {
+  const events = await approvalEventsForRun(ownerRunId);
+  const requests = new Map<string, ToolApprovalRequest>();
+  const resolved = new Set<string>();
+
+  for (const chunk of events) {
+    const parsed = parseToolApprovalEvent(chunk);
+
+    if (!parsed) {
+      continue;
+    }
+
+    if (parsed.kind === "requested") {
+      requests.set(parsed.request.approvalId, parsed.request);
+    } else {
+      resolved.add(parsed.resolution.approvalId);
+    }
+  }
+
+  for (const request of requests.values()) {
+    if (request.operationId !== operationId || resolved.has(request.approvalId)) {
+      continue;
+    }
+
+    await DBOS.send(
+      request.childWorkflowId,
+      { cancel: true, approvalId: request.approvalId },
+      request.topic,
+      approvalCancelKey(request.approvalId),
+    ).catch(() => undefined);
+  }
 }
 
 export async function checkCursor(runId: string, cursor: number, threadId?: string) {
@@ -1096,9 +1316,12 @@ export async function publishProjection(
 }
 
 export async function cancelTesting(ownerRunId: string, operationId: string): Promise<TestView> {
-  return withTestingRoot(ownerRunId, (tx, _run, _thread, append) =>
+  const view = await withTestingRoot(ownerRunId, (tx, _run, _thread, append) =>
     cancelTestingInTransaction(tx, ownerRunId, operationId, append),
   );
+  await wakePendingApprovals(ownerRunId, operationId);
+
+  return view;
 }
 
 export async function closeTesting(

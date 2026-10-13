@@ -3,6 +3,7 @@ import { useEffect, type ReactNode } from "react";
 import type { SendResult, CompactNotice } from "../hooks/use-threads";
 import { Marker, MarkerContent } from "@/components/ui/marker";
 import type { TestRunId, TestView } from "../../shared/testing";
+import type { ToolApprovalView } from "../../shared/tool-approval";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -17,6 +18,7 @@ import {
 } from "@/components/ui/message-scroller";
 import { Composer } from "./composer";
 import { MessageList } from "./message-list";
+import { ToolApprovals } from "./tool-approvals";
 import { PaneShell } from "./pane-shell";
 import { ProgressPanel } from "./progress-panel";
 import { StatusBadge } from "./status-badge";
@@ -31,6 +33,7 @@ type PanePresentation = Readonly<{
 }>;
 
 const EMPTY_TESTING_VIEWS: readonly TestView[] = [];
+const EMPTY_APPROVALS: readonly ToolApprovalView[] = [];
 
 const PANE_PRESENTATION: Record<PaneModel["kind"], PanePresentation> = {
   main: {
@@ -93,6 +96,8 @@ function PaneMessages({
   testingViews,
   onCancelTesting,
   activeRunId,
+  approvals,
+  onDecideApproval,
 }: {
   pane: PaneModel;
   presentation: PanePresentation;
@@ -101,6 +106,8 @@ function PaneMessages({
   testingViews: readonly TestView[];
   onCancelTesting?: (runId: TestRunId) => Promise<void>;
   activeRunId?: string | null;
+  approvals: readonly ToolApprovalView[];
+  onDecideApproval?: (approval: ToolApprovalView, approved: boolean) => Promise<void>;
 }) {
   return (
     <>
@@ -120,6 +127,9 @@ function PaneMessages({
         onCancelTesting={onCancelTesting}
         activeRunId={activeRunId}
       />
+      {pane.kind === "main" && onDecideApproval ? (
+        <ToolApprovals approvals={approvals} onDecide={onDecideApproval} />
+      ) : null}
     </>
   );
 }
@@ -198,6 +208,8 @@ function PaneTranscript({
   testingViews,
   onCancelTesting,
   activeRunId,
+  approvals,
+  onDecideApproval,
 }: {
   pane: PaneModel;
   presentation: PanePresentation;
@@ -206,6 +218,8 @@ function PaneTranscript({
   testingViews: readonly TestView[];
   onCancelTesting?: (runId: TestRunId) => Promise<void>;
   activeRunId?: string | null;
+  approvals: readonly ToolApprovalView[];
+  onDecideApproval?: (approval: ToolApprovalView, approved: boolean) => Promise<void>;
 }) {
   return (
     <MessageScrollerProvider autoScroll defaultScrollPosition="end">
@@ -221,6 +235,8 @@ function PaneTranscript({
               testingViews={testingViews}
               onCancelTesting={onCancelTesting}
               activeRunId={activeRunId}
+              approvals={approvals}
+              onDecideApproval={onDecideApproval}
             />
             {pane.progress.length > 0 ? (
               <MessageScrollerItem messageId="pane-progress">
@@ -257,6 +273,8 @@ export function Pane({
   testingViews = EMPTY_TESTING_VIEWS,
   onCancelTesting,
   activeRunId,
+  approvals = EMPTY_APPROVALS,
+  onDecideApproval,
 }: {
   pane: PaneModel;
   onOpenAgentPane?: () => void;
@@ -272,6 +290,8 @@ export function Pane({
   testingViews?: readonly TestView[];
   onCancelTesting?: (runId: TestRunId) => Promise<void>;
   activeRunId?: string | null;
+  approvals?: readonly ToolApprovalView[];
+  onDecideApproval?: (approval: ToolApprovalView, approved: boolean) => Promise<void>;
 }) {
   const presentation = PANE_PRESENTATION[pane.kind];
   const actionsDisabled = sendDisabled || isHydrating || pane.status !== "idle" || !onSend;
@@ -293,6 +313,8 @@ export function Pane({
         testingViews={testingViews}
         onCancelTesting={onCancelTesting}
         activeRunId={activeRunId}
+        approvals={approvals}
+        onDecideApproval={onDecideApproval}
       />
       <CompactNoticeMarker notice={compactNotice} />
       <HydrationFeedback isHydrating={isHydrating} hydrationError={hydrationError} />

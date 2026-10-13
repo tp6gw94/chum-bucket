@@ -7,7 +7,11 @@ import { setTimeout as delay } from "node:timers/promises";
 import { clearTimeout as nodeClearTimeout, setTimeout as nodeSetTimeout } from "node:timers";
 import type { ToolExecutionContext, UIMessage } from "@tanstack/ai";
 import type { ModelCall } from "../../../../server/harness/model-turn";
-import { withAtlassianScope, type ModelTool } from "../../../../server/harness/tools/atlassian";
+import {
+  withAtlassianScope,
+  sendApprovedJiraComment,
+  type ModelTool,
+} from "../../../../server/harness/tools/atlassian";
 import { read } from "../../../../server/harness/tools/fs";
 import {
   withRunTools as withConversationTools,
@@ -24,6 +28,50 @@ import {
   mcpFixture,
   withMcpEnvironment,
 } from "../../../fixtures/mcp-fixture";
+
+test("approved comments normalize the native FastMCP string result envelope", async () => {
+  const payload = { issue_key: "CHUM-42", body: "Exact **body**\nSecond line" };
+  const fixture = mcpFixture({
+    rules: [
+      {
+        method: "tools/call",
+        name: "jira_add_comment",
+        arguments: payload,
+        result: {
+          content: [{ type: "text", text: JSON.stringify({ id: "42" }) }],
+          structuredContent: { result: JSON.stringify({ id: "42" }) },
+        },
+      },
+    ],
+  });
+  await withMcpEnvironment(
+    async () => {
+      assert.deepEqual(
+        await sendApprovedJiraComment(payload, fakeBaseUrl, new AbortController().signal),
+        { id: "42" },
+      );
+    },
+    true,
+    fixture,
+  );
+});
+
+test("approved comments refuse to open the remote when the configured site differs", async () => {
+  const payload = { issue_key: "CHUM-42", body: "Exact body" };
+  const fixture = mcpFixture();
+  await withMcpEnvironment(
+    async () => {
+      process.env.JIRA_BASE_URL = "https://changed.atlassian.net";
+      await assert.rejects(
+        sendApprovedJiraComment(payload, fakeBaseUrl, new AbortController().signal),
+        /Jira site changed after approval/,
+      );
+      assert.equal(fixture.calls().length, 0);
+    },
+    true,
+    fixture,
+  );
+});
 
 const discoveryName = "discover_atlassian_tools";
 const context: ToolExecutionContext = {
@@ -395,7 +443,10 @@ test("HTTP initializes once, paginates, retains native schemas and executes disc
           properties: {
             toolNames: {
               type: "array",
-              items: { type: "string", enum: remoteNames },
+              items: {
+                type: "string",
+                enum: ["jira_get_issue", "jira_add_comment", ...remoteNames.slice(1)],
+              },
               minItems: 1,
             },
           },

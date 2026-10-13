@@ -151,7 +151,7 @@ async function stopLauncher(launcher: Launcher, log: string) {
   }
 }
 
-test("launcher runs the fixed readonly HTTP command with a sanitized mapped environment and fixed logs", async () => {
+test("launcher runs the fixed allowlisted HTTP command with a sanitized mapped environment and fixed logs", async () => {
   const directory = await mkdtemp(join(tmpdir(), "chum-launcher-"));
   const log = join(directory, "uvx.jsonl");
   await writeFakeUvx(directory, {
@@ -175,9 +175,8 @@ test("launcher runs the fixed readonly HTTP command with a sanitized mapped envi
       "8000",
       "--path",
       "/mcp",
-      "--read-only",
       "--enabled-tools",
-      "jira_get_issue,jira_search,confluence_get_page,confluence_search,confluence_get_comments",
+      "jira_get_issue,jira_add_comment,jira_search,confluence_get_page,confluence_search,confluence_get_comments",
     ]);
     assert.equal(record.env!.JIRA_URL, fakeBaseUrl);
     assert.equal(record.env!.JIRA_USERNAME, fakeEmail);
@@ -185,13 +184,18 @@ test("launcher runs the fixed readonly HTTP command with a sanitized mapped envi
     assert.equal(record.env!.CONFLUENCE_URL, `${fakeBaseUrl}/wiki`);
     assert.equal(record.env!.CONFLUENCE_USERNAME, fakeEmail);
     assert.equal(record.env!.CONFLUENCE_API_TOKEN, fakeToken);
-    assert.equal(record.env!.READ_ONLY_MODE, "true");
+    assert.equal(record.env!.READ_ONLY_MODE, "false");
+    assert.equal(record.env!.ATLASSIAN_RETRY_TOTAL, "0");
+    assert.equal(record.env!.ATLASSIAN_RETRY_INCLUDE_WRITES, "false");
     assert.equal(record.env!.PYTHON_DOTENV_DISABLED, "1");
     assert.equal(record.env!.ALLOW_GLOBAL_CRED_FALLBACK, "true");
-    assert.equal(record.env!.TOOLSETS, "jira_issues,confluence_pages,confluence_comments");
+    assert.equal(
+      record.env!.TOOLSETS,
+      "jira_issues,jira_comments,confluence_pages,confluence_comments",
+    );
     assert.equal(
       record.env!.ENABLED_TOOLS,
-      "jira_get_issue,jira_search,confluence_get_page,confluence_search,confluence_get_comments",
+      "jira_get_issue,jira_add_comment,jira_search,confluence_get_page,confluence_search,confluence_get_comments",
     );
     assert.equal(record.env!.UV_PYTHON, "/custom/python3.13");
     assert.equal(record.env!.PATH, launcherEnv(directory).PATH);

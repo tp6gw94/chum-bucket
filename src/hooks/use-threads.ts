@@ -6,6 +6,12 @@ import { parseComposerCommand } from "../composer-commands";
 import { fetchServerSentEvents, useChat } from "@tanstack/ai-react";
 import { parseCompactionEvent } from "@/shared/compaction-event";
 import {
+  applyToolApprovalEvent,
+  parseToolApprovalEvent,
+  parseToolApprovals,
+  type ToolApprovalView,
+} from "@/shared/tool-approval";
+import {
   parsePublishedTasks,
   parseTestView,
   parseTestingProjectionEvent,
@@ -169,6 +175,7 @@ type ThreadState = Readonly<{
   setError: (error: string | null) => void;
   setCompactNotice: (notice: CompactNotice | null) => void;
   setTestingViews: Dispatch<SetStateAction<readonly TestView[]>>;
+  setApprovals: Dispatch<SetStateAction<readonly ToolApprovalView[]>>;
 }>;
 
 type StreamObserver = (stream: AsyncIterable<StreamChunk>) => AsyncIterable<StreamChunk>;
@@ -253,6 +260,14 @@ function observeProjection(state: ThreadState, chunk: StreamChunk) {
   }
 }
 
+function observeApproval(state: ThreadState, chunk: StreamChunk) {
+  const event = parseToolApprovalEvent(chunk);
+
+  if (event && state.owner.mounted) {
+    state.setApprovals((current) => applyToolApprovalEvent(current, event));
+  }
+}
+
 function observeChunk(state: ThreadState, chunk: StreamChunk, side: boolean) {
   const { owner } = state;
   const terminal = terminalResult(chunk, owner.runId);
@@ -266,6 +281,7 @@ function observeChunk(state: ThreadState, chunk: StreamChunk, side: boolean) {
 
   if (!side) {
     observeProjection(state, chunk);
+    observeApproval(state, chunk);
   }
 }
 
@@ -292,9 +308,34 @@ function absorbPublishedTesting(state: ThreadState, response: Response) {
     .json()
     .then((payload: unknown) => {
       const published = parsePublishedTasks(payload);
+      const approvals = parseToolApprovals((payload as { approvals?: unknown } | null)?.approvals);
 
       if (state.owner.mounted) {
         state.setTestingViews((current) => published.reduce(mergeHydratedTestingView, current));
+
+        if (approvals.length > 0) {
+          state.setApprovals((current) => {
+            const hydrated = new Map(approvals.map((view) => [view.approvalId, view]));
+            const merged = approvals.map((view) => {
+              const live = current.find((entry) => entry.approvalId === view.approvalId);
+              const liveWins =
+                live &&
+                live.state !== "pending" &&
+                live.state !== "approved" &&
+                (view.state === "pending" || view.state === "approved");
+
+              return liveWins ? live : view;
+            });
+
+            for (const view of current) {
+              if (!hydrated.has(view.approvalId)) {
+                merged.push(view);
+              }
+            }
+
+            return merged;
+          });
+        }
       }
     })
     .catch(() => undefined);
@@ -626,8 +667,16 @@ export function useThread(threadId: string, side = false) {
   const [error, setError] = useState<string | null>(null);
   const [compactNotice, setCompactNotice] = useState<CompactNotice | null>(null);
   const [testingViews, setTestingViews] = useState<readonly TestView[]>([]);
+  const [approvals, setApprovals] = useState<readonly ToolApprovalView[]>([]);
   const owner = useRef(createOwner()).current;
-  const state: ThreadState = { owner, setPhase, setError, setCompactNotice, setTestingViews };
+  const state: ThreadState = {
+    owner,
+    setPhase,
+    setError,
+    setCompactNotice,
+    setTestingViews,
+    setApprovals,
+  };
   const observedStream = useRef<StreamObserver | null>(null);
   const connection = useMemo(() => {
     const created = createConnection(state, side);
@@ -661,6 +710,23 @@ export function useThread(threadId: string, side = false) {
     error,
     compactNotice,
     testingViews,
+    approvals,
+    decideApproval: async (approval: ToolApprovalView, approved: boolean) => {
+      const response = await fetch(`/api/chat/approvals/${approval.approvalId}/decision`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Tool-Approval": "1" },
+        body: JSON.stringify({
+          threadId: approval.threadId,
+          digest: approval.digest,
+          tool: approval.tool,
+          approved,
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error("決策未確認或狀態已變更。請重新整理確認，勿重複送出。");
+      }
+    },
     activeRunId: owner.runId,
     cancelTesting: (runId: TestRunId) => cancelTesting(runtime, runId),
     send: (text: string) => send(runtime, text),

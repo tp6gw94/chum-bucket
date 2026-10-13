@@ -160,6 +160,8 @@ function ThreadPage({ threadId }: { threadId: string }) {
               hydrationError={hydrationError}
               compactNotice={thread.compactNotice}
               testingViews={thread.testingViews}
+              approvals={thread.approvals}
+              onDecideApproval={thread.decideApproval}
               activeRunId={thread.activeRunId}
               onCancelTesting={thread.cancelTesting}
             />

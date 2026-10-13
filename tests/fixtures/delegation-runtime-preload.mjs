@@ -19,6 +19,22 @@ if (process.argv.some((arg) => /server\/index\.ts$|delegation-recovery-worker\.m
   const fixture = mcpFixture({
     pages: sourceReadPages,
     rules: [
+      ...(process.env.DELEGATION_FIXTURE_SCENARIO === "jira-comment"
+        ? [
+            {
+              method: "tools/call",
+              name: "jira_add_comment",
+              arguments: {
+                issue_key: "CHUM-42",
+                body: "Approval fixture **exact body**\nSecond line. No live Jira write.",
+              },
+              result: {
+                content: [{ type: "text", text: JSON.stringify({ id: "fixture-comment-42" }) }],
+                structuredContent: { result: JSON.stringify({ id: "fixture-comment-42" }) },
+              },
+            },
+          ]
+        : []),
       sourceReadRule(
         "jira_get_issue",
         { issue_key: "CHUM-42" },
@@ -72,7 +88,22 @@ if (process.argv.some((arg) => /server\/index\.ts$|delegation-recovery-worker\.m
     }
     if (url.hostname !== "127.0.0.1" && url.hostname !== "localhost")
       throw new Error("External network denied by delegation fixture");
-    return originalFetch(input, init);
+    if (
+      process.env.DELEGATION_FIXTURE_SCENARIO === "jira-comment" &&
+      init?.body &&
+      String(init.body).includes("jira_add_comment")
+    )
+      record({ boundary: "mcp", request: JSON.parse(String(init.body)) });
+    const response = await originalFetch(input, init);
+    if (
+      process.env.DELEGATION_FIXTURE_COMMENT_ACCEPT_DELAY &&
+      init?.body &&
+      String(init.body).includes('"name":"jira_add_comment"')
+    ) {
+      record({ boundary: "comment-accepted" });
+      await delay(Number(process.env.DELEGATION_FIXTURE_COMMENT_ACCEPT_DELAY));
+    }
+    return response;
   };
   const { deepinfra } = await import("../../server/harness/provider.ts");
   const adapter = deepinfra("deepseek-ai/DeepSeek-V4.1-Flash");
@@ -95,7 +126,11 @@ if (process.argv.some((arg) => /server\/index\.ts$|delegation-recovery-worker\.m
       yield* scriptedEvents(options, { ordinary: true });
       return;
     }
-    const events = scriptedEvents(options, { intent: input, planningMixed });
+    const events = scriptedEvents(options, {
+      intent: input,
+      planningMixed,
+      jiraComment: process.env.DELEGATION_FIXTURE_SCENARIO === "jira-comment",
+    });
     if (role === "atlassian")
       record({
         boundary: "proposal",

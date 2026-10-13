@@ -8,6 +8,7 @@ import {
   database,
   closeTesting,
   publishProjection,
+  readCommentOutcome,
   readTestingExecution,
   recordRoleFailure,
   reserveRoleTask,
@@ -268,6 +269,7 @@ export async function delegateTask(run: AcceptedRun, call: ModelCall) {
         state: view.state,
         task: view.task,
         progress: view.task ? view.progress.rows[view.task.role] : null,
+        comment: await readCommentOutcome(run.runId, prefix),
       };
     },
     { name: `${prefix}:close`, ...DURABLE_RETRY },
