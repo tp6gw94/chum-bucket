@@ -7,6 +7,8 @@ import {
 } from "@tanstack/ai";
 import { deepinfra } from "@server/harness/provider";
 import { openuiInstructions } from "@server/harness/prompts";
+import { figmaTools } from "@server/harness/tools/figma";
+import { jiraTools } from "@server/harness/tools/jira";
 import { Hono } from "hono";
 import { db } from "./db";
 import { threadsTable } from "./db/schema";
@@ -33,6 +35,11 @@ const updateChatMessage: ChatMiddleware = {
   },
 };
 
+const forceRunId = (runId: string): ChatMiddleware => ({
+  name: "forceRunId",
+  onChunk: (_context, chunk) => ("runId" in chunk ? { ...chunk, runId } : chunk),
+});
+
 app.get("/", async (c) => {
   const threadId = c.req.query("threadId");
 
@@ -57,7 +64,8 @@ app.post("/", async (c) => {
     messages: payload.messages,
     threadId: payload.threadId,
     runId: payload.runId,
-    middleware: [updateChatMessage],
+    middleware: [forceRunId(payload.runId), updateChatMessage],
+    tools: [...figmaTools, ...jiraTools],
   });
 
   return toServerSentEventsResponse(stream);
