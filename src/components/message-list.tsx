@@ -11,39 +11,55 @@ import { type ChatMessage } from "./types";
 import { ToolCall } from "./tool-call";
 
 const assistantReplyParser = createParser(openuiLibrary.toJSONSchema(), openuiLibrary.root);
-const openuiStart = /^\s*\$?[A-Za-z_]\w*\s*=(?!=)/;
+const openuiLine = /^[ \t]*\$?[A-Za-z_]\w*[ \t]*=(?!=)/m;
 const markdownOptions = { remarkPlugins: [remarkGfm] };
 
 export function parseAssistantReply(text: string): ParseResult {
   return assistantReplyParser.parse(text);
 }
 
+export function splitAssistantReply(text: string): { prose: string; code: string | null } {
+  const match = openuiLine.exec(text);
+
+  if (!match) {
+    return { prose: text, code: null };
+  }
+
+  return { prose: text.slice(0, match.index).trim(), code: text.slice(match.index) };
+}
+
+function Prose({ text }: { text: string }) {
+  return (
+    <Bubble variant="muted" align="start">
+      <BubbleContent>
+        <MarkDownRenderer textMarkdown={text} options={markdownOptions} />
+      </BubbleContent>
+    </Bubble>
+  );
+}
+
 function AssistantMessage({ text, isStreaming }: { text: string; isStreaming: boolean }) {
+  const { prose, code } = useMemo(() => splitAssistantReply(text), [text]);
   const result = useMemo(
-    () => (isStreaming ? null : parseAssistantReply(text)),
-    [text, isStreaming],
+    () => (isStreaming || code === null ? null : parseAssistantReply(code)),
+    [code, isStreaming],
   );
   const errors = result?.meta.errors ?? [];
 
-  if (!openuiStart.test(text) || result?.root === null) {
-    return (
-      <Bubble variant="muted" align="start">
-        <BubbleContent>
-          <MarkDownRenderer textMarkdown={text} options={markdownOptions} />
-        </BubbleContent>
-      </Bubble>
-    );
+  if (code === null || result?.root === null) {
+    return <Prose text={text} />;
   }
 
   return (
     <div className="flex min-w-0 flex-col gap-1">
+      {prose ? <Prose text={prose} /> : null}
       {errors.length > 0 ? (
         <p className="text-xs text-destructive">
           部分元件無法解析：
           {[...new Set(errors.map((error) => error.component))].join("、")}
         </p>
       ) : null}
-      <Renderer response={text} library={openuiLibrary} isStreaming={isStreaming} />
+      <Renderer response={code} library={openuiLibrary} isStreaming={isStreaming} />
     </div>
   );
 }
@@ -61,6 +77,7 @@ function ChatMessageRow({
     .filter((part) => part.type === "text")
     .map((part) => part.content)
     .join("");
+  const lastIndex = message.parts.length - 1;
 
   if (message.role === "system") {
     return (
@@ -83,10 +100,17 @@ function ChatMessageRow({
         {header ? <MessageHeader>{header}</MessageHeader> : null}
         {message.role === "assistant" ? (
           <div className="flex min-w-0 flex-col gap-2">
-            {message.parts.map((part) =>
-              part.type === "tool-call" ? <ToolCall key={part.id} part={part} /> : null,
+            {message.parts.map((part, index) =>
+              part.type === "tool-call" ? (
+                <ToolCall key={part.id} part={part} />
+              ) : part.type === "text" && part.content.trim() !== "" ? (
+                <AssistantMessage
+                  key={index}
+                  text={part.content}
+                  isStreaming={isStreaming && index === lastIndex}
+                />
+              ) : null,
             )}
-            {text.trim() !== "" ? <AssistantMessage text={text} isStreaming={isStreaming} /> : null}
           </div>
         ) : (
           <Bubble variant="default" align={align}>

@@ -1,4 +1,4 @@
-import { parseAssistantReply } from "../src/components/message-list";
+import { parseAssistantReply, splitAssistantReply } from "../src/components/message-list";
 
 const valid =
   'root = Stack([\n  Card([\n    CardHeader("報告", "摘要"),\n    TextContent("內容")\n  ])\n])';
@@ -30,6 +30,16 @@ const unknown = parseAssistantReply('root = Stack([UnknownThing("x")])');
 
 if (unknown.root === null || unknown.meta.errors.length === 0) {
   throw new Error("unknown component did not report a parse error");
+}
+
+const prefixed = splitAssistantReply(`讀到了！整理成介面：\n\n${valid}`);
+
+if (prefixed.prose !== "讀到了！整理成介面：" || prefixed.code !== valid) {
+  throw new Error("prose before OpenUI Lang was not split off");
+}
+
+if (splitAssistantReply("這是一段普通文字。").code !== null) {
+  throw new Error("plain prose was treated as OpenUI Lang");
 }
 
 console.log("openui settled parse OK");
