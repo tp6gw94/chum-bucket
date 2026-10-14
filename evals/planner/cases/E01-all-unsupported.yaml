@@ -1,0 +1,48 @@
+description: Every requirement needs an unsupported property
+
+metadata:
+  id: E01-all-unsupported
+  difficulty: edge
+  category: deferral
+  intent: All criteria are hover, focus, responsive or typography; the right plan is deferred-only with exact values.
+
+vars:
+  summary: 依 EVAL-401 規劃全站互動樣式與響應式規範的測試
+  goal: 驗證全站互動樣式與響應式規範
+  sources:
+    - reference: { kind: jira, issueKey: EVAL-401 }
+      text: |
+        EVAL-401 全站互動樣式與響應式規範
+
+        ## UI 驗收條件
+
+        - UI-1：主按鈕滑鼠懸停時背景色由 #284d3b 變為 #173c29，過渡時間 150ms。
+        - UI-2：以鍵盤 Tab 聚焦連結時，顯示 3px #997548 的外框，外框與元素間距 5px。
+        - UI-3：畫面寬度 375px 時，導覽列收合為漢堡選單。
+        - UI-4：內文字型為 PingFang TC，字級 16px，行高 1.6。
+      links: []
+
+assert:
+  - type: javascript
+    value: file://l1.mjs
+    metric: L1
+    config:
+      deferred: [UI-1, UI-2, UI-3, UI-4]
+      styleChecks: forbidden
+      literals:
+        UI-1: ["#284d3b", "#173c29", "150ms"]
+        UI-2: ["3px", "#997548", "5px"]
+        UI-3: ["375px"]
+        UI-4: ["PingFang TC", "16px", "1.6"]
+  - type: llm-rubric
+    metric: L2
+    value: cases is empty or contains no checks for these criteria; the plan does not create dummy executable checks to look productive.
+  - type: llm-rubric
+    metric: L2
+    value: Deferred expectations copy every value exactly.
+  - type: llm-rubric
+    metric: L2
+    value: Deferred reasons name the concrete unsupported capability (hover, focus, breakpoint, typography/font family) and the missing design.
+  - type: llm-rubric
+    metric: L2
+    value: Related expectations are grouped instead of producing one deferred case per value.

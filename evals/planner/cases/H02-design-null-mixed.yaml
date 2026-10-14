@@ -1,0 +1,66 @@
+description: Functional and style requirements with no bound design
+
+metadata:
+  id: H02-design-null-mixed
+  difficulty: hard
+  category: deferral
+  intent: Execute the functional criteria, defer every style criterion, copy exact values, and never promote a Figma link to a design.
+
+vars:
+  summary: 依 EVAL-302 規劃文章頁內容、按讚功能與樣式的測試
+  goal: 驗證文章頁的內容、按讚功能與樣式
+  sources:
+    - reference: { kind: jira, issueKey: EVAL-302 }
+      text: |
+        EVAL-302 文章頁：內容、按讚與樣式
+
+        ## 驗收條件
+
+        - AC-1：文章頁 `/articles/hello-world` 顯示標題「Hello World」與作者「Todd」。
+        - AC-2：點擊「喜歡」按鈕後，喜歡數由「12」變為「13」。
+        - AC-3：再次點擊「喜歡」按鈕取消喜歡，喜歡數回到「12」。
+
+        ## UI 驗收條件
+
+        - UI-1：文章標題字級 32px、字重 700、行高 1.4。
+        - UI-2：「喜歡」按鈕背景色 #ff4d6d、圓角 999px。
+        - UI-3：畫面寬度 375px 時，文章內容不出現橫向捲動。
+        - UI-4：以鍵盤聚焦「喜歡」按鈕時，顯示 2px 的焦點框。
+      links:
+        - url: https://www.figma.com/design/EVALfig0002?node-id=7-10
+          label: 文章頁｜桌面
+          fileKey: EVALfig0002
+          nodeId: "7:10"
+
+assert:
+  - type: javascript
+    value: file://l1.mjs
+    metric: L1
+    config:
+      executable: [AC-1, AC-2, AC-3]
+      deferred: [UI-1, UI-2, UI-3, UI-4]
+      styleChecks: forbidden
+      literals:
+        AC-1: ["Hello World", "Todd"]
+        AC-2: ["13"]
+        AC-3: ["12"]
+        UI-1: ["32px", "700", "1.4"]
+        UI-2: ["#ff4d6d", "999px"]
+        UI-3: ["375px"]
+        UI-4: ["2px"]
+      allowedPaths: ["/articles/hello-world"]
+  - type: llm-rubric
+    metric: L2
+    value: No style check exists; the Figma link 7:10 is not used as a design reference.
+  - type: llm-rubric
+    metric: L2
+    value: "Deferred expectations copy every value exactly (32px, 700, 1.4, #ff4d6d, 999px, 375px, 2px)."
+  - type: llm-rubric
+    metric: L2
+    value: Related style expectations are grouped into a small number of deferred cases rather than one case per value.
+  - type: llm-rubric
+    metric: L2
+    value: Deferred reasons distinguish "no bound design" from "unsupported property" (responsive width, focus).
+  - type: llm-rubric
+    metric: L2
+    value: AC-3 clicks 喜歡 twice in one case and observes the final count 12.

@@ -1,0 +1,49 @@
+description: Newsletter subscription success, empty and malformed email
+
+metadata:
+  id: S02-newsletter-subscribe
+  difficulty: simple
+  category: negative
+  intent: Positive, empty-input and malformed-input cases from explicit messages, without trying to verify email delivery.
+
+vars:
+  summary: 依 EVAL-102 規劃電子報訂閱表單的測試
+  goal: 驗證電子報訂閱表單
+  sources:
+    - reference: { kind: jira, issueKey: EVAL-102 }
+      text: |
+        EVAL-102 電子報訂閱表單
+
+        ## 使用者故事
+
+        身為訪客，我希望留下 Email 訂閱電子報，並在送出後收到確認信。
+
+        ## 驗收條件
+
+        - AC-1：在 `/newsletter` 頁輸入 Email「reader@example.com」並點擊「訂閱」，按鈕下方顯示「感謝訂閱！確認信已寄出」。
+        - AC-2：Email 欄位空白時點擊「訂閱」，顯示「請輸入 Email」。
+        - AC-3：輸入格式錯誤的 Email（例如「reader@」）時點擊「訂閱」，顯示「Email 格式不正確」。
+      links: []
+
+assert:
+  - type: javascript
+    value: file://l1.mjs
+    metric: L1
+    config:
+      executable: [AC-1, AC-2, AC-3]
+      literals:
+        AC-1: ["感謝訂閱！確認信已寄出"]
+        AC-2: ["請輸入 Email"]
+        AC-3: ["Email 格式不正確"]
+      boundaries:
+        AC-3: ["reader@"]
+      allowedPaths: ["/newsletter"]
+  - type: llm-rubric
+    metric: L2
+    value: Each of the three inputs (valid, empty, malformed) is its own case.
+  - type: llm-rubric
+    metric: L2
+    value: The plan does not claim to verify that the confirmation email was delivered; at most it defers, omits or records that aspect in unresolved.
+  - type: llm-rubric
+    metric: L2
+    value: Checks use the exact messages from the requirements, not paraphrases.

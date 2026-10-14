@@ -1,0 +1,55 @@
+description: Password reset that depends on a mailbox, time and a registered account
+
+metadata:
+  id: E04-external-dependencies
+  difficulty: edge
+  category: external-setup
+  intent: Execute only what the page alone can show; record the missing setup and defer mailbox, time-based and account-dependent behaviour without fabricating tokens.
+
+vars:
+  summary: 依 EVAL-404 規劃忘記密碼流程的測試
+  goal: 驗證忘記密碼流程
+  sources:
+    - reference: { kind: jira, issueKey: EVAL-404 }
+      text: |
+        EVAL-404 忘記密碼流程
+
+        ## 驗收條件
+
+        - AC-1：在 `/forgot-password` 輸入已註冊的 Email 並點擊「寄送重設連結」，頁面顯示「重設連結已寄出，請於 30 分鐘內使用」。
+        - AC-2：使用者點擊信件中的重設連結後，可以設定新密碼。
+        - AC-3：重設連結超過 30 分鐘後失效，開啟時顯示「連結已過期」。
+        - AC-4：同一 Email 在 60 秒內重複送出，顯示「請稍後再試」。
+        - AC-5：輸入未註冊的 Email 送出時，顯示與 AC-1 相同的訊息，避免帳號探測。
+      links: []
+
+assert:
+  - type: javascript
+    value: file://l1.mjs
+    metric: L1
+    config:
+      executable: [AC-5]
+      deferred: [AC-2, AC-3]
+      either: [AC-1, AC-4]
+      unresolved: required
+      literals:
+        AC-1: ["重設連結已寄出，請於 30 分鐘內使用"]
+        AC-3: ["連結已過期"]
+        AC-4: ["請稍後再試"]
+        AC-5: ["重設連結已寄出，請於 30 分鐘內使用"]
+      allowedPaths: ["/forgot-password"]
+  - type: llm-rubric
+    metric: L2
+    value: AC-5 fills an obviously unregistered email and expects the exact AC-1 message.
+  - type: llm-rubric
+    metric: L2
+    value: No reset token, reset URL or mailbox content is fabricated.
+  - type: llm-rubric
+    metric: L2
+    value: AC-3 is deferred rather than simulating 30 minutes passing.
+  - type: llm-rubric
+    metric: L2
+    value: unresolved notes that no registered test email is provided and the mailbox is not accessible.
+  - type: llm-rubric
+    metric: L2
+    value: If AC-1 is executable, it does not pretend an arbitrary email is registered; otherwise its deferred reason cites the missing registered test account.

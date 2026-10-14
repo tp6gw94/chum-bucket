@@ -1,0 +1,47 @@
+description: Dark mode toggle states and a background colour without design
+
+metadata:
+  id: S05-dark-mode-toggle
+  difficulty: simple
+  category: deferral
+  intent: Toggle state changes are executable; a colour requirement without a design must be deferred.
+
+vars:
+  summary: 依 EVAL-105 規劃設定頁深色模式開關的測試
+  goal: 驗證設定頁的深色模式開關
+  sources:
+    - reference: { kind: jira, issueKey: EVAL-105 }
+      text: |
+        EVAL-105 設定頁：深色模式開關
+
+        ## 驗收條件
+
+        - AC-1：`/settings` 頁「深色模式」開關旁的狀態文字初始顯示「關閉」。
+        - AC-2：點擊「深色模式」開關後，狀態文字顯示「開啟」。
+        - AC-3：再次點擊「深色模式」開關後，狀態文字回到「關閉」。
+        - AC-4：開啟深色模式後，頁面背景色為 #121212。
+      links: []
+
+assert:
+  - type: javascript
+    value: file://l1.mjs
+    metric: L1
+    config:
+      executable: [AC-1, AC-2, AC-3]
+      deferred: [AC-4]
+      styleChecks: forbidden
+      literals:
+        AC-1: ["關閉"]
+        AC-2: ["開啟"]
+        AC-3: ["關閉"]
+        AC-4: ["#121212"]
+      allowedPaths: ["/settings"]
+  - type: llm-rubric
+    metric: L2
+    value: AC-3 clicks the toggle twice within one case and checks the final 關閉 state.
+  - type: llm-rubric
+    metric: L2
+    value: "AC-4 is deferred because no design is bound, and its expectation keeps the literal #121212."
+  - type: llm-rubric
+    metric: L2
+    value: The plan does not invent a persistence-after-reload check.

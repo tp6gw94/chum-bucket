@@ -1,0 +1,115 @@
+description: Real FETM-78 source text for the scone shop cart
+
+metadata:
+  id: R01-fetm-78-scone-cart
+  difficulty: hard
+  category: regression
+  intent: Real Jira text without criterion labels; an earlier plan passed validation but operated cart-only controls on the home page.
+
+vars:
+  summary: Plan tests for FETM-78 from the requirements artifact.
+  goal: Read Jira issue FETM-78 and capture its full requirements, acceptance criteria, and any linked design references (including Figma links) needed for QA test planning. Return the requirements artifact reference. Do not post any comment.
+  sources:
+    - reference: { kind: jira, issueKey: FETM-78 }
+      text: |
+        FETM-78 司康小舖：商品與購物車
+
+        ## 使用者故事
+
+        身為司康小舖的顧客，我希望查看商品並調整購物車數量，以便知道自己要買幾顆及商品小計。
+
+        ## 範圍
+
+        提供商品瀏覽與購物車功能，使用純 HTML、CSS、JavaScript。只販售原味司康，每顆 NT$100。不含登入、付款串接或後台。運費與訂單提交由 FETM-79「司康小舖：運費與訂單提交」Story 定義。
+
+        ## 驗收條件
+
+        1. 頁面顯示唯一商品「原味司康」及單價 NT$100。
+        1. 初次開啟頁面時，購物車數量為 0，商品小計為 NT$0。
+        1. 點擊「加入購物車」時，數量每次增加 1；已有商品時也以目前數量累加。
+        1. 購物車提供增加與減少數量的操作，每次調整 1。數量只能是 0 至 5 的整數，包含 0 與 5。
+        1. 數量為 0 時不能再減少；數量為 5 時，「加入購物車」及增加操作均不能使數量超過 5。
+        1. 每次數量改變後，畫面立即更新數量與商品小計。商品小計等於 NT$100 乘以數量。
+        1. 數量減至 0 時，畫面顯示購物車為空，商品小計為 NT$0。
+
+        ## UI 規格
+
+        首頁、商品頁與購物車頁採一致的司康小舖視覺。下列共用規格亦適用於 FETM-79 的結帳頁與訂單完成頁。
+
+        ### 共用色票與字體
+
+        - 頁面背景為 #F7F5EF，主要文字為 #273B32。商品卡片與一般面板背景為 #FFFDFA，插畫區背景為 #E9EDDF。
+        - 主按鈕背景與邊框為 #284D3B，文字為 #FFFFFF。可用按鈕的滑鼠懸停背景為 #173C29；停用按鈕保留原色，整體不透明度為 45%，不呈現可用按鈕的懸停效果。
+        - 商品卡片使用 1px、#E2DFD6 邊框及 16px 圓角；一般面板使用 1px、#E0E3D8 邊框及 14px 圓角。按鈕與連結的鍵盤焦點框為 3px、#997548，外距為 5px。
+        - 字體依序使用 PingFang TC、Microsoft JhengHei、system-ui、sans-serif。一般頁面主標題為 26–40px，首頁主視覺標題為 36–58px，區塊標題為 19–25px。商品說明為 14px，操作提示為 12px，內文行高為 1.6。
+
+        ### 商品與購物車配置
+
+        - 商品頁卡片依序呈現司康插畫、商品名稱、NT$100 單價、商品說明與「加入購物車」按鈕。主按鈕填滿所在內容區的寬度，高度至少 50px，圓角為 8px。
+        - 購物車商品區清楚呈現商品名稱、單價與數量。「−」、數量與「＋」由左至右排列，加減按鈕的操作區至少為 44 × 44px。加減按鈕背景為 #F7F8F3、文字為 #284D3B；可用時的懸停背景為 #E6ECDF，數量控制區邊框為 #CBD5C8。
+        - 數量為 5 時，「加入購物車」與「＋」顯示停用狀態。數量為 0 時顯示「購物車還是空的」與加入商品入口；若仍顯示「−」，該按鈕須停用。成功加入商品後，在按鈕附近顯示文字回饋，並同步更新導覽列的購物車數量。
+        - 內容區最大寬度為 1160px，桌面左右留白各 36px。畫面寬度不超過 760px 時改為單欄、左右留白各 20px，購物車商品區置於金額摘要上方。商品圖片等比例縮放，文字、數量控制與按鈕不得重疊或造成頁面橫向捲動。
+
+        ## UI 驗收條件
+
+        1. 首頁、商品頁與購物車頁符合共用色票及字體層級；商品卡片、一般面板與主按鈕符合指定的邊框、圓角與尺寸。
+        1. 在數量為 0、1、5 時檢查購物車，空車提示、加減控制與停用狀態均符合 UI 規格。可用主按鈕呈現指定懸停色，停用按鈕不呈現該效果；鍵盤移至可操作按鈕或連結時，焦點框清楚可見。
+        1. 以 375px 與 1280px 畫面寬度檢查首頁、商品頁與購物車頁。商品名稱、單價、數量與主要操作均可完整閱讀及操作，沒有重疊、裁切或頁面橫向捲動。
+      links:
+        - url: https://www.figma.com/design/DiPISvcpFmaPsK9QonpeDf
+          label: Figma 設計稿｜Todd Course｜商品與購物車設計稿
+          fileKey: DiPISvcpFmaPsK9QonpeDf
+        - url: https://www.figma.com/design/DiPISvcpFmaPsK9QonpeDf?node-id=1-81
+          label: Figma 設計稿｜商品頁｜桌面
+          fileKey: DiPISvcpFmaPsK9QonpeDf
+          nodeId: "1:81"
+        - url: https://www.figma.com/design/DiPISvcpFmaPsK9QonpeDf?node-id=1-82
+          label: Figma 設計稿｜購物車｜桌面
+          fileKey: DiPISvcpFmaPsK9QonpeDf
+          nodeId: "1:82"
+        - url: https://www.figma.com/design/DiPISvcpFmaPsK9QonpeDf?node-id=1-86
+          label: Figma 設計稿｜商品頁｜手機
+          fileKey: DiPISvcpFmaPsK9QonpeDf
+          nodeId: "1:86"
+        - url: https://www.figma.com/design/DiPISvcpFmaPsK9QonpeDf?node-id=1-87
+          label: Figma 設計稿｜購物車｜手機
+          fileKey: DiPISvcpFmaPsK9QonpeDf
+          nodeId: "1:87"
+
+assert:
+  - type: javascript
+    value: file://l1.mjs
+    metric: L1
+    config:
+      minCriteria: 10
+      styleChecks: forbidden
+      unresolved: required
+      observations: ["原味司康", "NT$100", "NT$0", "購物車還是空的"]
+      allowedPaths: ["/"]
+  - type: llm-rubric
+    metric: L2
+    value: criteria covers each of the seven 驗收條件 items and the three UI 驗收條件 items, with ids that keep the functional and UI groups distinguishable.
+  - type: llm-rubric
+    metric: L2
+    value: Cases that use the cart's increase/decrease controls first reach the cart page with a semantic link click (for example the 購物車 navigation link); they do not assume those controls exist on /.
+  - type: llm-rubric
+    metric: L2
+    value: Targets do not claim a page ("on the product page") that the case's actions never reached.
+  - type: llm-rubric
+    metric: L2
+    value: The quantity-limit criterion tests both edges, decreasing at 0 and adding past 5, and observes the resulting quantity rather than a disabled state.
+  - type: llm-rubric
+    metric: L2
+    value: The subtotal criterion checks at least two quantities with literal subtotals (for example NT$200 and NT$500).
+  - type: llm-rubric
+    metric: L2
+    value: UI criteria are deferred because no design is bound, and their expectations copy UI 規格 values exactly (for example #284D3B, #173C29, 45%, 375px and 1280px).
+  - type: llm-rubric
+    metric: L2
+    value: No criterion or case covers FETM-79 checkout or order-completion pages.
+  - type: llm-rubric
+    metric: L2
+    value: unresolved records that the product and cart page routes are undefined and that the add-to-cart feedback text and navigation cart-count format are unspecified.
+  - type: llm-rubric
+    metric: L2
+    value: No navigate action uses an invented path such as /cart or /product.

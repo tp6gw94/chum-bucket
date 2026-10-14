@@ -1,0 +1,43 @@
+description: Unmeasurable requirements in unlabeled prose
+
+metadata:
+  id: E02-vague-requirements
+  difficulty: edge
+  category: grounding
+  intent: Requirements have no labels and no observable values; the plan must define its own criteria without inventing thresholds, copy text or performance budgets.
+
+vars:
+  summary: 依 EVAL-402 規劃首頁使用體驗的測試
+  goal: 驗證首頁的使用體驗
+  sources:
+    - reference: { kind: jira, issueKey: EVAL-402 }
+      text: |
+        EVAL-402 首頁使用體驗改善
+
+        首頁要讓使用者覺得好用、直覺。頁面載入要快。錯誤訊息要友善，不要嚇到使用者。
+      links: []
+
+assert:
+  - type: javascript
+    value: file://l1.mjs
+    metric: L1
+    config:
+      minCriteria: 3
+      functionalChecks: forbidden
+      styleChecks: forbidden
+      unresolved: required
+  - type: llm-rubric
+    metric: L2
+    value: The planner defines separate criteria for usability, load speed and error-message tone, with ids of its own.
+  - type: llm-rubric
+    metric: L2
+    value: The plan invents no numeric threshold (for example "within 2 seconds" or a Lighthouse score) for load speed.
+  - type: llm-rubric
+    metric: L2
+    value: The plan invents no specific error message text.
+  - type: llm-rubric
+    metric: L2
+    value: Deferred expectations keep the source's qualitative wording instead of turning it into made-up acceptance values.
+  - type: llm-rubric
+    metric: L2
+    value: unresolved and the deferred reasons state that measurable criteria and expected text are missing.

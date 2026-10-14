@@ -1,0 +1,57 @@
+description: Comment permissions across guest, member and admin
+
+metadata:
+  id: H05-multi-role-permissions
+  difficulty: hard
+  category: external-setup
+  intent: Execute the guest-visible criterion, record the missing accounts, and defer everything that needs a login without inventing credentials.
+
+vars:
+  summary: 依 EVAL-305 規劃討論串留言權限的測試
+  goal: 驗證討論串留言的權限
+  sources:
+    - reference: { kind: jira, issueKey: EVAL-305 }
+      text: |
+        EVAL-305 討論串：留言權限
+
+        ## 角色
+
+        訪客、一般會員、管理員。
+
+        ## 驗收條件
+
+        - AC-1：未登入訪客開啟討論串 `/threads/42`，留言區顯示「登入後即可留言」。
+        - AC-2：已登入的一般會員可在留言框輸入內容並點擊「送出」，新留言出現在列表最後。
+        - AC-3：一般會員看不到其他人留言的「刪除」按鈕。
+        - AC-4：管理員可刪除任一留言，刪除後該留言位置顯示「留言已刪除」。
+        - AC-5：留言內容超過 500 字時，送出按鈕旁顯示「留言最多 500 字」。
+      links: []
+
+assert:
+  - type: javascript
+    value: file://l1.mjs
+    metric: L1
+    config:
+      executable: [AC-1]
+      deferred: [AC-2, AC-3, AC-4, AC-5]
+      unresolved: required
+      literals:
+        AC-1: ["登入後即可留言"]
+        AC-4: ["留言已刪除"]
+        AC-5: ["留言最多 500 字"]
+      allowedPaths: ["/threads/42"]
+  - type: llm-rubric
+    metric: L2
+    value: No case fills a username, password or other credential, and no deferred step contains a made-up account.
+  - type: llm-rubric
+    metric: L2
+    value: unresolved notes that member and admin test accounts and the login method are not provided.
+  - type: llm-rubric
+    metric: L2
+    value: Deferred reasons cite the missing member/admin accounts, not vague "cannot test".
+  - type: llm-rubric
+    metric: L2
+    value: AC-5 is deferred because the comment box is only available to logged-in members, even though the 500-character boundary itself would be testable.
+  - type: llm-rubric
+    metric: L2
+    value: AC-3's "cannot see" expectation is not turned into an executable visible=false check on an element that may be absent.

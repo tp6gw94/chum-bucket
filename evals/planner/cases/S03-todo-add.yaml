@@ -1,0 +1,43 @@
+description: Todo list add, empty state and whitespace-only input
+
+metadata:
+  id: S03-todo-add
+  difficulty: simple
+  category: coverage
+  intent: Empty initial state, a happy-path add, and a whitespace-only negative input.
+
+vars:
+  summary: 依 EVAL-103 規劃待辦清單新增功能的測試
+  goal: 驗證待辦清單的新增功能
+  sources:
+    - reference: { kind: jira, issueKey: EVAL-103 }
+      text: |
+        EVAL-103 待辦清單：新增項目
+
+        ## 驗收條件
+
+        - AC-1：初次開啟 `/todos` 時清單為空，顯示「目前沒有待辦事項」，計數顯示「0 項待辦」。
+        - AC-2：在輸入框輸入「買牛奶」並點擊「新增」後，清單最後一項顯示「買牛奶」，計數顯示「1 項待辦」。
+        - AC-3：輸入框為空白或只有空白字元時點擊「新增」，清單不新增項目，計數維持「0 項待辦」。
+      links: []
+
+assert:
+  - type: javascript
+    value: file://l1.mjs
+    metric: L1
+    config:
+      executable: [AC-1, AC-2, AC-3]
+      literals:
+        AC-1: ["目前沒有待辦事項", "0 項待辦"]
+        AC-2: ["買牛奶", "1 項待辦"]
+        AC-3: ["0 項待辦"]
+      allowedPaths: ["/todos"]
+  - type: llm-rubric
+    metric: L2
+    value: AC-3 covers a whitespace-only input (for example "   "), not only an empty field.
+  - type: llm-rubric
+    metric: L2
+    value: The plan does not invent a persistence-after-reload check, because the source does not say whether items survive a reload.
+  - type: llm-rubric
+    metric: L2
+    value: AC-2 checks the last list item text, not just that some item exists.

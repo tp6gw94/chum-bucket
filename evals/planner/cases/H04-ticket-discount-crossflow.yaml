@@ -1,0 +1,59 @@
+description: Cross-page ticket purchase with a 3-ticket discount and a random order number
+
+metadata:
+  id: H04-ticket-discount-crossflow
+  difficulty: hard
+  category: navigation
+  intent: Multi-page stateful flow reached by clicks, computed literal totals at the discount boundary, and a contains check for a random order number.
+
+vars:
+  summary: 依 EVAL-304 規劃活動購票流程與團體折扣的測試
+  goal: 驗證活動購票流程與團體折扣
+  sources:
+    - reference: { kind: jira, issueKey: EVAL-304 }
+      text: |
+        EVAL-304 爵士之夜：購票流程與團體折扣
+
+        ## 流程
+
+        活動頁 → 確認頁 → 完成頁。確認頁與完成頁由按鈕進入。
+
+        ## 驗收條件
+
+        - AC-1：活動頁 `/events/jazz-night` 顯示票價「NT$350／張」。
+        - AC-2：在活動頁點擊「＋」選擇張數後點擊「立即購票」，進入確認頁，確認頁顯示所選張數，例如「2 張」。
+        - AC-3：確認頁的應付金額為 NT$350 乘以張數；一次購買 3 張以上享 9 折。
+        - AC-4：每筆最多購買 4 張。
+        - AC-5：在確認頁點擊「送出訂單」後進入完成頁，顯示「訂購成功」與一組以「JZ-」開頭的訂單編號。
+        - AC-6：在完成頁點擊「返回活動頁」後，活動頁的張數重設為「0」。
+      links: []
+
+assert:
+  - type: javascript
+    value: file://l1.mjs
+    metric: L1
+    config:
+      executable: [AC-1, AC-2, AC-3, AC-4, AC-5, AC-6]
+      literals:
+        AC-1: ["NT$350／張"]
+        AC-3: ["NT$700", "NT$945"]
+        AC-5: ["訂購成功", "JZ-"]
+        AC-6: ["0"]
+      boundaries:
+        AC-3: ["NT$700", "NT$945"]
+      allowedPaths: ["/events/jazz-night"]
+  - type: llm-rubric
+    metric: L2
+    value: AC-3 computes literal totals on both sides of the discount boundary, 2 tickets = NT$700 and 3 tickets = NT$945, instead of writing a formula.
+  - type: llm-rubric
+    metric: L2
+    value: AC-5 checks the order number with comparison contains JZ- rather than equals, because the full number is unpredictable.
+  - type: llm-rubric
+    metric: L2
+    value: Confirmation and completion pages are reached by clicking 立即購票 and 送出訂單; no invented paths such as /confirm or /orders.
+  - type: llm-rubric
+    metric: L2
+    value: AC-4 tries to go beyond 4 tickets and checks the selection stays at 4.
+  - type: llm-rubric
+    metric: L2
+    value: Each case repeats the full setup it needs from /events/jazz-night, because cases do not share state.

@@ -1,0 +1,11 @@
+# yaml-language-server: $schema=https://promptfoo.dev/config-schema.json
+description: Planner eval
+tests: file://cases/*.yaml
+defaultTest:
+  options:
+    disableVarExpansion: true
+    provider:
+      id: openai:chat:zai-org/GLM-5.3-Flash
+      config:
+        apiBaseUrl: https://api.deepinfra.com/v1/openai
+        apiKeyEnvar: MODEL_API_KEY

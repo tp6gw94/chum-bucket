@@ -1,0 +1,41 @@
+description: Static about page heading, footer and contact link from unlabeled prose
+
+metadata:
+  id: S04-about-static-page
+  difficulty: simple
+  category: coverage
+  intent: The smallest reasonable plan from a source without criterion labels; penalizes padding with invented scenarios.
+
+vars:
+  summary: 依 EVAL-104 規劃關於我們頁面的測試
+  goal: 驗證關於我們頁面的內容
+  sources:
+    - reference: { kind: jira, issueKey: EVAL-104 }
+      text: |
+        EVAL-104 新增關於我們頁面
+
+        新增 `/about` 頁面，主標題為「關於我們」，頁尾顯示版權文字「© 2026 Chum Bucket」。
+
+        頁面中放一個「聯絡我們」連結，點擊後前往 `/contact`。
+      links: []
+
+assert:
+  - type: javascript
+    value: file://l1.mjs
+    metric: L1
+    config:
+      minCriteria: 3
+      observations: ["關於我們", "© 2026 Chum Bucket", "/contact"]
+      allowedPaths: ["/about"]
+  - type: llm-rubric
+    metric: L2
+    value: The planner defines one criterion each for the heading, the footer text and the contact link, with short stable ids of its own.
+  - type: llm-rubric
+    metric: L2
+    value: The contact-link criterion reaches /contact by clicking the 聯絡我們 link, not by navigating to /contact directly.
+  - type: llm-rubric
+    metric: L2
+    value: The contact-link check uses a url observation with comparison contains.
+  - type: llm-rubric
+    metric: L2
+    value: The plan has at most 3 cases and does not add scenarios beyond the three requirements.

@@ -1,0 +1,46 @@
+description: Delegation summary limits the plan to AC-2 and AC-5 out of six criteria
+
+metadata:
+  id: M05-scoped-subset
+  difficulty: medium
+  category: scope
+  intent: Respect a subset stated in the delegation summary; define only those criteria and never widen to the rest of the source.
+
+vars:
+  summary: 依 EVAL-205 規劃通知設定頁的測試，範圍只限 AC-2 與 AC-5
+  goal: 驗證通知設定頁
+  sources:
+    - reference: { kind: jira, issueKey: EVAL-205 }
+      text: |
+        EVAL-205 通知設定頁
+
+        ## 驗收條件
+
+        - AC-1：`/notifications` 頁顯示三個通知類別：「訂單更新」「促銷活動」「系統公告」。
+        - AC-2：「促銷活動」通知預設為關閉，開關旁的狀態文字顯示「已關閉」。
+        - AC-3：「系統公告」通知不可關閉，其開關為停用狀態。
+        - AC-4：點擊「全部關閉」後，「系統公告」以外的通知狀態文字皆顯示「已關閉」。
+        - AC-5：變更任一通知開關後點擊「儲存設定」，頁面顯示「設定已更新」。
+        - AC-6：有未儲存的變更時離開頁面，跳出確認對話框「尚有未儲存的變更」。
+      links: []
+
+assert:
+  - type: javascript
+    value: file://l1.mjs
+    metric: L1
+    config:
+      executable: [AC-2, AC-5]
+      excluded: [AC-1, AC-3, AC-4, AC-6]
+      literals:
+        AC-2: ["已關閉"]
+        AC-5: ["設定已更新"]
+      allowedPaths: ["/notifications"]
+  - type: llm-rubric
+    metric: L2
+    value: criteria defines only AC-2 and AC-5; AC-1, AC-3, AC-4 and AC-6 are neither defined nor referenced by any check or deferred expectation.
+  - type: llm-rubric
+    metric: L2
+    value: AC-5 toggles one specific named switch (for example 促銷活動) before clicking 儲存設定.
+  - type: llm-rubric
+    metric: L2
+    value: The plan does not mention or test the out-of-scope behaviours in titles or steps.

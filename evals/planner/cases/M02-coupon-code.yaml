@@ -1,0 +1,53 @@
+description: Coupon code application, invalid code, case-insensitivity and reuse
+
+metadata:
+  id: M02-coupon-code
+  difficulty: medium
+  category: coverage
+  intent: Literal monetary values, a case-insensitivity variant, and a repeated-application negative case.
+
+vars:
+  summary: 依 EVAL-202 規劃結帳頁優惠碼功能的測試
+  goal: 驗證結帳頁優惠碼功能
+  sources:
+    - reference: { kind: jira, issueKey: EVAL-202 }
+      text: |
+        EVAL-202 結帳頁：優惠碼
+
+        ## 範圍
+
+        結帳頁 `/checkout` 預設載入示範訂單，用於驗證優惠碼。
+
+        ## 驗收條件
+
+        - AC-1：結帳頁 `/checkout` 預設載入示範訂單，商品小計顯示「NT$500」。
+        - AC-2：輸入優惠碼「SAVE10」並點擊「套用」，折扣顯示「-NT$50」，應付金額顯示「NT$450」。
+        - AC-3：輸入不存在的優惠碼「FAKE99」並點擊「套用」，顯示「優惠碼無效」，應付金額維持「NT$500」。
+        - AC-4：優惠碼不分大小寫：輸入「save10」與輸入「SAVE10」的結果相同。
+        - AC-5：同一訂單只能套用一組優惠碼；已套用「SAVE10」後再次套用，顯示「已套用優惠碼」，應付金額維持「NT$450」。
+      links: []
+
+assert:
+  - type: javascript
+    value: file://l1.mjs
+    metric: L1
+    config:
+      executable: [AC-1, AC-2, AC-3, AC-4, AC-5]
+      literals:
+        AC-1: ["NT$500"]
+        AC-2: ["-NT$50", "NT$450"]
+        AC-3: ["優惠碼無效", "NT$500"]
+        AC-4: ["NT$450"]
+        AC-5: ["已套用優惠碼", "NT$450"]
+      boundaries:
+        AC-4: ["save10"]
+      allowedPaths: ["/checkout"]
+  - type: llm-rubric
+    metric: L2
+    value: AC-4 fills the lowercase code save10 and expects the same NT$450 outcome as AC-2.
+  - type: llm-rubric
+    metric: L2
+    value: AC-5 applies SAVE10 twice within one case and checks both the message and the unchanged NT$450 total.
+  - type: llm-rubric
+    metric: L2
+    value: Monetary values are copied exactly, including the minus sign in -NT$50.

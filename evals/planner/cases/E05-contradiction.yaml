@@ -1,0 +1,46 @@
+description: Two criteria state different purchase limits
+
+metadata:
+  id: E05-contradiction
+  difficulty: edge
+  category: grounding
+  intent: Record the contradiction in unresolved and keep each limit traceable to its own criterion instead of silently choosing one.
+
+vars:
+  summary: 依 EVAL-405 規劃商品購買數量上限的測試
+  goal: 驗證商品購買數量上限
+  sources:
+    - reference: { kind: jira, issueKey: EVAL-405 }
+      text: |
+        EVAL-405 商品購買數量上限
+
+        ## 驗收條件
+
+        - AC-1：每筆訂單最多可購買 5 顆。
+        - AC-2：在商品頁 `/product` 點擊「加入購物車」，數量加 1。
+        - AC-3：每筆訂單最多可購買 10 顆，達上限時顯示「已達購買上限」。
+      links: []
+
+assert:
+  - type: javascript
+    value: file://l1.mjs
+    metric: L1
+    config:
+      executable: [AC-2]
+      either: [AC-1, AC-3]
+      unresolved: required
+      literals:
+        AC-3: ["已達購買上限"]
+      allowedPaths: ["/product"]
+  - type: llm-rubric
+    metric: L2
+    value: unresolved names the conflict between the 5-item limit in AC-1 and the 10-item limit in AC-3.
+  - type: llm-rubric
+    metric: L2
+    value: The plan does not silently pick one limit and drop the other; each limit is traced to its own criterion.
+  - type: llm-rubric
+    metric: L2
+    value: No third limit value is invented.
+  - type: llm-rubric
+    metric: L2
+    value: The contradiction is visible in the plan, either as deferred reasons or as separate cases titled by their source limit.

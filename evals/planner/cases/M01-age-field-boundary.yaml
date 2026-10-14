@@ -1,0 +1,49 @@
+description: Age field accepts 18 to 65 inclusive
+
+metadata:
+  id: M01-age-field-boundary
+  difficulty: medium
+  category: boundary
+  intent: Boundary-value analysis on both edges, plus empty and non-integer inputs, one input per case.
+
+vars:
+  summary: 依 EVAL-201 規劃個人資料頁年齡欄位驗證規則的測試
+  goal: 驗證個人資料頁的年齡欄位驗證規則
+  sources:
+    - reference: { kind: jira, issueKey: EVAL-201 }
+      text: |
+        EVAL-201 個人資料頁：年齡欄位驗證
+
+        ## 驗收條件
+
+        - AC-1：`/profile` 頁「年齡」欄位接受 18 至 65 的整數（含 18 與 65）；輸入合法值後點擊「儲存」，顯示「資料已儲存」。
+        - AC-2：年齡小於 18 或大於 65 時點擊「儲存」，欄位下方顯示「年齡需介於 18 至 65 歲」。
+        - AC-3：年齡欄位空白時點擊「儲存」，顯示「請輸入年齡」。
+        - AC-4：年齡輸入非整數（例如「20.5」或「abc」）時點擊「儲存」，顯示「年齡必須為整數」。
+      links: []
+
+assert:
+  - type: javascript
+    value: file://l1.mjs
+    metric: L1
+    config:
+      executable: [AC-1, AC-2, AC-3, AC-4]
+      literals:
+        AC-1: ["資料已儲存"]
+        AC-2: ["年齡需介於 18 至 65 歲"]
+        AC-3: ["請輸入年齡"]
+        AC-4: ["年齡必須為整數"]
+      boundaries:
+        AC-1: ["18", "65"]
+        AC-2: ["17", "66"]
+        AC-4: ["20.5"]
+      allowedPaths: ["/profile"]
+  - type: llm-rubric
+    metric: L2
+    value: Both inclusive edges (18 and 65) and both just-outside values (17 and 66) are tested.
+  - type: llm-rubric
+    metric: L2
+    value: Each boundary input is its own case; the plan does not fill several values in one case and then observe only the last result.
+  - type: llm-rubric
+    metric: L2
+    value: Error-message checks use the exact literal messages.

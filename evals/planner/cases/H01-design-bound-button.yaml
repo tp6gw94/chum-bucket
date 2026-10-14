@@ -1,0 +1,73 @@
+description: Bound design node for the primary button, with decoy Figma links
+
+metadata:
+  id: H01-design-bound-button
+  difficulty: hard
+  category: design
+  intent: Emit style checks only for the bound node, keep UI cases navigation-only, and defer requirements that need other nodes or hover.
+
+vars:
+  summary: 依 EVAL-301 規劃結帳頁「確認付款」按鈕的功能與樣式測試，設計稿使用 node 45:120
+  goal: 驗證結帳頁「確認付款」按鈕的功能與樣式
+  sources:
+    - reference: { kind: jira, issueKey: EVAL-301 }
+      text: |
+        EVAL-301 結帳頁：確認付款按鈕
+
+        ## 驗收條件
+
+        - AC-1：結帳頁 `/checkout` 點擊「確認付款」後，按鈕下方顯示「付款處理中…」。
+
+        ## UI 驗收條件
+
+        設計稿見附件連結。
+
+        - UI-1：結帳頁「確認付款」主按鈕的寬度、高度、圓角與背景色符合設計稿 node 45:120。
+        - UI-2：停用狀態的「確認付款」按鈕不透明度符合設計稿 node 45:121。
+        - UI-3：滑鼠懸停於「確認付款」按鈕時，背景色變為 #173c29。
+      links:
+        - url: https://www.figma.com/design/EVALfig0001?node-id=45-120
+          label: 主按鈕｜預設狀態
+          fileKey: EVALfig0001
+          nodeId: "45:120"
+        - url: https://www.figma.com/design/EVALfig0001?node-id=45-121
+          label: 主按鈕｜停用狀態
+          fileKey: EVALfig0001
+          nodeId: "45:121"
+        - url: https://www.figma.com/design/EVALfig0001?node-id=40-1
+          label: 結帳頁｜桌面
+          fileKey: EVALfig0001
+          nodeId: "40:1"
+  design: { fileKey: EVALfig0001, nodeId: "45:120" }
+
+assert:
+  - type: javascript
+    value: file://l1.mjs
+    metric: L1
+    config:
+      executable: [AC-1, UI-1]
+      deferred: [UI-2, UI-3]
+      styleChecks: required
+      design: { fileKey: EVALfig0001, nodeId: "45:120" }
+      literals:
+        AC-1: ["付款處理中…"]
+        UI-3: ["#173c29"]
+      allowedPaths: ["/checkout"]
+  - type: llm-rubric
+    metric: L2
+    value: UI-1 has separate style checks for width, height, cornerRadius and backgroundColor, all referencing EVALfig0001 / 45:120.
+  - type: llm-rubric
+    metric: L2
+    value: The UI-1 case contains only navigate actions; it does not click 確認付款.
+  - type: llm-rubric
+    metric: L2
+    value: AC-1 is a functional case separate from the UI case.
+  - type: llm-rubric
+    metric: L2
+    value: UI-2 is deferred because node 45:121 is not the bound design; no style check references 45:121 or 40:1.
+  - type: llm-rubric
+    metric: L2
+    value: "UI-3 is deferred because hover is unsupported, and keeps the literal #173c29."
+  - type: llm-rubric
+    metric: L2
+    value: Style checks use exact tolerance unless the requirement justifies a numeric one.

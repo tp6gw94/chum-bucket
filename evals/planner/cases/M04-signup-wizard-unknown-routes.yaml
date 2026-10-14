@@ -1,0 +1,57 @@
+description: Multi-step signup wizard where only the home route is known
+
+metadata:
+  id: M04-signup-wizard-unknown-routes
+  difficulty: medium
+  category: navigation
+  intent: Reach later steps by semantic clicks instead of invented routes, record the source gaps, and defer the step whose required data is unknown.
+
+vars:
+  summary: 依 EVAL-204 規劃註冊流程步驟切換的測試
+  goal: 驗證註冊流程的步驟切換
+  sources:
+    - reference: { kind: jira, issueKey: EVAL-204 }
+      text: |
+        EVAL-204 註冊精靈：步驟切換
+
+        ## 說明
+
+        註冊流程分三步，從首頁的「立即註冊」進入。第 2 步「個人資料」的欄位由設計團隊另行定義。
+
+        ## 驗收條件
+
+        - AC-1：在首頁 `/` 點擊「立即註冊」進入註冊流程第 1 步，步驟標題顯示「步驟 1／3：建立帳號」。
+        - AC-2：第 1 步輸入 Email「new@example.com」與暱稱「小海」後點擊「下一步」，進入第 2 步，步驟標題顯示「步驟 2／3：個人資料」。
+        - AC-3：在第 2 步點擊「上一步」回到第 1 步，先前輸入的 Email「new@example.com」仍保留在欄位中。
+        - AC-4：在第 3 步點擊「完成註冊」後顯示「註冊完成，歡迎加入！」。
+      links: []
+
+assert:
+  - type: javascript
+    value: file://l1.mjs
+    metric: L1
+    config:
+      executable: [AC-1, AC-2, AC-3]
+      either: [AC-4]
+      unresolved: required
+      literals:
+        AC-1: ["步驟 1／3：建立帳號"]
+        AC-2: ["步驟 2／3：個人資料"]
+        AC-3: ["new@example.com"]
+        AC-4: ["註冊完成，歡迎加入！"]
+      allowedPaths: ["/"]
+  - type: llm-rubric
+    metric: L2
+    value: Every case starts from / and reaches later steps by clicking 立即註冊, 下一步 or 上一步; no invented paths such as /signup/step-2.
+  - type: llm-rubric
+    metric: L2
+    value: AC-3 uses a value observation on the email field with the literal new@example.com.
+  - type: llm-rubric
+    metric: L2
+    value: AC-4 is deferred, or if executable it does not invent step-2 field values; a deferred AC-4 cites the unknown step-2 fields as the reason.
+  - type: llm-rubric
+    metric: L2
+    value: unresolved notes that the step-2 fields and accepted values are not defined.
+  - type: llm-rubric
+    metric: L2
+    value: No password or other credential appears in the plan.
