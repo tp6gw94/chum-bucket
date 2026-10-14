@@ -58,6 +58,15 @@ git switch -c my-harness origin/workshop/00-start
 git diff origin/workshop/04-compact origin/workshop/05-subagents
 ```
 
+## Claude Code Source Code Reference
+
+- [Loop](https://deepwiki.com/search/-loop-messages_38d6a36b-d52f-446c-9a07-0ca39d6c4257?mode=fast)
+- [Tool Call](https://deepwiki.com/search/-tool-call-tool_f78fe3c4-dc6b-4544-8b1f-d7fc866e22e0?mode=fast)
+- [Subagent](https://deepwiki.com/search/-subagent_4a3fdfd4-ff63-4c8c-a557-6517611f3f14?mode=fast)
+- [Compact](https://deepwiki.com/search/-compact_6d2d9ab8-6fbc-4a2b-8797-51d6641005ed?mode=fast)
+- [User Approve](https://deepwiki.com/search/-user-approve_eb74a2c7-0205-42b9-9c29-aed68fd8216e?mode=fast)
+
+
 ## 0. Intro
 
 Agent = Model + Harness
