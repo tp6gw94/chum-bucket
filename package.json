@@ -4,9 +4,10 @@
   "scripts": {
     "generate": "openui generate src/library.ts --spec --out src/generated/spec.json",
     "prevdev": "pnpm run generate",
-    "dev": "concurrently \"vite\" \"tsx watch server/index.ts\"",
+    "dev": "concurrently \"vite\" \"tsx watch server/index.ts\" \"tsx scripts/atlassian-mcp.ts\"",
     "dev:client": "vite",
     "dev:server": "tsx watch server/index.ts",
+    "dev:atlassian": "tsx scripts/atlassian-mcp.ts",
     "typecheck": "tsc",
     "check:contrast": "tsx scripts/check-contrast.ts",
     "check:openui": "tsx scripts/check-openui-parse.ts",
