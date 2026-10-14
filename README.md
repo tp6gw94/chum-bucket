@@ -363,15 +363,19 @@ flowchart LR
 
 角色之間不直接對話。前一個角色的產出由 host 驗證後存成 artifact，主 Agent 把它的 ref 交給下一個角色。
 
-### Host 驗證，不是模型自己說了算
+### Host 驗證產出，主 Agent 寫 QA 報告
 
 角色的模型只「提出」結果。host 用自己記下的工具紀錄（receipt）檢查：
 
 - `atlassian` 不寫需求整理，host 直接從它讀到的原文組出需求。
 - `planner` 的計畫要通過 ID 與引用檢查，哪些檢查分給 `ac`、哪些分給 `ui` 由 host 決定。
-- `ac` 與 `ui` 的判定必須引用瀏覽器結果的 receipt，host 用 receipt 重新推出判定，和模型寫的不同就拒絕。
+- `ac` 與 `ui` 不交判定，只寫純文字的 findings。host 從瀏覽器的 receipt 直接組出每個 check 的工具觀察。
 
-不通過時，host 把問題回饋給角色，再給 2 回合。仍不通過，主 Agent 收到失敗原因。
+`atlassian` 與 `planner` 不通過時，host 把問題回饋給角色，再給 2 回合。仍不通過，主 Agent 收到失敗原因。
+
+`ac` 與 `ui` 結束後，主 Agent 收到分開的三份輸入：角色的 findings、host 的工具觀察，以及沒有工具觀察的 check。task 完成只代表執行結束，不代表檢查通過。主 Agent 比對這三份輸入，用自然語言寫 QA 報告，缺少的證據寫成限制，互相矛盾的觀察兩邊都留下。
+
+判定直接來自 receipt，模型不必抄寫 receipt ID 與 digest，也改不了判定。模型的文字只負責 receipt 表達不了的部分：怎麼解讀差異，以及缺了哪些證據。
 
 ### 瀏覽器由 Jev 選元素
 
@@ -383,15 +387,16 @@ flowchart LR
 
 - [ ] 建立 Agent registry，用 `allowsTool` 統一判斷每個 Agent 能用哪些工具。
 - [ ] 建立 `delegate_task`，為每次委派建立一個可恢復的 DBOS 子 workflow，用 artifact ref 串起角色。
-- [ ] 建立 `atlassian`、`planner`、`ac`、`ui` 四個角色，由 host 驗證產出並給一次回饋。
+- [ ] 建立 `atlassian`、`planner`、`ac`、`ui` 四個角色。host 驗證 `atlassian` 與 `planner` 的產出並給一次回饋，`ac` 與 `ui` 回傳純文字 findings。
 - [ ] 建立 `verify_ac` 與 `verify_ui`，用 Playwright 執行計畫、Jev 選元素，選不出來時交給角色。
+- [ ] 讓主 Agent 比對 findings、工具觀察與缺少證據的 check，用自然語言寫 QA 報告。
 - [ ] 在 `delegate_task` 呼叫下方顯示角色進度，支援取消。
 
 依序閱讀以下文件：
 
 1. [子 Agent 的委派架構](docs/subagents/architecture.md)：角色分工、資料流、artifact 與不重跑的保證。
 2. [建立委派](docs/subagents/implement-delegation.md)：registry、工具權限、`delegate_task`、主 workflow 的七個 steps 與子 workflow。
-3. [建立四個角色](docs/subagents/role-agents.md)：角色的 prompt、工具限制、receipt、產出驗證與回饋。
+3. [建立四個角色](docs/subagents/role-agents.md)：角色的 prompt、工具限制、receipt、產出驗證、回饋與 QA findings。
 4. [建立瀏覽器驗證](docs/subagents/browser-verification.md)：Playwright、Jev、handoff 與重跑保護。
 5. [驗證子 Agent](docs/subagents/verify-subagents.md)：權限與產出測試、中斷恢復與 demo 商店驗收。
 

@@ -139,9 +139,9 @@ hook 在 step 外面執行，因為委派本身由許多 DBOS steps 組成，不
 2. **`<operationId>:reserve`**：建立 `testing_tasks`，算出 `taskId` 與 `childWorkflowId`，`attempt_nonce` 固定為 1。task 已存在時，`input_digest` 必須相同，回傳原本那列。前置角色還沒完成時拒絕：`planner` 需要 `atlassian` 已 `satisfied`，`ac`/`ui` 需要 `planner` 已 `satisfied`。寫入 `dispatch:<role>` decision。
 3. **`<taskId>:start-join`**：用 `DBOSClient.enqueue` 把子 workflow 排進 `testing-delegation` 佇列，`workflowID` 是 `childWorkflowId`。接著 `handle.getResult()` 等它結束。子 workflow 以 ERROR 結束時，轉成 `{ state: "failed", reason: "child_failed" }`。
 4. **`<operationId>:drain`**：確認子 workflow 的工作都已停止。
-5. **`<operationId>:settle`**：已收到取消時記錄 `cancelled`。子 workflow 回傳失敗時，把原因對應成 `RoleFailureCode` 後記錄。成功時呼叫 `acceptRoleCompletion`，再驗證一次產出並寫入 artifact。這次驗證失敗就記錄 `proposal_rejected`。
+5. **`<operationId>:settle`**：已收到取消時記錄 `cancelled`。子 workflow 回傳失敗時，把原因對應成 `RoleFailureCode` 後記錄。成功時呼叫 `acceptRoleCompletion`，再驗證一次產出並寫入 artifact。這次驗證失敗就記錄 `proposal_rejected`。`ac` 與 `ui` 失敗時，仍用已存下的 receipt 寫入工具觀察。
 6. **`<operationId>:quiet`**：每 200 毫秒檢查一次，直到 operation 已結束，或所有子流程都停了。等待期間更新 projection。
-7. **`<operationId>:close`**：寫入 `finished_at` 與 `terminal_outcome`，只寫一次。取消優先，接著是超過期限，最後看角色的 `task_result`。
+7. **`<operationId>:close`**：寫入 `finished_at` 與 `terminal_outcome`，只寫一次。取消優先，接著是超過期限，最後看角色的 `task_result`。`ac` 或 `ui` 的 task 還沒有 `task_result` 時，close 先記錄 `child_failed`，取消時記錄 `cancelled`。
 
 `delegateTask` 回傳的物件就是主 Agent 看到的工具結果：
 
@@ -149,12 +149,17 @@ hook 在 step 外面執行，因為委派本身由許多 DBOS steps 組成，不
 {
 	runId,    // operationId
 	state,    // "finished"
-	task,     // { role, summary, origin, result }，result 是 artifact 的 ref 與內容，失敗時為 null
-	progress, // 角色的進度列，失敗時帶 reasonCode 與 issues
+	task,     // 依角色不同，見下方
+	progress, // 角色的進度列，只代表生命週期，失敗時帶 reasonCode 與 issues
 }
 ```
 
-在 `testing-child.ts` 的模組頂層註冊子 workflow：`DBOS.registerWorkflow(executeTestingChild, { name: "testing-child-v1" })`。這個模組必須在 `DBOS.launch()` 之前載入。
+`task` 有兩種形狀：
+
+- `atlassian` 與 `planner`：`{ version: 2, role, summary, origin, result }`。`result` 是 artifact 的 ref 與內容，失敗時為 `null`。
+- `ac` 與 `ui`：`{ version: 3, role, summary, origin, findings, missingChecks, conflictingChecks, result }`。`findings` 是角色寫的純文字，沒有或失敗時為 `null`。`result` 是 host 從 receipt 組出的工具觀察，角色失敗時也會有。欄位的意思見[子 Agent 的委派架構](architecture.md)。
+
+在 `testing-child.ts` 的模組頂層註冊子 workflow：`DBOS.registerWorkflow(executeTestingChild, { name: TESTING_WORKFLOW_VERSION })`，目前的版本是 `testing-child-v3`。這個模組必須在 `DBOS.launch()` 之前載入。角色產出的格式改變時，升級這個版本。`childWorkflowId` 也由這個版本算出，舊的子 workflow 不會被新程式接手。
 
 ## 7. 建立子 workflow
 
@@ -164,7 +169,7 @@ hook 在 step 外面執行，因為委派本身由許多 DBOS steps 組成，不
 2. 讀回 operation 的 `intent` 與 runtime，用 `roleSystemPrompt(role, profile)` 取得 system prompt。存下的 profile 和 registry 不同時丟出錯誤。這代表 operation 是舊版程式建立的。
 3. 設定一個在 `deadline` 觸發的 `AbortSignal`。
 4. 依角色組合工具，執行角色的模型迴圈。細節在[建立四個角色](role-agents.md)。
-5. 回傳 `{ state: "ready", completion }`、`{ state: "failed", reason, issues? }` 或 `{ state: "denied", reason }`。
+5. 回傳 `{ state: "ready", completion }`、`{ state: "failed", reason, issues? }` 或 `{ state: "denied", reason }`。`ac` 與 `ui` 的 `completion` 是 `{ role, findings }`。回合用完時 `reason` 是 `budget`。context 超過模型上限時 `reason` 是 `context_overflow`，主 workflow 記錄成 `child_failed`。
 
 子 workflow 呼叫的是同一個 `runAgentLoop`，差異在三個參數：
 
@@ -208,6 +213,8 @@ hook 在 step 外面執行，因為委派本身由許多 DBOS steps 組成，不
 
 `TestingPanel` 用 `task.origin.parentMessageId` 與 `requestKey` 找到對應的 `delegate_task` 工具呼叫，把卡片顯示在那則 assistant 訊息後面。卡片顯示角色狀態、正在跑的工具、失敗原因，以及結束後的 artifact。執行中的卡片有取消按鈕。
 
+`ac` 與 `ui` 的卡片把模型文字和工具觀察分成兩塊，並註明任務完成不代表檢查通過。`conflictingChecks` 與 `missingChecks` 不是空的時候，卡片列出這些 check。同一個 check 的每筆觀察都顯示，不合併。
+
 重新整理頁面時，`GET /api/chat` 的 `hydrateThread` 多回傳 `publishedTasks`，前端用 `parsePublishedTasks` 讀回每個 operation 的最新卡片。
 
 ## 11. 啟動時接回未完成的委派
@@ -216,6 +223,8 @@ hook 在 step 外面執行，因為委派本身由許多 DBOS steps 組成，不
 
 - 已取消的 operation 補上缺少的 `cancel:<taskId>` delivery。
 - 重新 publish 每個未結束的 operation。
+
+啟動時 `assertDelegationCutover` 先檢查未結束的 operation。有 operation 是別的 `TESTING_WORKFLOW_VERSION` 建立的，就拒絕啟動，不修改任何紀錄。先用原本的 worker 跑完這些 operation，再啟動新版。
 
 不要在這裡重新啟動子 workflow。DBOS 會自己恢復佇列裡的 workflow。主 workflow 恢復時重新執行 `delegateTask`，admit 與 reserve 拿回同一筆紀錄，`enqueue` 拿回同一個 workflow handle。
 

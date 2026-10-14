@@ -22,7 +22,7 @@
 回傳值有兩種：
 
 - 結束：`{ checkId, evidence, receiptId, outputDigest }`。host 存下 receipt 後才加上 `receiptId` 與 `outputDigest`。
-- 暫停：`{ state: "selection_required" | "fill_value_required", checkId, handoff }`。沒有 receipt，不能當作證據引用。
+- 暫停：`{ state: "selection_required" | "fill_value_required", checkId, handoff }`。沒有 receipt，不會成為工具觀察。
 
 ## 1. 執行一個 case
 
@@ -146,7 +146,7 @@ Jev 不接受選擇時，瀏覽器不關閉，case 暫停，工具回傳 `select
 - 樣式檢查：`outcome` 是 `inside_tolerance`、`outside_tolerance` 或 `blocked`，帶 `property`、`expected`、`observed`、`tolerance`、`capturedDesign`。
 - 共同欄位：`origin: "browser"`、`fixture: { id: "playwright-chromium", version: "v1" }`、`adapterVersion: "playwright-jev-v1"`，以及 `browser.selections`（每次選擇是 Jev 還是角色選的）、`skippedActions` 與截圖。
 
-子 workflow 收到結束的結果時，存成 `testing_receipts`，`bindings` 記錄 `checkId`、fixture 與 adapter 版本。收到 handoff 時不存 receipt，所以角色無法把 handoff 當成證據。
+子 workflow 收到結束的結果時，存成 `testing_receipts`，`bindings` 記錄 `checkId`、fixture 與 adapter 版本。收到 handoff 時不存 receipt，所以 handoff 不會出現在 host 組出的工具觀察裡。
 
 `origin` 也可能是 `mock`。schema 規定 `browser` 證據一定要有 fixture 與 adapter 版本，`mock` 證據不能有，兩者不會混淆。
 
@@ -164,13 +164,9 @@ blocked: Prior browser execution may have produced effects; replay is forbidden
 
 ## 6. 準備驗證目標
 
-`demo-site/` 是一個不需要後端的多頁商店：首頁、商品、購物車、結帳、訂單完成。購物車存在 localStorage。啟動：
+`demo-site/` 是一個不需要後端的多頁商店：首頁、商品、購物車、結帳、訂單完成。購物車存在 localStorage。`pnpm dev` 會用 `pnx serve demo-site -p 5124` 啟動它。
 
-```bash
-python3 -m http.server 8080 --bind 127.0.0.1 --directory demo-site
-```
-
-委派 `ac` 時用 `http://127.0.0.1:8080/` 當 `targetUrl`。
+委派 `ac` 時用 `http://127.0.0.1:5124/` 當 `targetUrl`。
 
 在 `.env` 設定 `JEV_API_KEY`。沒有設定時，case 在開瀏覽器前就以 `blocked` 結束，不會退回其他選擇方式。
 
