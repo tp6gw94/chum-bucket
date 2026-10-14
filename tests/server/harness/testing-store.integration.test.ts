@@ -29,6 +29,7 @@ import {
   appendTrustedObservation,
   appendTrustedReceipt,
   claimActualTask,
+  listPendingTestingOperations,
   readStartCancelDeliveries,
   hostTestingRuntime,
 } from "../../../server/harness/testing-store";
@@ -599,7 +600,7 @@ async function plannerWithExecution() {
     childWorkflowId: frame.childWorkflowId,
   });
 
-  return { planner, startAc, io };
+  return { parent, planner, startAc, io };
 }
 
 test(
@@ -1249,35 +1250,24 @@ test(
         adapterVersion: fixture.adapterVersion,
       },
     });
-    const resultProposal = {
-      checks: [
-        {
-          caseId: "case-1",
-          checkId: "check-1",
-          judgment: "blocked",
-          evidence: [{ receiptId, digest: receipt.outputDigest }],
-        },
-      ],
+    assert.equal(receipt.outputDigest, digestOf(output));
+    const completion = {
+      role: "ac" as const,
+      findings: "The tool was blocked. This is unassessed prose, not a pass.",
     };
+    const result = await acceptRoleCompletion(parent.runId, ac.taskId, completion);
+    assert.deepEqual(await acceptRoleCompletion(parent.runId, ac.taskId, completion), result);
     await assert.rejects(
-      () =>
-        acceptRoleCompletion(parent.runId, ac.taskId, {
-          role: "ac",
-          proposal: {
-            checks: [
-              {
-                ...resultProposal.checks[0],
-                evidence: [{ receiptId: "forged", digest: receipt.outputDigest }],
-              },
-            ],
-          },
-        }),
-      /receipt/,
+      acceptRoleCompletion(parent.runId, ac.taskId, {
+        ...completion,
+        findings: "Changed findings",
+      }),
+      /Task result version mismatch/,
     );
-    const result = await acceptRoleCompletion(parent.runId, ac.taskId, {
-      role: "ac",
-      proposal: resultProposal,
-    });
+    const completed = await publishProjection(parent.runId, checking.operationId);
+    assert.equal(completed.task?.version, 3);
+    assert.equal(completed.task?.version === 3 && completed.task.findings, completion.findings);
+    assert.deepEqual(completed.task?.version === 3 && completed.task.missingChecks, []);
     await ackDelivery(`start:${ac.taskId}`, "quiet");
     const lastView = await closeTesting(parent.runId, checking.operationId, "completed");
     assert.equal(
@@ -1324,6 +1314,54 @@ test(
     assert.equal(pins.length, 3);
     for (const pin of pins) {
       assert.equal((pin.metadata as { versions: { model: string } }).versions.model, MODEL);
+    }
+    for (const scenario of ["missing", "status-only", "cancelled"] as const) {
+      const admitted = await admitAttachedTesting(parent, scenario, acInput);
+      const task = await reserveRoleTask(parent.runId, admitted.operationId, "ac", acInput);
+      assert.ok(task);
+      if (scenario === "cancelled") {
+        await appendTrustedReceipt({
+          id: `partial-${randomUUID()}`,
+          taskId: task.taskId,
+          attemptNonce: 1,
+          slot: "browser",
+          nativeName: "verify_ac",
+          route: "direct",
+          input: { checkId: "check-1" },
+          output,
+          bindings: {
+            checkId: "check-1",
+            fixture: fixture.identity,
+            adapterVersion: fixture.adapterVersion,
+          },
+        });
+        await cancelTesting(parent.runId, admitted.operationId);
+        await ackDelivery(`cancel:${task.taskId}`, "cancel_requested");
+        await ackDelivery(`cancel:${task.taskId}`, "stopped");
+      } else {
+        await acceptRoleCompletion(parent.runId, task.taskId, {
+          role: "ac",
+          findings: scenario === "missing" ? null : "Assembling the corrected final output.",
+        });
+      }
+      await ackDelivery(`start:${task.taskId}`, "quiet");
+      const view = await closeTesting(
+        parent.runId,
+        admitted.operationId,
+        scenario === "cancelled" ? "cancelled" : "completed",
+      );
+      assert.equal(view.task?.version, 3);
+      if (view.task?.version !== 3) throw new Error("Expected QA v3");
+      assert.deepEqual(view.task.missingChecks, scenario === "cancelled" ? [] : ["check-1"]);
+      assert.deepEqual(view.task.conflictingChecks, []);
+      assert.equal(
+        view.task.findings,
+        scenario === "status-only" ? "Assembling the corrected final output." : null,
+      );
+      assert.equal(view.task.result?.payload.length, scenario === "cancelled" ? 1 : 0);
+      assert.deepEqual(await readPublishedTesting(thread.id, admitted.operationId), view);
+      assert.equal(view.progress.rows.ac.status, "terminal");
+      assert.ok(!JSON.stringify(view).includes(privateMarker));
     }
     await finishRun(parent.runId);
     assert.equal((await hydrateThread(thread.id)).activeRun, null);
@@ -1915,5 +1953,40 @@ test(
       views.every((view) => view.state === "active" && !view.task),
       true,
     );
+  },
+);
+
+test(
+  "frozen workflow versions keep prose QA history as view 3, structured history as view 2, and report the frozen workflow to the cutover check",
+  { skip: !enabled },
+  async () => {
+    const { parent, startAc } = await plannerWithExecution();
+    const ac = await startAc();
+    const findings = "Unassessed prose from the first completed reply.";
+    await acceptRoleCompletion(parent.runId, ac.taskId, { role: "ac", findings });
+    const db = await database();
+    const workflowOf = async () =>
+      (await listPendingTestingOperations()).find((item) => item.operationId === ac.operationId)
+        ?.workflow;
+    const freeze = (workflow: string) =>
+      db
+        .update(testingOperationsTable)
+        .set({
+          runtime: sql`jsonb_set(${testingOperationsTable.runtime}, '{versions,workflow}', to_jsonb(${workflow}::text))`,
+        })
+        .where(eq(testingOperationsTable.id, ac.operationId));
+    assert.equal(await workflowOf(), "testing-child-v3");
+    const current = await publishProjection(parent.runId, ac.operationId);
+    assert.equal(current.task?.version === 3 && current.task.findings, findings);
+
+    await freeze("testing-child-v2");
+    assert.equal(await workflowOf(), "testing-child-v2");
+    const prose = await publishProjection(parent.runId, ac.operationId);
+    assert.equal(prose.task?.version === 3 && prose.task.findings, findings);
+
+    await freeze("testing-child-v1");
+    const structured = await publishProjection(parent.runId, ac.operationId);
+    assert.equal(structured.task?.version, 2);
+    assert.equal(structured.task?.version === 2 && "findings" in structured.task, false);
   },
 );

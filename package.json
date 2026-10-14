@@ -4,7 +4,7 @@
   "scripts": {
     "generate": "openui generate src/library.ts --spec --out src/generated/spec.json",
     "prevdev": "pnpm run generate",
-    "dev": "concurrently \"vite\" \"tsx watch server/index.ts\" \"tsx scripts/mcp-atlassian.ts\"",
+    "dev": "concurrently \"vite\" \"tsx watch server/index.ts\" \"tsx scripts/mcp-atlassian.ts\" \"pnx serve demo-site -p 5124\"",
     "dev:client": "vite",
     "dev:server": "tsx watch server/index.ts",
     "typecheck": "tsc -p tsconfig.json && tsc -p tests/tsconfig.json",

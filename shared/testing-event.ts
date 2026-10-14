@@ -242,6 +242,33 @@ const taskArtifactSchema = z.discriminatedUnion("kind", [
 ]);
 
 const testViewSchema = z.union([
+  z.strictObject({
+    ...testViewBase,
+    task: z.strictObject({
+      version: z.literal(3),
+      role: z.enum(["ac", "ui"]),
+      summary: boundedText(2_000),
+      origin: z
+        .strictObject({
+          parentRunId: z.string().min(1),
+          requestKey: z.string().min(1),
+          parentMessageId: z.string().min(1),
+        })
+        .nullish(),
+      findings: z.string().nullable(),
+      missingChecks: z.array(z.string().min(1).max(64)),
+      conflictingChecks: z.array(z.string().min(1).max(64)),
+      result: z
+        .strictObject({
+          ref: artifactRefSchema,
+          kind: z.enum(["ac-result", "ui-result"]),
+          payload: z.array(publicCheckResultSchema),
+        })
+        .nullable(),
+    }),
+    state: z.enum(["active", "cancelling", "finished"]),
+    report: z.null(),
+  }),
   z.object({
     ...testViewBase,
     task: z.object({

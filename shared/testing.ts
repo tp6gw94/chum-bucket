@@ -650,13 +650,24 @@ type TestViewBase = Readonly<{
 export type TestView = TestViewBase &
   (
     | Readonly<{
-        task: Readonly<{
-          version: 2;
-          role: RoleId;
-          summary: string;
-          origin?: TaskMessageOrigin | null;
-          result: PublicTaskArtifact | null;
-        }>;
+        task:
+          | Readonly<{
+              version: 2;
+              role: RoleId;
+              summary: string;
+              origin?: TaskMessageOrigin | null;
+              result: PublicTaskArtifact | null;
+            }>
+          | Readonly<{
+              version: 3;
+              role: "ac" | "ui";
+              summary: string;
+              origin?: TaskMessageOrigin | null;
+              findings: string | null;
+              missingChecks: readonly string[];
+              conflictingChecks: readonly string[];
+              result: Extract<PublicTaskArtifact, { kind: "ac-result" | "ui-result" }> | null;
+            }>;
         state: "active" | "cancelling" | "finished";
         report: null;
       }>

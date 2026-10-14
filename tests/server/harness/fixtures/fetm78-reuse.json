@@ -64,8 +64,8 @@
         "profiles": {
           "atlassian": "requirements-v4",
           "planner": "planning-v4",
-          "ac": "functional-v3",
-          "ui": "style-v3"
+          "ac": "functional-v4",
+          "ui": "style-v4"
         },
         "versions": {
           "loop": "agent-loop-v1",
@@ -77,7 +77,7 @@
           "catalog": "catalog-v1",
           "fixture": "v1",
           "runtime": "host-testing-runtime-v1",
-          "workflow": "testing-child-v1",
+          "workflow": "testing-child-v3",
           "validator": "testing-domain-v2"
         },
         "inputDigest": "sanitized-input",
@@ -87,8 +87,8 @@
         "registration": {
           "atlassian": "requirements:requirements-v4:enabled:atlassian_read",
           "planner": "plan:planning-v4:enabled:none",
-          "ac": "ac-result:functional-v3:enabled:browser_ac",
-          "ui": "ui-result:style-v3:enabled:browser_ui+figma_read"
+          "ac": "ac-result:functional-v4:enabled:browser_ac",
+          "ui": "ui-result:style-v4:enabled:browser_ui+figma_read"
         },
         "producerTaskId": "task-atlassian"
       },
@@ -944,8 +944,8 @@
         "profiles": {
           "atlassian": "requirements-v4",
           "planner": "planning-v4",
-          "ac": "functional-v3",
-          "ui": "style-v3"
+          "ac": "functional-v4",
+          "ui": "style-v4"
         },
         "versions": {
           "loop": "agent-loop-v1",
@@ -957,7 +957,7 @@
           "catalog": "catalog-v1",
           "fixture": "v1",
           "runtime": "host-testing-runtime-v1",
-          "workflow": "testing-child-v1",
+          "workflow": "testing-child-v3",
           "validator": "testing-domain-v2"
         },
         "inputDigest": "sanitized-input",
@@ -967,8 +967,8 @@
         "registration": {
           "atlassian": "requirements:requirements-v4:enabled:atlassian_read",
           "planner": "plan:planning-v4:enabled:none",
-          "ac": "ac-result:functional-v3:enabled:browser_ac",
-          "ui": "ui-result:style-v3:enabled:browser_ui+figma_read"
+          "ac": "ac-result:functional-v4:enabled:browser_ac",
+          "ui": "ui-result:style-v4:enabled:browser_ui+figma_read"
         },
         "producerTaskId": "task-planner"
       },

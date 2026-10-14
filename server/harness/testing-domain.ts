@@ -619,6 +619,44 @@ function receiptEvidence(receipt: TrustedToolReceipt, scope: ClaimScope): Checke
   return framedEvidence(evidence, planCase, scope.planCheck, receipt.id);
 }
 
+export function assembleToolResults(context: Omit<ResultsContext, "checks">): Results {
+  const receiptById = new Map(context.receipts.map((receipt) => [receipt.id, receipt]));
+  const assigned = context.cases.flatMap((planCase) =>
+    checksForRole([planCase], context.role).map((planCheck) => ({ planCase, planCheck })),
+  );
+  const checks = assigned.flatMap(({ planCase, planCheck }) =>
+    context.receipts.flatMap((receipt): CheckResult[] => {
+      const claim = {
+        caseId: planCase.id,
+        checkId: planCheck.id,
+        judgment: "pass" as const,
+        evidence: [{ receiptId: receipt.id, digest: receipt.outputDigest }],
+      };
+      const scope = { claim, planCheck, role: context.role, cases: context.cases, receiptById };
+      const trusted = trustedReceipt(claim.evidence[0]!, scope);
+
+      if (!trusted.ok) {
+        return [];
+      }
+
+      const observed = receiptEvidence(trusted.value, scope);
+
+      return observed.ok
+        ? [
+            {
+              caseId: planCase.id,
+              checkId: planCheck.id,
+              judgment: judgmentOf(observed.value),
+              evidence: [observed.value],
+            },
+          ]
+        : [];
+    }),
+  );
+
+  return { role: context.role, checks };
+}
+
 function claimEvidence(scope: ClaimScope, issues: string[]): PublicEvidence[] {
   const evidence: PublicEvidence[] = [];
   const digests = new Set<string>();

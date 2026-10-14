@@ -680,9 +680,9 @@ function CheckResultList({
         <p className="text-xs text-muted-foreground">沒有結果。</p>
       ) : (
         <ul className="flex flex-col gap-2">
-          {results.map((result) => (
+          {results.map((result, index) => (
             <li
-              key={`${result.caseId}:${result.checkId}`}
+              key={`${result.caseId}:${result.checkId}:${index}`}
               data-case-id={result.caseId}
               data-check-id={result.checkId}
               data-judgment={result.judgment}
@@ -863,10 +863,67 @@ function TestReportSection({
   );
 }
 
-function TaskResult({ view }: { view: TestView }) {
-  const result = view.task?.result;
+function QaFindings({ task }: { task: Extract<NonNullable<TestView["task"]>, { version: 3 }> }) {
+  return (
+    <section aria-label="模型文字" className="flex flex-col gap-2">
+      <h4 className="text-sm font-medium">模型文字，未評定完整性</h4>
+      <p className="whitespace-pre-wrap text-sm">{task.findings ?? "沒有最終 findings。"}</p>
+      <p className="text-xs text-muted-foreground">
+        任務完成僅代表執行結束，不代表檢查通過或報告完整。工具觀察與模型判讀分開呈現。
+      </p>
+      {task.conflictingChecks.length > 0 ? (
+        <p className="text-xs text-muted-foreground">
+          工具觀察互相矛盾，須逐筆判讀：{task.conflictingChecks.join("、")}
+        </p>
+      ) : null}
+      {task.missingChecks.length > 0 ? (
+        <p className="text-xs text-muted-foreground">
+          缺少工具證據的檢查：{task.missingChecks.join("、")}
+        </p>
+      ) : null}
+    </section>
+  );
+}
 
-  if (!result) {
+function checkResultTitle(kind: "ac-result" | "ui-result", qa: boolean): string {
+  if (qa) {
+    return "工具觀察（非 QA 整體判定）";
+  }
+
+  return kind === "ac-result" ? "AC 功能結果" : "UI 樣式結果";
+}
+
+function TaskArtifactContent({
+  result,
+  qa,
+}: {
+  result: NonNullable<NonNullable<TestView["task"]>["result"]>;
+  qa: boolean;
+}) {
+  return (
+    <>
+      {result.kind === "requirements" ? (
+        <RequirementsSummary requirements={result.payload} />
+      ) : null}
+      {result.kind === "plan" ? <PlanSummary plan={result.payload} /> : null}
+      {result.kind === "ac-result" || result.kind === "ui-result" ? (
+        <>
+          <p className="text-xs text-muted-foreground">
+            結果來源逐項標示，不構成整體網站或發布驗收。
+          </p>
+          <CheckResultList title={checkResultTitle(result.kind, qa)} results={result.payload} />
+        </>
+      ) : null}
+    </>
+  );
+}
+
+function TaskResult({ view }: { view: TestView }) {
+  const task = view.task;
+  const result = task?.result;
+  const isQa = task?.version === 3;
+
+  if (!result && !isQa) {
     return null;
   }
 
@@ -878,22 +935,9 @@ function TaskResult({ view }: { view: TestView }) {
       className="flex flex-col gap-3 break-words"
     >
       <h3 className="text-sm font-medium">任務結果</h3>
-      {result.kind === "requirements" ? (
-        <RequirementsSummary requirements={result.payload} />
-      ) : null}
-      {result.kind === "plan" ? <PlanSummary plan={result.payload} /> : null}
-      {result.kind === "ac-result" || result.kind === "ui-result" ? (
-        <>
-          <p className="text-xs text-muted-foreground">
-            結果來源逐項標示，不構成整體網站或發布驗收。
-          </p>
-          <CheckResultList
-            title={result.kind === "ac-result" ? "AC 功能結果" : "UI 樣式結果"}
-            results={result.payload}
-          />
-        </>
-      ) : null}
-      <ArtifactList title="產物參照" artifacts={[result.ref]} />
+      {isQa ? <QaFindings task={task} /> : null}
+      {result ? <TaskArtifactContent result={result} qa={isQa} /> : null}
+      {result ? <ArtifactList title="產物參照" artifacts={[result.ref]} /> : null}
     </section>
   );
 }

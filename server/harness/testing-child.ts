@@ -20,13 +20,10 @@ import {
   assembleRequirements,
   digestOf,
   canonicalizePlan,
-  checksForRole,
   publicIssues,
   sameDesign,
-  validateResults,
   type CanonicalPlan,
   type Requirements,
-  type TrustedToolReceipt,
   type Validation,
 } from "./testing-domain";
 import {
@@ -39,7 +36,12 @@ import {
   type TestingNativeReceipt,
   type TestingNativeReceiptReference,
 } from "./testing-tools";
-import { runAgentLoop, type AgentCheckpoint, type AgentSession } from "./agent-loop";
+import {
+  runAgentLoop,
+  type AgentCheckpoint,
+  type AgentLoopResult,
+  type AgentSession,
+} from "./agent-loop";
 import { roleRegistry, roleSystemPrompt } from "./agents";
 import { roleFeedbackPrompt, roleFinalTurnPrompt, roleTaskPrompt } from "./prompts";
 import type { ConversationState } from "./conversation";
@@ -329,17 +331,21 @@ function pinnedPlan(execution: TestingExecution): CanonicalPlan | null {
   return artifact ? (artifact.payload as CanonicalPlan) : null;
 }
 
+type MessageParts = ConversationState["context"][number]["parts"];
+
+function textOfParts(parts: MessageParts): string {
+  return parts
+    .filter((part) => part.type === "text")
+    .map((part) => ("content" in part ? String(part.content) : ""))
+    .join("");
+}
+
 function assistantText(conversation: ConversationState): string {
   const assistant = [...conversation.context]
     .reverse()
     .find((message) => message.role === "assistant");
 
-  return (
-    assistant?.parts
-      .filter((part) => part.type === "text")
-      .map((part) => ("content" in part ? String(part.content) : ""))
-      .join("") ?? ""
-  );
+  return assistant ? textOfParts(assistant.parts) : "";
 }
 
 export function extractJson(text: string): unknown {
@@ -389,82 +395,10 @@ function planIssues(
   );
 }
 
-function trustedBrowserReceipt(receipt: ExecutionReceipt, role: "ac" | "ui"): TrustedToolReceipt[] {
-  if (
-    !["use_browser", role === "ac" ? "verify_ac" : "verify_ui"].includes(receipt.nativeName) ||
-    !isObjectLike(receipt.bindings)
-  ) {
-    return [];
-  }
-
-  const bindings = receipt.bindings as { fixture?: { id: string; version: string } };
-
-  if (!bindings.fixture) {
-    return [];
-  }
-
-  const output = receipt.output as { checkId?: string };
-
-  return [
-    {
-      id: receipt.id,
-      role,
-      checkId: output.checkId ?? "",
-      inputDigest: receipt.inputDigest,
-      outputDigest: receipt.outputDigest,
-      output: receipt.output,
-      fixture: bindings.fixture,
-    },
-  ];
-}
-
-function isObjectLike(value: unknown): boolean {
-  return Boolean(value) && typeof value === "object";
-}
-
-function resultIssues(
-  execution: TestingExecution,
-  role: "ac" | "ui",
-  plan: CanonicalPlan,
-  proposal: unknown,
-): string[] {
-  const task = execution.tasks.find((item) => item.frame.role === role);
-  const receipts = (task?.receipts ?? []).flatMap((receipt) =>
-    trustedBrowserReceipt(receipt, role),
-  );
-
-  return validationIssues(
-    validateResults(proposal, {
-      role,
-      cases: plan.cases,
-      checks: checksForRole(plan.cases, role),
-      receipts,
-    }),
-  );
-}
-
-function proposalIssues(
-  role: Exclude<RoleId, "atlassian">,
-  execution: TestingExecution,
-  proposal: unknown,
-): string[] {
+function proposalIssues(execution: TestingExecution, proposal: unknown): string[] {
   const requirements = pinnedRequirements(execution);
 
-  if (!requirements) {
-    return ["requirements_missing"];
-  }
-
-  if (role === "planner") {
-    return planIssues(execution, requirements, proposal);
-  }
-
-  const plan = pinnedPlan(execution);
-
-  if (!plan) {
-    return ["plan_missing"];
-  }
-
-  return resultIssues(execution, role === "ac" ? "ac" : "ui", plan, proposal);
+  return requirements ? planIssues(execution, requirements, proposal) : ["requirements_missing"];
 }
 
 function feedbackConversation(
@@ -1065,14 +999,14 @@ function sourceReview(execution: TestingExecution): Review {
 }
 
 function proposalReview(
-  role: Exclude<RoleId, "atlassian">,
+  role: "planner",
   execution: TestingExecution,
   conversation: ConversationState,
 ): Review {
   try {
     const proposal = extractJson(assistantText(conversation));
 
-    return { completion: { role, proposal }, issues: proposalIssues(role, execution, proposal) };
+    return { completion: { role, proposal }, issues: proposalIssues(execution, proposal) };
   } catch (error) {
     return {
       completion: { role, proposal: null },
@@ -1092,19 +1026,37 @@ function reviewCompletion(
 
       return input.role === "atlassian"
         ? sourceReview(latest)
-        : proposalReview(input.role, latest, conversation);
+        : proposalReview("planner", latest, conversation);
     },
     { name },
   );
 }
 
 const FEEDBACK_TURNS = 2;
+const CONTEXT_OVERFLOW_ISSUE = "Model context capacity exceeded";
 
 export function rolePassTurns(runtime: TestingExecution["runtime"], role: RoleId) {
-  return {
-    initial: effectiveLimits(runtime, role).turns - FEEDBACK_TURNS,
-    feedback: FEEDBACK_TURNS,
-  };
+  const turns = effectiveLimits(runtime, role).turns;
+
+  return role === "ac" || role === "ui"
+    ? { initial: turns, feedback: 0 }
+    : { initial: turns - FEEDBACK_TURNS, feedback: FEEDBACK_TURNS };
+}
+
+function qaChildResult(role: "ac" | "ui", result: AgentLoopResult): TestingChildResult {
+  switch (result.state) {
+    case "done": {
+      const message = result.conversation.context.at(-1);
+      const text = message?.role === "assistant" ? textOfParts(message.parts) : "";
+
+      return { state: "ready", completion: { role, findings: text.trim() ? text : null } };
+    }
+
+    case "overflow":
+      return { state: "failed", reason: "context_overflow", issues: [CONTEXT_OVERFLOW_ISSUE] };
+    case "limit":
+      return { state: "failed", reason: "budget" };
+  }
 }
 
 async function runRoleLoops(run: ChildRun, tools: RunTools): Promise<TestingChildResult> {
@@ -1138,6 +1090,11 @@ async function runRoleLoops(run: ChildRun, tools: RunTools): Promise<TestingChil
     });
   const passes = rolePassTurns(execution.runtime, input.role);
   const first = await loop(initial, passes.initial, "a");
+
+  if (input.role === "ac" || input.role === "ui") {
+    return qaChildResult(input.role, first);
+  }
+
   const decision = await reviewCompletion(input, first.conversation, "proposal");
 
   if (decision.issues.length === 0) {

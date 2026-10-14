@@ -134,8 +134,8 @@ test("owner snapshot versions are passed in and are not a second model constant"
   assert.deepEqual(host.registration, {
     atlassian: "requirements:requirements-v4:enabled:atlassian_read",
     planner: "plan:planning-v4:enabled:none",
-    ac: "ac-result:functional-v3:enabled:browser_ac",
-    ui: "ui-result:style-v3:enabled:browser_ui+figma_read",
+    ac: "ac-result:functional-v4:enabled:browser_ac",
+    ui: "ui-result:style-v4:enabled:browser_ui+figma_read",
   });
 });
 

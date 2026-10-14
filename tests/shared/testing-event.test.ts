@@ -29,6 +29,34 @@ import {
   deriveReport,
 } from "../../server/harness/testing-domain";
 
+test("QA v3 preserves unassessed findings and explicit evidence gaps without accepting private fields", () => {
+  const view = {
+    runId: "qa-v3",
+    state: "finished",
+    report: null,
+    progress: { version: 1, rows: rows() },
+    reuse: [],
+    availableArtifacts: [],
+    task: {
+      version: 3,
+      role: "ac",
+      summary: "Check checkout",
+      findings:
+        "Both checks now have their own bound receipts. Assembling the corrected final output.",
+      missingChecks: ["check-1"],
+      conflictingChecks: [],
+      result: null,
+    },
+  };
+  assert.deepEqual(parseTestView(view), view);
+  assert.deepEqual(
+    parseTestView({ ...view, task: { ...view.task, findings: null } })?.task?.result,
+    null,
+  );
+  assert.equal(parseTestView({ ...view, task: { ...view.task, transcript: "private" } }), null);
+  assert.equal(parseTestView({ ...view, task: { ...view.task, role: "planner" } }), null);
+});
+
 const runId = testRunIdSchema.parse("run-1");
 const otherRunId = testRunIdSchema.parse("run-2");
 const artifact = artifactRefSchema.parse("artifact:requirements:1");

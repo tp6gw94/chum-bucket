@@ -43,8 +43,8 @@ import {
 } from "../../shared/testing";
 import {
   assembleRequirements,
+  assembleToolResults,
   canonicalizePlan,
-  checksForRole,
   deriveReport,
   publicIssues,
   schemaIssueMessages,
@@ -55,7 +55,6 @@ import {
   projectProgress,
   publicTaskArtifact,
   requirementsScopeDigest,
-  validateResults,
   validateReuse,
   type CanonicalPlan,
   type Requirements,
@@ -68,7 +67,11 @@ import { roleRegistry } from "./agents";
 import { readProjection } from "./conversation";
 import { readSource } from "./source-links";
 
-export const TESTING_WORKFLOW_VERSION = "testing-child-v1";
+export const TESTING_WORKFLOW_VERSION = "testing-child-v3";
+const PROSE_WORKFLOW_VERSIONS: ReadonlySet<string> = new Set([
+  "testing-child-v2",
+  TESTING_WORKFLOW_VERSION,
+]);
 const TESTING_SCHEMA_VERSION = "supervised-testing-schema-v2";
 export const DESIGN_CAPTURE_NATIVE = "design_capture";
 const TESTING_LIMITS = {
@@ -366,6 +369,7 @@ type DecisionBody =
       taskId: string;
       execution: "completed";
       ref: string;
+      findings?: string | null;
     }>
   | Readonly<{
       kind: "task_result";
@@ -1202,6 +1206,10 @@ function frozenRuntime(
   return { ...runtime, mode: runtime.mode === "standalone" ? "standalone" : "attached" };
 }
 
+function isProseOperation(operation: OperationRow): boolean {
+  return PROSE_WORKFLOW_VERSIONS.has(frozenRuntime(operation).versions.workflow);
+}
+
 export async function reserveRoleTaskInTransaction(
   tx: Transaction,
   operationId: string,
@@ -2003,6 +2011,15 @@ export async function appendTrustedReceipt(input: {
       return { outputDigest, duplicate: true };
     }
 
+    const decisions = await readDecisions(tx, operation.id);
+
+    if (
+      (task.role === "ac" || task.role === "ui") &&
+      decisions.some((decision) => decision.kind === "task_result" && decision.taskId === task.id)
+    ) {
+      throw new TestingPersistenceError(409, "Testing receipt fence is closed");
+    }
+
     assertReceiptScope(
       task,
       frozenRuntime(operation),
@@ -2038,7 +2055,8 @@ export async function appendTrustedReceipt(input: {
 
 export type RoleCompletion =
   | Readonly<{ role: "atlassian" }>
-  | Readonly<{ role: Exclude<RoleId, "atlassian">; proposal: unknown }>;
+  | Readonly<{ role: "planner"; proposal: unknown }>
+  | Readonly<{ role: "ac" | "ui"; findings: string | null }>;
 
 type Candidate = Readonly<{
   kind: ArtifactKind;
@@ -2142,6 +2160,7 @@ async function recordCandidateDecisions(
   task: TaskRow,
   accepted: Candidate,
   ref: ArtifactRef,
+  completion: RoleCompletion,
 ) {
   await appendDecision(tx, operation, `task_result:${task.role}`, {
     kind: "task_result",
@@ -2149,6 +2168,7 @@ async function recordCandidateDecisions(
     taskId: task.id,
     execution: "completed",
     ref,
+    ...("findings" in completion ? { findings: completion.findings } : {}),
   });
   await appendDecision(tx, operation, `satisfied:${task.role}`, {
     kind: "satisfied",
@@ -2194,13 +2214,17 @@ export async function acceptRoleCompletionInTransaction(
       throw new TestingPersistenceError(409, "Task result is already decided");
     }
 
+    if ("findings" in completion && completion.findings !== prior.findings) {
+      throw new TestingPersistenceError(409, "Task result version mismatch");
+    }
+
     return replayCompletion(tx, operation, task, completion, prior.ref);
   }
 
   const runtime = frozenRuntime(operation);
   const accepted = await validateCandidate(tx, operation, task, completion, runtime);
   const ref = await storeCandidate(tx, operation, task, accepted, runtime);
-  await recordCandidateDecisions(tx, operation, task, accepted, ref);
+  await recordCandidateDecisions(tx, operation, task, accepted, ref, completion);
 
   return { ref, kind: accepted.kind };
 }
@@ -2269,7 +2293,6 @@ async function resultsCandidate(
   tx: Transaction,
   operation: OperationRow,
   task: TaskRow,
-  proposal: unknown,
 ): Promise<Candidate> {
   const plan = await satisfiedPayload(tx, operation.id, "planner");
 
@@ -2280,14 +2303,11 @@ async function resultsCandidate(
   const canonical = plan.payload as CanonicalPlan;
   const role = task.role === "ac" ? "ac" : "ui";
   const receipts = (await readTrustedReceipts(tx, task)).filter((receipt) => receipt.role === role);
-  const payload = acceptedOrThrow(
-    validateResults(proposal, {
-      role,
-      cases: canonical.cases,
-      checks: checksForRole(canonical.cases, role),
-      receipts,
-    }),
-  );
+  const payload = assembleToolResults({
+    role,
+    cases: canonical.cases,
+    receipts,
+  });
 
   return {
     kind: role === "ac" ? "ac-result" : "ui-result",
@@ -2322,7 +2342,7 @@ async function validateCandidate(
     return planCandidate(requirements, intent, completion.proposal);
   }
 
-  return resultsCandidate(tx, operation, task, completion.proposal);
+  return resultsCandidate(tx, operation, task);
 }
 
 async function satisfiedPayload(tx: Transaction, operationId: string, role: RoleId) {
@@ -2405,7 +2425,8 @@ async function readTrustedReceipts(tx: Transaction, task: TaskRow): Promise<Trus
         eq(testingReceiptsTable.task_id, task.id),
         eq(testingReceiptsTable.attempt, task.attempt_nonce),
       ),
-    );
+    )
+    .orderBy(asc(testingReceiptsTable.id));
   const role = task.role === "ac" || task.role === "ui" ? task.role : null;
 
   if (!role) {
@@ -2443,6 +2464,30 @@ export async function closeTestingInTransaction(
   const outcome = operation.cancel_accepted_at ? "cancelled" : rootOutcome;
 
   if (!operation.finished_at) {
+    if (isProseOperation(operation)) {
+      const tasks = await tx
+        .select()
+        .from(testingTasksTable)
+        .where(eq(testingTasksTable.operation_id, operation.id));
+      const decisions = await readDecisions(tx, operation.id);
+      const unsettled = tasks.filter(
+        (task) =>
+          (task.role === "ac" || task.role === "ui") &&
+          !decisions.some(
+            (decision) => decision.kind === "task_result" && decision.taskId === task.id,
+          ),
+      );
+
+      for (const task of unsettled) {
+        await recordRoleFailureInTransaction(
+          tx,
+          ownerRunId,
+          task.id,
+          outcome === "cancelled" ? "cancelled" : "child_failed",
+        );
+      }
+    }
+
     await tx
       .update(testingOperationsTable)
       .set({ finished_at: sql`now()`, terminal_outcome: outcome })
@@ -2660,7 +2705,14 @@ async function projectionSnapshot(
     reuse,
     availableArtifacts: available,
     ...(intent.task
-      ? taskProjection(intent.task, artifacts, operation, origins.get(operation.id) ?? null)
+      ? taskProjection(
+          intent.task,
+          artifacts,
+          operation,
+          origins.get(operation.id) ?? null,
+          decisions,
+          plan,
+        )
       : lifecycle(report, cancelling)),
   };
 
@@ -2707,20 +2759,64 @@ function completedProjectionReport(
   });
 }
 
+function qaTaskFacts(
+  result: NonNullable<TestView["task"]>["result"],
+  assigned: readonly string[],
+  decision: DecisionBody | undefined,
+) {
+  const qaResult = result?.kind === "ac-result" || result?.kind === "ui-result" ? result : null;
+  const observations = qaResult?.payload ?? [];
+  const observed = new Set(observations.map((check) => check.checkId));
+  const conflictingChecks = [...observed].filter(
+    (id) =>
+      new Set(
+        observations
+          .filter((check) => check.checkId === id)
+          .flatMap((check) => check.evidence.map((evidence) => evidence.outcome)),
+      ).size > 1,
+  );
+
+  return {
+    findings:
+      decision?.kind === "task_result" && decision.execution === "completed"
+        ? (decision.findings ?? null)
+        : null,
+    missingChecks: assigned.filter((id) => !observed.has(id)),
+    conflictingChecks,
+    result: qaResult,
+  };
+}
+
 function taskProjection(
   task: NonNullable<TestingRequestInput["task"]>,
   artifacts: readonly ArtifactRow[],
   operation: OperationRow,
   origin: TaskMessageOrigin | null,
+  decisions: readonly DecisionBody[],
+  plan: CanonicalPlan | null,
 ) {
+  const role = task.input.role;
+  const result = taskArtifact(artifacts, role, operation.id);
+  const decision = decisions.find((item) => item.kind === "task_result" && item.role === role);
+  const qa = (role === "ac" || role === "ui") && isProseOperation(operation);
+  const projectedTask: NonNullable<TestView["task"]> = qa
+    ? {
+        version: 3,
+        origin,
+        role,
+        summary: task.input.summary,
+        ...qaTaskFacts(result, plan?.assignments[role] ?? [], decision),
+      }
+    : {
+        version: 2,
+        origin,
+        role,
+        summary: task.input.summary,
+        result,
+      };
+
   return {
-    task: {
-      version: 2 as const,
-      origin,
-      role: task.input.role,
-      summary: task.input.summary,
-      result: taskArtifact(artifacts, task.input.role, operation.id),
-    },
+    task: projectedTask,
     state: operation.finished_at
       ? ("finished" as const)
       : operation.cancel_accepted_at
@@ -3378,6 +3474,7 @@ export type RoleFailureCode = z.infer<typeof roleFailureSchema>;
 
 export type PendingTestingOperation = Readonly<{
   delegated: boolean;
+  workflow: string;
   operationId: string;
   parentRunId: string;
   threadId: string;
@@ -3441,6 +3538,11 @@ export async function recordRoleFailureInTransaction(
     throw new TestingPersistenceError(409, "Task result is already decided");
   }
 
+  if ((task.role === "ac" || task.role === "ui") && isProseOperation(operation)) {
+    const candidate = await resultsCandidate(tx, operation, task);
+    await storeCandidate(tx, operation, task, candidate, frozenRuntime(operation));
+  }
+
   await appendDecision(tx, operation, `task_result:${task.role}`, {
     kind: "task_result",
     role: task.role as RoleId,
@@ -3461,12 +3563,13 @@ export async function listPendingTestingOperations(): Promise<readonly PendingTe
     .where(sql`${testingOperationsTable.finished_at} is null`);
 
   return rows.map((row) => {
-    const runtime = row.runtime as { mode?: string };
+    const runtime = row.runtime as { mode?: string; versions?: { workflow?: string } };
 
     return {
       delegated:
         testingIntentSchema.safeParse(row.intent).success &&
         Boolean((row.intent as TestingRequestInput).task),
+      workflow: runtime.versions?.workflow ?? "legacy",
       operationId: row.id,
       parentRunId: row.parent_run_id,
       threadId: row.thread_id,

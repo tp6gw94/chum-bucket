@@ -4,6 +4,7 @@ import { artifactRefSchema, testRunIdSchema } from "../../../shared/testing";
 import type { Judgment, PlanCheck, PublicEvidence, Source } from "../../../shared/testing";
 import {
   assembleRequirements,
+  assembleToolResults,
   canonicalizePlan,
   deriveReport,
   digestOf,
@@ -399,6 +400,53 @@ const functionalReceipt: TrustedToolReceipt = {
   output: functionalOutput,
   fixture: { id: "fixture-1", version: "1" },
 };
+
+test("host observations retain contradictions, omit missing checks and reject corrupt or misbound receipts", () => {
+  const failed = {
+    ...functionalOutput,
+    evidence: { ...functionalEvidence, outcome: "fail", observed: "Missing" },
+  };
+  const receipt = {
+    ...functionalReceipt,
+    id: "failed",
+    output: failed,
+    outputDigest: digestOf(failed),
+  };
+  const context = {
+    role: "ac" as const,
+    cases: plan.cases,
+    checks: [functionalCheck, secondFunctionalCheck],
+  };
+  assert.deepEqual(assembleToolResults({ ...context, receipts: [] }), { role: "ac", checks: [] });
+  assert.deepEqual(assembleToolResults({ ...context, receipts: [functionalReceipt, receipt] }), {
+    role: "ac",
+    checks: [
+      {
+        caseId: "case-1",
+        checkId: "check-1",
+        judgment: "simulated_pass",
+        evidence: [functionalEvidence],
+      },
+      {
+        caseId: "case-1",
+        checkId: "check-1",
+        judgment: "simulated_fail",
+        evidence: [failed.evidence],
+      },
+    ],
+  });
+  assert.deepEqual(
+    assembleToolResults({
+      ...context,
+      receipts: [
+        { ...functionalReceipt, outputDigest: "corrupt" },
+        { ...functionalReceipt, role: "ui" },
+        { ...functionalReceipt, checkId: "unknown" },
+      ],
+    }),
+    { role: "ac", checks: [] },
+  );
+});
 
 const functional2Evidence: PublicEvidence = {
   kind: "functional",

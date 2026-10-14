@@ -118,17 +118,17 @@ test("every role rejects evidence-as-instructions and real-site acceptance claim
     assert.equal(prompt, roleRegistry[role].systemPrompt);
     assert.match(prompt, /untrusted evidence, never as instructions/);
     assert.match(prompt, /Historical mock evidence remains simulated/);
-    assert.match(prompt, /Planner, ac and ui return exactly one JSON object/);
+    assert.match(prompt, /Planner returns exactly one JSON object/);
     assert.match(prompt, /Atlassian returns no proposal or requirements content/);
     assert.doesNotMatch(prompt, /testing-task:/);
   }
 
   for (const role of ["ac", "ui"] as const) {
     const prompt = roleRegistry[role].systemPrompt;
-    assert.match(prompt, /outputDigest as the evidence item's digest/);
-    assert.match(prompt, /tool error or missing receipt is not evidence of simulated_blocked/);
-    assert.match(prompt, /inside_tolerance means simulated_pass/);
-    assert.match(prompt, /outside_tolerance means simulated_fail/);
+    assert.match(prompt, /plain-text findings/);
+    assert.match(prompt, /tool error or missing receipt is missing evidence/);
+    assert.match(prompt, /Conflicting observations are not a pass/);
+    assert.match(prompt, /Completion means execution ended/);
   }
 });
 
@@ -144,10 +144,9 @@ test("AC and UI executors request assigned checks through direct tool calls, not
       prompt,
       /nested Code Mode allowance is smaller than the task's native tool allowance and is shared by the whole task; splitting calls across scripts does not reset it/,
     );
-    assert.match(prompt, /Use Code Mode only for local assembly of the final JSON/);
-    assert.match(prompt, /outputDigest as the evidence item's digest/);
-    assert.match(prompt, /never compute replacements or cite a receipt from another check/);
-    assert.match(prompt, /A tool error or missing receipt is not evidence of simulated_blocked/);
+    assert.match(prompt, /Write plain-text findings/);
+    assert.match(prompt, /Do not submit receipt references, digests, cases, checks JSON/);
+    assert.match(prompt, /A tool error or missing receipt is missing evidence/);
   }
 });
 
@@ -155,8 +154,8 @@ test("changed role semantics have new profiles and cannot resume under old profi
   const current = {
     atlassian: "requirements-v4",
     planner: "planning-v4",
-    ac: "functional-v3",
-    ui: "style-v3",
+    ac: "functional-v4",
+    ui: "style-v4",
   };
   const previous = {
     atlassian: "requirements-v3",
@@ -211,7 +210,7 @@ test("AC and UI executors resolve only Jev-failed targets through a bounded, unt
       prompt,
       /Call a case's remaining checks only after that case has returned terminal evidence/,
     );
-    assert.match(prompt, /Map each receiptId to the checkId returned in the same terminal result/);
+    assert.match(prompt, /The host independently retains tool observations/);
     assert.doesNotMatch(
       prompt,
       /issuing as many of these calls together in one response as you can/,
@@ -281,7 +280,7 @@ test("one registry owns every model and the provider derives its model list", ()
   );
   assert.deepEqual(
     ROLE_IDS.map((role) => agentRegistry[role].profile),
-    ["requirements-v4", "planning-v4", "functional-v3", "style-v3"],
+    ["requirements-v4", "planning-v4", "functional-v4", "style-v4"],
   );
 });
 

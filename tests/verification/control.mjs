@@ -12,7 +12,7 @@ import { setTimeout as delay } from "node:timers/promises";
 const script = fileURLToPath(import.meta.url);
 const root = resolve(dirname(script), "../..");
 const [command, argument] = process.argv.slice(2);
-assert(argument, "Usage: node control.mjs launch|doctor|inspect|cleanup EVIDENCE_DIR");
+assert(argument, "Usage: node control.mjs launch|doctor|inspect|restart|cleanup EVIDENCE_DIR");
 const directory = resolve(argument);
 const statePath = resolve(directory, "instance.json");
 const exec = (binary, args) =>
@@ -186,12 +186,27 @@ async function supervise() {
   let backend;
   let vite;
   let stopping;
+  let restartBackend;
+  let restarting = false;
   let interrupted = false;
-  const controller = createHttpServer((request, response) => {
+  const controller = createHttpServer(async (request, response) => {
     if (request.headers.authorization !== `Bearer ${token}`) {
       response.writeHead(403).end();
 
       return;
+    }
+
+    if (request.method === "POST" && request.url === "/restart") {
+      try {
+        assert(restartBackend && !restarting && !interrupted, "Backend is not ready to restart");
+        restarting = true;
+        await restartBackend();
+      } catch (error) {
+        response.writeHead(409).end(JSON.stringify({ error: error.message }));
+        return;
+      } finally {
+        restarting = false;
+      }
     }
 
     if (request.method === "POST" && request.url === "/cleanup") {
@@ -322,15 +337,46 @@ async function supervise() {
     state.serverPort = await freePort();
     state.clientPort = await freePort();
     assert.notEqual(state.serverPort, state.clientPort);
-    backend = spawn(process.execPath, ["--import", "tsx", "server/index.ts"], {
-      cwd: root,
-      env: { ...env, PORT: String(state.serverPort) },
-      stdio: "inherit",
-    });
-    state.serverPid = backend.pid;
-    backend.on("exit", () => {
-      interrupted = true;
-    });
+    const startBackend = () => {
+      backend = spawn(process.execPath, ["--import", "tsx", "server/index.ts"], {
+        cwd: root,
+        env: { ...env, PORT: String(state.serverPort) },
+        stdio: "inherit",
+      });
+      state.serverPid = backend.pid;
+      backend.on("exit", () => {
+        if (!restarting) interrupted = true;
+      });
+    };
+    startBackend();
+    restartBackend = async () => {
+      assert.equal(
+        state.fingerprint,
+        await fingerprint(),
+        "Source changed; launch a fresh instance",
+      );
+      assert.equal(container(state).Id, state.containerId);
+      const previousPid = backend.pid;
+      backend.kill("SIGKILL");
+      await until(async () => backend.exitCode !== null || backend.signalCode !== null, 5000);
+      startBackend();
+      await until(async () => {
+        assert(
+          backend.exitCode === null && backend.signalCode === null,
+          "Restarted backend exited",
+        );
+        try {
+          return (
+            (await fetch(`${state.origin}/api/thread`, { signal: AbortSignal.timeout(1000) }))
+              .status === 200
+          );
+        } catch {
+          return false;
+        }
+      });
+      state.restart = { previousPid, serverPid: state.serverPid, at: new Date().toISOString() };
+      await save(state);
+    };
     const { createServer: createVite } = await import("vite");
     vite = await createVite({
       root,
@@ -407,6 +453,16 @@ if (command === "launch") {
 } else if (command === "supervise") {
   await supervise();
 } else if (command === "doctor") {
+  await doctor();
+} else if (command === "restart") {
+  await doctor();
+  const state = await readState();
+  const response = await fetch(`http://127.0.0.1:${state.controlPort}/restart`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${state.token}` },
+    signal: AbortSignal.timeout(100_000),
+  });
+  assert.equal(response.status, 200, await response.text());
   await doctor();
 } else if (command === "inspect") {
   await doctor();

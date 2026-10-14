@@ -16,6 +16,81 @@ import {
 import { TestingPanel } from "../../../src/components/testing-panel";
 import { parseTestView } from "../../../shared/testing-event";
 
+test("QA prose remains escaped and unassessed with missing evidence independent of completed lifecycle", () => {
+  const view: TestView = {
+    runId: testRunIdSchema.parse("qa-v3"),
+    state: "finished",
+    report: null,
+    reuse: [],
+    availableArtifacts: [],
+    progress: { version: 1, rows: completedRows },
+    task: {
+      version: 3,
+      role: "ac",
+      summary: "Check",
+      findings: "<script>alert('private')</script> Assembling output.",
+      missingChecks: ["check-1"],
+      conflictingChecks: [],
+      result: null,
+    },
+  };
+  const markup = renderToStaticMarkup(<TestingPanel view={view} />);
+  assert.match(markup, /模型文字，未評定完整性/);
+  assert.match(markup, /缺少工具證據的檢查/);
+  assert.match(markup, /check-1/);
+  assert.match(markup, /&lt;script&gt;/);
+  assert.doesNotMatch(markup, /<script>/);
+  assert.match(markup, /不代表檢查通過或報告完整/);
+});
+
+test("QA v3 renders every contradictory observation and explicitly flags the check", () => {
+  const view: TestView = {
+    runId: testRunIdSchema.parse("qa-conflict"),
+    state: "finished",
+    report: null,
+    reuse: [],
+    availableArtifacts: [],
+    progress: { version: 1, rows: completedRows },
+    task: {
+      version: 3,
+      role: "ac",
+      summary: "Observe checkout",
+      findings: "The observations disagree.",
+      missingChecks: [],
+      conflictingChecks: ["check-1"],
+      result: {
+        ref: artifact,
+        kind: "ac-result",
+        payload: [
+          {
+            caseId: "case-1",
+            checkId: "check-1",
+            judgment: "simulated_pass",
+            evidence: [functionalEvidence],
+          },
+          {
+            caseId: "case-1",
+            checkId: "check-1",
+            judgment: "simulated_fail",
+            evidence: [
+              { ...functionalEvidence, outcome: "fail", observed: "Contradictory observation" },
+            ],
+          },
+        ],
+      },
+    },
+  };
+  const markup = renderToStaticMarkup(<TestingPanel view={view} />);
+  assert.equal(markup.split('data-check-id="check-1"').length - 1, 2);
+  assert.match(markup, /data-judgment="simulated_pass"/);
+  assert.match(markup, /data-judgment="simulated_fail"/);
+  assert.match(markup, /Contradictory observation/);
+  assert.match(markup, /工具觀察互相矛盾，須逐筆判讀/);
+  assert.match(markup, /工具觀察（非 QA 整體判定）/);
+  assert.match(markup, /不構成整體網站或發布驗收/);
+  assert.deepEqual(parseTestView(view), view);
+});
+
 const runId = testRunIdSchema.parse("run-1");
 const originalRunId = testRunIdSchema.parse("run-0");
 const artifact = artifactRefSchema.parse("artifact:requirements:1");
@@ -77,7 +152,10 @@ const plan: PublicPlan = {
   assignments: { ac: ["check-1"], ui: ["check-2"] },
 };
 
-const functionalEvidence: PublicEvidence = {
+const functionalEvidence: Extract<
+  PublicEvidence,
+  { kind: "functional"; outcome: "pass" | "fail" }
+> = {
   kind: "functional",
   outcome: "pass",
   expected: "顯示訂單編號",

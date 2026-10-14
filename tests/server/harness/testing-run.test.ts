@@ -59,7 +59,7 @@ test("source read feedback names unread sources without dumping read text and st
   assert.equal(bounded.includes("20:"), false);
 });
 
-test("AC and UI first passes get 18 of their 20 turns while planner and atlassian keep 6, each with 2 feedback turns", () => {
+test("AC and UI use their full 20 turns in one pass while planner and atlassian keep 6 with 2 feedback turns", () => {
   const runtime = hostTestingRuntime({ model: "owner-model", build: "owner-build" });
 
   assert.deepEqual(
@@ -67,8 +67,8 @@ test("AC and UI first passes get 18 of their 20 turns while planner and atlassia
     [
       ["atlassian", { initial: 6, feedback: 2 }],
       ["planner", { initial: 6, feedback: 2 }],
-      ["ac", { initial: 18, feedback: 2 }],
-      ["ui", { initial: 18, feedback: 2 }],
+      ["ac", { initial: 20, feedback: 0 }],
+      ["ui", { initial: 20, feedback: 0 }],
     ],
   );
 });

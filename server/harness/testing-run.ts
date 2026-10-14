@@ -277,9 +277,13 @@ export async function delegateTask(run: AcceptedRun, call: ModelCall) {
 export async function assertDelegationCutover(): Promise<void> {
   const pending = await listPendingTestingOperations();
 
-  if (pending.some((operation) => !operation.delegated)) {
+  if (
+    pending.some(
+      (operation) => !operation.delegated || operation.workflow !== TESTING_WORKFLOW_VERSION,
+    )
+  ) {
     throw new Error(
-      "Legacy testing operations are active. Maintenance is required before delegation cutover; no records were changed.",
+      "Incompatible testing operations are active. Maintenance is required: drain them with their original worker before delegation cutover; no records were changed.",
     );
   }
 }

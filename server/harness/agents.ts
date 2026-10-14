@@ -91,7 +91,7 @@ export const agentRegistry = {
     tools: [verifyAcTool],
     registration: "browser_ac",
     codeMode: "enabled",
-    profile: "functional-v3",
+    profile: "functional-v4",
     systemPrompt: qaSystemPrompts.ac,
   },
   ui: {
@@ -101,7 +101,7 @@ export const agentRegistry = {
     tools: [verifyUiTool, getFigma],
     registration: "browser_ui+figma_read",
     codeMode: "enabled",
-    profile: "style-v3",
+    profile: "style-v4",
     systemPrompt: qaSystemPrompts.ui,
   },
 } as const satisfies AgentDefinitions;
