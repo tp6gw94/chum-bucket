@@ -7,12 +7,8 @@ import {
 } from "@tanstack/ai";
 import { agentRegistry, allowsTool } from "../agents";
 import type { ModelCall } from "../model-turn";
-import {
-  withAtlassianScope,
-  ToolBoundaryError,
-  type LocalToolHandler,
-  type ModelTool,
-} from "./atlassian";
+import { withAtlassianScope, type LocalToolHandler, type ModelTool } from "./atlassian";
+import { ToolBoundaryError } from "./atlassian-policy";
 import { codeModeToolName, composeCodeModeTurn } from "./code-mode";
 import { toolOutputSchemas } from "./output-schemas";
 import { DELEGATE_TASK_TOOL } from "./delegate-task";

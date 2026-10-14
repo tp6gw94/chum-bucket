@@ -6,6 +6,8 @@ export type ModelToolShape = Readonly<{
   inputSchema: JSONSchema;
 }>;
 
+export class ToolBoundaryError extends Error {}
+
 export type Environment = Readonly<Record<string, string | undefined>>;
 
 export const defaultAtlassianEndpoint = "http://127.0.0.1:8000/mcp";

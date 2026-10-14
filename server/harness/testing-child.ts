@@ -3,7 +3,6 @@ import { gateToolApproval } from "./tool-approval";
 import type { ModelCall } from "./model-turn";
 import { createPlaywrightFixture } from "./playwright-check";
 import { DBOS } from "@dbos-inc/dbos-sdk";
-import type { UIMessage } from "@tanstack/ai";
 import { z } from "zod";
 import {
   DESIGN_CAPTURE_NATIVE,
@@ -21,8 +20,6 @@ import { guardActualIO, readTestingExecution } from "./run-store";
 import {
   assembleRequirements,
   digestOf,
-  canonicalizePlan,
-  publicIssues,
   sameDesign,
   type CanonicalPlan,
   type Requirements,
@@ -38,14 +35,9 @@ import {
   type TestingNativeReceipt,
   type TestingNativeReceiptReference,
 } from "./testing-tools";
-import {
-  runAgentLoop,
-  type AgentCheckpoint,
-  type AgentLoopResult,
-  type AgentSession,
-} from "./agent-loop";
+import type { AgentCheckpoint, AgentSession } from "./agent-loop";
 import { roleRegistry, roleSystemPrompt } from "./agents";
-import { roleFeedbackPrompt, roleFinalTurnPrompt, roleTaskPrompt } from "./prompts";
+import { reviewPlanner, runRole, type ReviewName, type RoleReview } from "./role-run";
 import type { ConversationState } from "./conversation";
 import {
   browserHandoffSchema,
@@ -333,90 +325,11 @@ function pinnedPlan(execution: TestingExecution): CanonicalPlan | null {
   return artifact ? (artifact.payload as CanonicalPlan) : null;
 }
 
-type MessageParts = ConversationState["context"][number]["parts"];
-
-function textOfParts(parts: MessageParts): string {
-  return parts
-    .filter((part) => part.type === "text")
-    .map((part) => ("content" in part ? String(part.content) : ""))
-    .join("");
-}
-
-function assistantText(conversation: ConversationState): string {
-  const assistant = [...conversation.context]
-    .reverse()
-    .find((message) => message.role === "assistant");
-
-  return assistant ? textOfParts(assistant.parts) : "";
-}
-
-export function extractJson(text: string): unknown {
-  const start = text.indexOf("{");
-  const end = text.lastIndexOf("}");
-
-  if (start < 0 || end <= start) {
-    throw new Error("Role output is not valid JSON");
-  }
-
-  try {
-    return JSON.parse(text.slice(start, end + 1)) as unknown;
-  } catch {
-    throw new Error("Role output is not valid JSON");
-  }
-}
-
 type ExecutionTask = TestingExecution["tasks"][number];
 type ExecutionReceipt = ExecutionTask["receipts"][number];
 
 function validationIssues(validation: Validation<unknown>): string[] {
   return validation.kind === "rejected" ? [...validation.issues] : [];
-}
-
-function planIssues(
-  execution: TestingExecution,
-  requirements: Requirements,
-  proposal: unknown,
-): string[] {
-  const validation = canonicalizePlan(proposal, {
-    requirementsDigest: digestOf(requirements),
-    goal: execution.intent.goal,
-    targetUrl: execution.intent.targetUrl,
-    design: execution.intent.design ?? null,
-  });
-
-  if (validation.kind !== "accepted") {
-    return validationIssues(validation);
-  }
-
-  return validation.value.cases.flatMap((planCase) =>
-    planCase.checks.flatMap((check) =>
-      (check.kind === "functional" ? !check.observation : !check.target)
-        ? [`Check ${check.id} requires a typed executable observation or style target`]
-        : [],
-    ),
-  );
-}
-
-function proposalIssues(execution: TestingExecution, proposal: unknown): string[] {
-  const requirements = pinnedRequirements(execution);
-
-  return requirements ? planIssues(execution, requirements, proposal) : ["requirements_missing"];
-}
-
-function feedbackConversation(
-  conversation: ConversationState,
-  issues: readonly string[],
-): ConversationState {
-  const message: UIMessage = {
-    id: `feedback-${conversation.context.length}`,
-    role: "user",
-    parts: [{ type: "text", content: roleFeedbackPrompt(issues) }],
-  };
-
-  return {
-    display: [...conversation.display, message],
-    context: [...conversation.context, message],
-  };
 }
 
 const designReceiptBindingSchema = z.strictObject({
@@ -989,9 +902,7 @@ function childHost(
   };
 }
 
-type Review = Readonly<{ completion: RoleCompletion; issues: readonly string[] }>;
-
-function sourceReview(execution: TestingExecution): Review {
+function sourceReview(execution: TestingExecution): RoleReview<"atlassian"> {
   const task = execution.tasks.find((item) => item.frame.role === "atlassian");
 
   return {
@@ -1000,35 +911,21 @@ function sourceReview(execution: TestingExecution): Review {
   };
 }
 
-function proposalReview(
-  role: "planner",
-  execution: TestingExecution,
-  conversation: ConversationState,
-): Review {
-  try {
-    const proposal = extractJson(assistantText(conversation));
-
-    return { completion: { role, proposal }, issues: proposalIssues(execution, proposal) };
-  } catch (error) {
-    return {
-      completion: { role, proposal: null },
-      issues: [error instanceof Error ? error.message : "invalid json"],
-    };
-  }
-}
-
 function reviewCompletion(
   input: TestingChildInput,
   conversation: ConversationState,
-  name: string,
-): Promise<Review> {
+  name: ReviewName,
+): Promise<RoleReview> {
   return DBOS.runStep(
-    async (): Promise<Review> => {
+    async (): Promise<RoleReview> => {
       const latest = await readTestingExecution(input.parentRunId, input.operationId);
 
       return input.role === "atlassian"
         ? sourceReview(latest)
-        : proposalReview("planner", latest, conversation);
+        : reviewPlanner(
+            { intent: latest.intent, requirements: pinnedRequirements(latest) },
+            conversation,
+          );
     },
     { name },
   );
@@ -1049,33 +946,6 @@ async function orchestrateComment(run: ChildRun, call: ModelCall) {
   );
 }
 
-const FEEDBACK_TURNS = 2;
-const CONTEXT_OVERFLOW_ISSUE = "Model context capacity exceeded";
-
-export function rolePassTurns(runtime: TestingExecution["runtime"], role: RoleId) {
-  const turns = effectiveLimits(runtime, role).turns;
-
-  return role === "ac" || role === "ui"
-    ? { initial: turns, feedback: 0 }
-    : { initial: turns - FEEDBACK_TURNS, feedback: FEEDBACK_TURNS };
-}
-
-function qaChildResult(role: "ac" | "ui", result: AgentLoopResult): TestingChildResult {
-  switch (result.state) {
-    case "done": {
-      const message = result.conversation.context.at(-1);
-      const text = message?.role === "assistant" ? textOfParts(message.parts) : "";
-
-      return { state: "ready", completion: { role, findings: text.trim() ? text : null } };
-    }
-
-    case "overflow":
-      return { state: "failed", reason: "context_overflow", issues: [CONTEXT_OVERFLOW_ISSUE] };
-    case "limit":
-      return { state: "failed", reason: "budget" };
-  }
-}
-
 async function runRoleLoops(run: ChildRun, tools: RunTools): Promise<TestingChildResult> {
   const { input, execution, signal } = run;
   const step = { current: "model-0" };
@@ -1084,57 +954,22 @@ async function runRoleLoops(run: ChildRun, tools: RunTools): Promise<TestingChil
       step.current = name.replaceAll(":", "-");
     }
   });
-  const prompt = roleTaskPrompt(input.role, {
-    intent: execution.intent,
-    requirements: pinnedRequirements(execution),
-    plan: pinnedPlan(execution),
+
+  return runRole({
+    role: input.role,
+    task: {
+      intent: execution.intent,
+      requirements: pinnedRequirements(execution),
+      plan: pinnedPlan(execution),
+    },
+    turns: effectiveLimits(execution.runtime, input.role).turns,
+    systemPrompt: run.systemPrompt,
+    session: childSession(input, execution, run.transport, signal, () => step.current, tools),
+    checkpoint,
+    orchestration: (call) => orchestrateComment(run, call),
+    signal,
+    review: (conversation, name) => reviewCompletion(input, conversation, name),
   });
-  const initial: ConversationState = {
-    display: [{ id: "task", role: "user", parts: [{ type: "text", content: prompt }] }],
-    context: [{ id: "task", role: "user", parts: [{ type: "text", content: prompt }] }],
-  };
-  const session = childSession(input, execution, run.transport, signal, () => step.current, tools);
-  const loop = (conversation: ConversationState, maxTurn: number, prefix: string) =>
-    runAgentLoop({
-      session,
-      conversation,
-      model: roleRegistry[input.role].model,
-      prompt: run.systemPrompt,
-      compaction: { kind: "bounded", maxTurn },
-      finalTurn: roleFinalTurnPrompt(input.role),
-      checkpoint: prefixed(checkpoint, prefix),
-      orchestration: (call) => orchestrateComment(run, call),
-      signal,
-    });
-  const passes = rolePassTurns(execution.runtime, input.role);
-  const first = await loop(initial, passes.initial, "a");
-
-  if (input.role === "ac" || input.role === "ui") {
-    return qaChildResult(input.role, first);
-  }
-
-  const decision = await reviewCompletion(input, first.conversation, "proposal");
-
-  if (decision.issues.length === 0) {
-    return { state: "ready", completion: decision.completion };
-  }
-
-  const second = await loop(
-    feedbackConversation(first.conversation, decision.issues),
-    passes.feedback,
-    "b",
-  );
-  const again = await reviewCompletion(input, second.conversation, "proposal-2");
-
-  if (again.issues.length === 0) {
-    return { state: "ready", completion: again.completion };
-  }
-
-  return {
-    state: "failed",
-    reason: input.role === "atlassian" ? "source_reads_incomplete" : "proposal_rejected",
-    issues: publicIssues(again.issues),
-  };
 }
 
 async function runClaimedChild(
@@ -1226,10 +1061,6 @@ async function executeTestingChild(input: TestingChildInput): Promise<TestingChi
       await acknowledgeDrain(input);
     }
   }
-}
-
-function prefixed(checkpoint: AgentCheckpoint, prefix: string): AgentCheckpoint {
-  return (input) => checkpoint({ ...input, name: `${prefix}:${input.name}` });
 }
 
 function childCheckpoint(transport: Transport, note: (name: string) => void): AgentCheckpoint {

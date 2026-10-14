@@ -3,7 +3,6 @@ import {
   type JSONSchema,
   type Tool,
   type ToolExecutionContext,
-  type UIMessage,
 } from "@tanstack/ai";
 import { z } from "zod";
 import {
@@ -21,7 +20,7 @@ import {
 } from "../../shared/testing";
 import type { ModelCall } from "./model-turn";
 import { toolArgumentSchemas } from "../../shared/tool-approval";
-import { allowsTool, roleRegistry, toolNamesFor } from "./agents";
+import { roleRegistry, toolNamesFor } from "./agents";
 import {
   checksForRole,
   digestOf,
@@ -42,18 +41,15 @@ import {
   withPageMetadata,
   withRemoteLinks,
 } from "./source-links";
-import { codeModeToolName, composeCodeModeTurn, type CodeModeTurn } from "./tools/code-mode";
-import { toolOutputSchemas } from "./tools/output-schemas";
 import { createUseBrowserTool, type BrowserAdapter } from "./tools/use-browser";
+import { plannerRoleTools, roleRunTools, type NativeRoute, type RoleRun } from "./role-tools";
 import type { RunTools } from "./tools";
-
-export type TestingNativeRoute = "direct" | "codemode";
 
 export type TestingNativeInvocation = Readonly<{
   call: ModelCall;
   input: unknown;
   nativeName: string;
-  route: TestingNativeRoute;
+  route: NativeRoute;
   context: ToolExecutionContext;
 }>;
 
@@ -101,17 +97,6 @@ export type TestingRoleToolsInput = Readonly<{
   host: TestingNativeHost;
 }>;
 
-type RoleRun = Readonly<{
-  tools: RunTools;
-  quiet: () => Promise<void>;
-}>;
-
-type NativeDispatch = (
-  call: ModelCall,
-  context: ToolExecutionContext,
-  route: TestingNativeRoute,
-) => Promise<unknown>;
-
 type BrowserTool = ReturnType<typeof createUseBrowserTool>;
 
 export function testingRoleToolNames(role: RoleId): readonly string[] {
@@ -157,82 +142,6 @@ function envelopeOf(value: unknown): TestingNativeReceipt {
     output,
     receiptId: parsed.data.receiptId,
     outputDigest: parsed.data.outputDigest,
-  };
-}
-
-function roleRunTools(options: {
-  role: RoleId;
-  definitions: (messages: readonly UIMessage[]) => Promise<readonly ModelTool[]>;
-  dispatch: (messages: readonly UIMessage[]) => NativeDispatch;
-  guard: (value: unknown) => void;
-  signal?: AbortSignal;
-}): RoleRun {
-  const pending = new Set<Promise<unknown>>();
-  const contextFor = (context: ToolExecutionContext): ToolExecutionContext =>
-    options.signal
-      ? {
-          ...context,
-          abortSignal: context.abortSignal
-            ? AbortSignal.any([context.abortSignal, options.signal])
-            : options.signal,
-        }
-      : context;
-
-  const dispatchFor =
-    (messages: readonly UIMessage[]) =>
-    (call: ModelCall, context: ToolExecutionContext, route: TestingNativeRoute) => {
-      context.abortSignal?.throwIfAborted();
-      options.signal?.throwIfAborted();
-
-      if (!allowsTool(options.role, call.name, route)) {
-        throw new Error("Unknown tool");
-      }
-
-      const work = options.dispatch(messages)(call, contextFor(context), route);
-      pending.add(work);
-      void work.then(
-        () => pending.delete(work),
-        () => pending.delete(work),
-      );
-
-      return work;
-    };
-
-  const buildTurn = async (
-    messages: readonly UIMessage[],
-    definitions: readonly ModelTool[],
-  ): Promise<CodeModeTurn> =>
-    composeCodeModeTurn({
-      definitions: definitions.filter((definition) =>
-        allowsTool(options.role, definition.name, "codemode"),
-      ),
-      dispatch: (call, context) => dispatchFor(messages)(call, context, "codemode"),
-      guard: options.guard,
-      outputSchemas: toolOutputSchemas,
-    });
-
-  return {
-    quiet: async () => {
-      await Promise.allSettled(pending);
-    },
-    tools: {
-      async getModelTools(messages) {
-        const definitions = await options.definitions(messages);
-        const turn = await buildTurn(messages, definitions);
-
-        return { definitions: [...definitions, turn.definition], systemPrompt: turn.systemPrompt };
-      },
-      async executeTool(messages, call, context) {
-        if (call.name === codeModeToolName) {
-          const definitions = await options.definitions(messages);
-          const turn = await buildTurn(messages, definitions);
-
-          return turn.execute(call.input, contextFor(context));
-        }
-
-        return dispatchFor(messages)(call, context, "direct");
-      },
-    },
   };
 }
 
@@ -341,18 +250,6 @@ async function atlassianRoleTools(
   });
 }
 
-function plannerRoleTools(signal?: AbortSignal): RoleRun {
-  return roleRunTools({
-    role: "planner",
-    signal,
-    guard: () => undefined,
-    definitions: async () => [],
-    dispatch: () => async (call) => {
-      throw new Error(`Tool ${call.name} is not available to the planner role`);
-    },
-  });
-}
-
 function hostFixture(host: TestingNativeHost): BrowserAdapter {
   if (!host.browserFixture) {
     throw new Error("Host browser fixture is required");
@@ -380,7 +277,7 @@ async function browserEnvelope(
   browser: BrowserTool,
   call: ModelCall,
   context: ToolExecutionContext,
-  route: TestingNativeRoute,
+  route: NativeRoute,
 ): Promise<unknown> {
   const parsed = useBrowserInputSchema.parse(call.input);
   const result = await host.invoke(

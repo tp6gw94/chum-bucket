@@ -6,15 +6,18 @@ import { DELEGATE_TASK_TOOL, withRunTools } from "../../../server/harness/tools"
 import {
   GuardDenial,
   designProperties,
-  extractJson,
   failureReason,
   observeStream,
   restoreDesignCapture,
-  rolePassTurns,
 } from "../../../server/harness/testing-child";
+import { extractJson, rolePassTurns } from "../../../server/harness/role-run";
 import { assembleRequirements, digestOf } from "../../../server/harness/testing-domain";
 import { roleFeedbackPrompt } from "../../../server/harness/prompts";
-import { hostTestingRuntime, type TestingExecution } from "../../../server/harness/testing-store";
+import {
+  effectiveLimits,
+  hostTestingRuntime,
+  type TestingExecution,
+} from "../../../server/harness/testing-store";
 import { ROLE_IDS, delegationInputSchema } from "../../../shared/testing";
 
 const { scriptedEvents } = createRequire(import.meta.url)(
@@ -63,7 +66,7 @@ test("AC and UI use their full 20 turns in one pass while planner and atlassian 
   const runtime = hostTestingRuntime({ model: "owner-model", build: "owner-build" });
 
   assert.deepEqual(
-    ROLE_IDS.map((role) => [role, rolePassTurns(runtime, role)]),
+    ROLE_IDS.map((role) => [role, rolePassTurns(effectiveLimits(runtime, role).turns, role)]),
     [
       ["atlassian", { initial: 6, feedback: 2 }],
       ["planner", { initial: 6, feedback: 2 }],

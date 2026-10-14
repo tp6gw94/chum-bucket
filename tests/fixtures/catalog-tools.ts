@@ -3,10 +3,10 @@ import type { ModelCall } from "../../server/harness/model-turn";
 import type { RunTools } from "../../server/harness/tools";
 import {
   withAtlassianScope,
-  ToolBoundaryError,
   type ModelTool,
   type LocalToolHandler,
 } from "../../server/harness/tools/atlassian";
+import { ToolBoundaryError } from "../../server/harness/tools/atlassian-policy";
 import { composeCodeModeTurn } from "../../server/harness/tools/code-mode";
 import { read, write, edit } from "../../server/harness/tools/fs";
 import { getFigma } from "../../server/harness/tools/get-figma";

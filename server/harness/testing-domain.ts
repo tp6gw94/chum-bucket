@@ -49,6 +49,16 @@ const isFunctionalCheck = (check: PlanCheck): check is FunctionalCheck =>
   check.kind === "functional";
 const isStyleCheck = (check: PlanCheck): check is StyleCheck => check.kind === "style";
 
+export const TESTING_LIMITS = {
+  turns: 8,
+  tools: 24,
+  nestedCalls: 8,
+  observationEntries: 64,
+  observationBytes: 32_768,
+  modelAttempts: 3,
+  operationMs: 15 * 60 * 1000,
+} as const;
+
 export function checksForRole(cases: readonly PlanCase[], role: "ac"): readonly FunctionalCheck[];
 export function checksForRole(cases: readonly PlanCase[], role: "ui"): readonly StyleCheck[];
 export function checksForRole(cases: readonly PlanCase[], role: "ac" | "ui"): readonly PlanCheck[];

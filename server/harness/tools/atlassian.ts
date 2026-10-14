@@ -12,6 +12,7 @@ import {
   atlassianTools,
   discoveryToolName,
   readAtlassianConfiguration,
+  ToolBoundaryError,
   type AtlassianConfiguration,
   type AtlassianCatalog,
   type ModelToolShape as ModelTool,
@@ -85,8 +86,6 @@ function discoveryDefinition(names: readonly string[]): ModelTool {
     },
   };
 }
-
-export class ToolBoundaryError extends Error {}
 
 function parseDiscoveryRequest(argumentsText: string): readonly string[] | undefined {
   let parsed: unknown;

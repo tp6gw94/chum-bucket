@@ -18,7 +18,11 @@ import { createQuickJSIsolateDriver } from "@tanstack/ai-isolate-quickjs";
 import { z } from "zod";
 import { codeModeDescription, codeModeSystemPrompt } from "../prompts";
 import type { ModelCall } from "../model-turn";
-import { discoveryToolName, ToolBoundaryError, type ModelTool } from "./atlassian";
+import {
+  discoveryToolName,
+  ToolBoundaryError,
+  type ModelToolShape as ModelTool,
+} from "./atlassian-policy";
 
 export const codeModeToolName = "codemode";
 

@@ -42,6 +42,7 @@ import {
   type TestingRequestInput,
 } from "../../shared/testing";
 import {
+  TESTING_LIMITS,
   assembleRequirements,
   assembleToolResults,
   canonicalizePlan,
@@ -74,15 +75,6 @@ const PROSE_WORKFLOW_VERSIONS: ReadonlySet<string> = new Set([
 ]);
 const TESTING_SCHEMA_VERSION = "supervised-testing-schema-v2";
 export const DESIGN_CAPTURE_NATIVE = "design_capture";
-const TESTING_LIMITS = {
-  turns: 8,
-  tools: 24,
-  nestedCalls: 8,
-  observationEntries: 64,
-  observationBytes: 32_768,
-  modelAttempts: 3,
-  operationMs: 15 * 60 * 1000,
-} as const;
 const BROWSER_ROLE_LIMITS = {
   turns: 20,
   tools: 60,
