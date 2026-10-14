@@ -33,3 +33,4 @@ dist
 .data/browser-evidence/
 
 .worktree/
+.workspace/

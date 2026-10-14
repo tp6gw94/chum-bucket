@@ -7,6 +7,7 @@ import {
 } from "@tanstack/ai";
 import { deepinfra } from "@server/harness/provider";
 import { openuiInstructions } from "@server/harness/prompts";
+import { createFsTools } from "@server/harness/tools/fs";
 import { getFigma } from "@server/harness/tools/get-figma";
 import { Hono } from "hono";
 import { db } from "./db";
@@ -15,6 +16,8 @@ import { eq } from "drizzle-orm";
 import { z } from "zod";
 
 const app = new Hono();
+
+const fsTools = createFsTools(process.env.AGENT_WORKSPACE ?? ".workspace");
 
 const updateChatMessage: ChatMiddleware = {
   name: "updateChatMessage",
@@ -56,7 +59,7 @@ app.post("/", async (c) => {
     adapter: deepinfra("deepseek-ai/DeepSeek-V4.1-Flash"),
     systemPrompts: [openuiInstructions()],
     messages: payload.messages,
-    tools: [getFigma],
+    tools: [getFigma, ...fsTools],
     threadId: payload.threadId,
     runId: payload.runId,
     middleware: [updateChatMessage],
