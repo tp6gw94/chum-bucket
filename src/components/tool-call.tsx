@@ -10,12 +10,43 @@ const labels: Record<ToolCallPart["state"], string> = {
   error: "執行失敗",
 };
 
-export function ToolCall({ part }: { part: ToolCallPart }) {
-  let args = part.arguments;
+type CodeBlock = { key: string; value: string };
 
+function parseJson(text: string): { value: unknown } | undefined {
   try {
-    args = JSON.stringify(JSON.parse(args), null, 2);
-  } catch {}
+    return { value: JSON.parse(text) };
+  } catch {
+    return undefined;
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function isMultiline(value: unknown): value is string {
+  return typeof value === "string" && value.includes("\n");
+}
+
+function splitArguments(text: string): { json: string; blocks: CodeBlock[] } {
+  const parsed = parseJson(text);
+
+  if (!parsed || !isRecord(parsed.value)) {
+    return { json: parsed ? JSON.stringify(parsed.value, null, 2) : text, blocks: [] };
+  }
+
+  const entries = Object.entries(parsed.value);
+  const blocks = entries.flatMap(([key, value]) => (isMultiline(value) ? [{ key, value }] : []));
+  const rest = entries.filter(([, value]) => !isMultiline(value));
+
+  return {
+    json: blocks.length && !rest.length ? "" : JSON.stringify(Object.fromEntries(rest), null, 2),
+    blocks,
+  };
+}
+
+export function ToolCall({ part }: { part: ToolCallPart }) {
+  const { json, blocks } = splitArguments(part.arguments);
 
   return (
     <details open className="min-w-0 rounded-lg border border-border bg-muted/30 p-3">
@@ -28,9 +59,19 @@ export function ToolCall({ part }: { part: ToolCallPart }) {
       </summary>
       <div className="mt-2 flex flex-col gap-1">
         <p className="text-xs text-muted-foreground">傳入參數</p>
-        <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-all text-xs">
-          {args || "等待參數…"}
-        </pre>
+        {json || !blocks.length ? (
+          <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-all text-xs">
+            {json || "等待參數…"}
+          </pre>
+        ) : null}
+        {blocks.map((block) => (
+          <div key={block.key} className="flex min-w-0 flex-col gap-1">
+            <p className="font-mono text-xs text-muted-foreground">{block.key}</p>
+            <pre className="max-h-96 overflow-auto rounded-md bg-muted p-2 text-xs">
+              <code>{block.value}</code>
+            </pre>
+          </div>
+        ))}
       </div>
     </details>
   );

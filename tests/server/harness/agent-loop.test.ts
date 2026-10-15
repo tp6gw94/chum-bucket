@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import type { AdapterYieldChunk, UIMessage } from "@tanstack/ai";
+import type { AdapterYieldChunk, StreamChunk, UIMessage } from "@tanstack/ai";
 import {
   runAgentLoop,
   type AgentCheckpoint,
@@ -63,10 +63,15 @@ function modelEvents(step: Step, turn: number): AdapterYieldChunk[] {
 
 function scriptedSession(steps: Step[]) {
   const counts = { model: 0, tool: 0 };
+  const emitted: StreamChunk[] = [];
+  const prompts: string[][] = [];
   const session: AgentSession = {
     runId: "run",
-    emit: async () => undefined,
-    chatStream: async () => {
+    emit: async (_runId, event) => {
+      emitted.push(event);
+    },
+    chatStream: async (options) => {
+      prompts.push(options.systemPrompts);
       const events = modelEvents(steps[counts.model], counts.model);
       counts.model++;
       return (async function* () {
@@ -74,20 +79,24 @@ function scriptedSession(steps: Step[]) {
       })();
     },
     tools: {
-      getModelTools: async () => [
-        {
-          name: "jira_get_issue",
-          description: "Read an issue",
-          inputSchema: { type: "object", properties: { issue_key: { type: "string" } } },
-        },
-      ],
-      executeTool: async (_messages, call) => {
+      getModelTools: async () => ({
+        definitions: [
+          {
+            name: "jira_get_issue",
+            description: "Read an issue",
+            inputSchema: { type: "object", properties: { issue_key: { type: "string" } } },
+          },
+        ],
+        systemPrompt: "code mode prompt",
+      }),
+      executeTool: async (_messages, call, context) => {
         counts.tool++;
+        context.emitCustomEvent("code_mode:external_call", { function: "external_jira_get_issue" });
         return { issue: (call.input as { issue_key: string }).issue_key };
       },
     },
   };
-  return { session, counts };
+  return { session, counts, emitted, prompts };
 }
 
 function cachedCheckpoint(cache: Map<string, unknown>, names: string[]): AgentCheckpoint {
@@ -122,6 +131,34 @@ test("each model call and tool call runs as its own named checkpoint", async () 
   assert.deepEqual(names, ["model:0", "tool:0:0", "model:1"]);
   assert.deepEqual(counts, { model: 2, tool: 1 });
   assert.match(JSON.stringify(result.messages), /PROJ-1 read/);
+});
+
+test("model calls receive the code mode prompt and tool events are stored before the tool result", async () => {
+  const { session, emitted, prompts } = scriptedSession(steps);
+  await runAgentLoop({
+    session,
+    messages,
+    model: "offline",
+    prompt: "prompt",
+    checkpoint: cachedCheckpoint(new Map(), []),
+  });
+
+  assert.deepEqual(prompts, [
+    ["prompt", "code mode prompt"],
+    ["prompt", "code mode prompt"],
+  ]);
+  const custom = emitted.findIndex((event) => event.type === "CUSTOM");
+  const result = emitted.findIndex((event) => event.type === "TOOL_CALL_RESULT");
+  assert.ok(custom >= 0 && custom < result);
+  assert.deepEqual(
+    { ...emitted[custom], timestamp: 0 },
+    {
+      type: "CUSTOM",
+      name: "code_mode:external_call",
+      value: { function: "external_jira_get_issue" },
+      timestamp: 0,
+    },
+  );
 });
 
 test("a rerun reuses completed checkpoints and only executes unfinished steps", async () => {

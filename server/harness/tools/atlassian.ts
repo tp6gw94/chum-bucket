@@ -20,17 +20,19 @@ export type ModelTool = Readonly<{
 }>;
 export type AtlassianCatalog = ReadonlyMap<string, ModelTool>;
 export type LocalToolHandler = (input: unknown, context: ToolExecutionContext) => Promise<unknown>;
+export type CredentialGuard = (value: unknown) => void;
 export type AtlassianScope = Readonly<{
-  getModelTools: (
+  getModelTools: <T>(
     messages: readonly UIMessage[],
-    compose: (remote: AtlassianCatalog) => ModelTool[],
-  ) => Promise<ModelTool[]>;
+    compose: (granted: AtlassianCatalog, discovery: ModelTool | undefined) => T,
+  ) => Promise<T>;
   executeTool: (
     messages: readonly UIMessage[],
     call: ModelCall,
     context: ToolExecutionContext,
     local: LocalToolHandler | undefined,
   ) => Promise<unknown>;
+  credentialGuard: () => Promise<CredentialGuard>;
 }>;
 
 type RemoteRegistration = Readonly<{
@@ -556,16 +558,8 @@ function selectDefinitions(
   );
 }
 
-function advertisedTools(
-  definitions: ModelTool[],
-  session: RemoteSession | undefined,
-  catalog: RemoteCatalog | undefined,
-): ModelTool[] {
-  if (!session || !catalog) {
-    return definitions;
-  }
-
-  return [...definitions, discoveryDefinition([...catalog.registrations.keys()])];
+function advertisedDiscovery(catalog: RemoteCatalog | undefined): ModelTool | undefined {
+  return catalog ? discoveryDefinition([...catalog.registrations.keys()]) : undefined;
 }
 
 function authorizeRemoteCall(
@@ -637,6 +631,24 @@ function discoveryOutput(
   return output;
 }
 
+function unwrapResultText(output: unknown): unknown {
+  if (!output || typeof output !== "object" || Array.isArray(output)) {
+    return output;
+  }
+
+  const text = (output as { result?: unknown }).result;
+
+  if (Object.keys(output).length !== 1 || typeof text !== "string") {
+    return output;
+  }
+
+  try {
+    return JSON.parse(text);
+  } catch {
+    return output;
+  }
+}
+
 function remoteToolInput(call: ModelCall): unknown {
   return call.name === "jira_get_issue"
     ? { ...(call.input as Record<string, unknown>), update_history: false }
@@ -656,9 +668,11 @@ async function invokeRemote(
     throw new ToolBoundaryError("Unknown tool");
   }
 
-  const output = await withAbort(
-    entry.handler(remoteToolInput(call), { ...context, abortSignal: signal }),
-    signal,
+  const output = unwrapResultText(
+    await withAbort(
+      entry.handler(remoteToolInput(call), { ...context, abortSignal: signal }),
+      signal,
+    ),
   );
   guardCredentials(output, config);
 
@@ -786,8 +800,10 @@ export async function withAtlassianScope<T>(
 
         try {
           const catalog = await session?.catalog;
-          const definitions = compose(selectDefinitions(catalog, grantedNames(messages, config)));
-          const advertised = advertisedTools(definitions, session, catalog);
+          const advertised = compose(
+            selectDefinitions(catalog, grantedNames(messages, config)),
+            advertisedDiscovery(catalog),
+          );
           guardCredentials(advertised, config);
 
           return structuredClone(advertised);
@@ -818,6 +834,11 @@ export async function withAtlassianScope<T>(
         }
 
         return runRemoteTool(names, call, context, config, getRemote, retire);
+      },
+      async credentialGuard() {
+        const config = await getConfiguration();
+
+        return (value) => guardCredentials(value, config);
       },
     });
   } finally {

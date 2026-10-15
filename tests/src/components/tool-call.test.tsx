@@ -29,6 +29,32 @@ test("tool calls expose their name, partial arguments and lifecycle state", () =
     assert.match(html, /\n  &quot;issueKey&quot;: &quot;DEMO-1&quot;\n/);
   }
 
+  const code =
+    'const issue = await external_jira_get_issue({ issue_key: "DEMO-1" });\nreturn issue.key;';
+  const codemode = renderToStaticMarkup(
+    <ToolCall
+      part={{
+        ...part,
+        name: "codemode",
+        arguments: JSON.stringify({ code, label: "multi\nline", limit: 2 }),
+        state: "complete",
+      }}
+    />,
+  );
+  assert.match(
+    codemode,
+    /<code>const issue = await external_jira_get_issue\(\{ issue_key: &quot;DEMO-1&quot; \}\);\nreturn issue.key;<\/code>/,
+  );
+  assert.match(codemode, /<code>multi\nline<\/code>/);
+  assert.match(codemode, /\{\n {2}&quot;limit&quot;: 2\n\}/);
+  assert.doesNotMatch(codemode, /\\n/);
+
+  const codeOnly = renderToStaticMarkup(
+    <ToolCall part={{ ...part, arguments: JSON.stringify({ code }), state: "complete" }} />,
+  );
+  assert.doesNotMatch(codeOnly, /等待參數/);
+  assert.match(codeOnly, /<code>/);
+
   const escaped = renderToStaticMarkup(
     <ToolCall part={{ ...part, arguments: "<script>alert(1)</script>" }} />,
   );
