@@ -35,3 +35,24 @@ test("tool calls expose their name, partial arguments and lifecycle state", () =
   assert.doesNotMatch(escaped, /<script>/);
   assert.match(escaped, /&lt;script&gt;/);
 });
+
+test("multi-line string arguments render as code blocks that keep their line breaks", () => {
+  const code = 'const file = await external_read({ path: "a.txt" });\nreturn file.content[0].text;';
+  const html = renderToStaticMarkup(
+    <ToolCall
+      part={{
+        type: "tool-call",
+        id: "call-2",
+        name: "codemode",
+        arguments: JSON.stringify({ code }),
+        state: "complete",
+      }}
+    />,
+  );
+  assert.match(
+    html,
+    /<code>const file = await external_read\(\{ path: &quot;a\.txt&quot; \}\);\nreturn file/,
+  );
+  assert.doesNotMatch(html, /\\n/);
+  assert.doesNotMatch(html, /等待參數/);
+});

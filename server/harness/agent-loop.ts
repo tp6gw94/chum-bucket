@@ -8,6 +8,7 @@ import {
 } from "@tanstack/ai";
 import { resolveDebugOption } from "@tanstack/ai/adapter-internals";
 import { snapshot, streamModelTurn, type ModelCall, type Turn } from "./model-turn";
+import { createToolEventBuffer, persistToolEvents } from "./tool-events";
 import type { ModelTool } from "./tools/atlassian";
 import type { RunTools } from "./tools";
 
@@ -75,13 +76,13 @@ async function modelStep(
 ): Promise<Turn> {
   const { messages, model, prompt } = input;
   await session.emit(session.runId, snapshot(messages), messages);
-  const definitions = await session.tools.getModelTools(messages);
+  const { definitions, systemPrompt } = await session.tools.getModelTools(messages);
   const result = await streamModelTurn({
     messages,
     stream: await session.chatStream({
       model,
       messages: convertMessagesToModelMessages(messages),
-      systemPrompts: [prompt],
+      systemPrompts: [prompt, systemPrompt],
       tools: definitions,
       logger: resolveDebugOption(false),
       request: { signal: AbortSignal.timeout(MODEL_REQUEST_TIMEOUT_MS) },
@@ -127,6 +128,7 @@ async function executeToolStep(
 ): Promise<UIMessage[]> {
   const { messages, call } = input;
   await session.emit(session.runId, snapshot(messages), messages);
+  const events = createToolEventBuffer(call.id);
   let output: unknown;
   let error = false;
 
@@ -134,15 +136,15 @@ async function executeToolStep(
     const context = {
       toolCallId: call.id,
       abortSignal: AbortSignal.timeout(TOOL_REQUEST_TIMEOUT_MS),
-      emitCustomEvent: () => {
-        throw new Error("Tool custom events are not supported");
-      },
+      emitCustomEvent: events.emit,
     };
     output = await session.tools.executeTool(messages, call, context);
   } catch (failure) {
     output = { error: failure instanceof Error ? failure.message.slice(0, 2000) : "Tool failed" };
     error = true;
   }
+
+  await persistToolEvents(events.close(), (event) => session.emit(session.runId, event));
 
   return settleToolStep(session, { messages, call, output, error });
 }

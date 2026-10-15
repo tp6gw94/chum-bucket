@@ -31,6 +31,7 @@ export type AtlassianScope = Readonly<{
     context: ToolExecutionContext,
     local: LocalToolHandler | undefined,
   ) => Promise<unknown>;
+  credentialGuard: () => Promise<(value: unknown) => void>;
 }>;
 
 type RemoteRegistration = Readonly<{
@@ -88,6 +89,8 @@ function discoveryDefinition(names: readonly string[]): ModelTool {
 }
 
 class ToolBoundaryError extends Error {}
+export class CredentialBoundaryError extends ToolBoundaryError {}
+export class ToolAuthorizationError extends ToolBoundaryError {}
 
 function parseDiscoveryRequest(argumentsText: string): readonly string[] | undefined {
   let parsed: unknown;
@@ -371,7 +374,7 @@ function guardCredentials(value: unknown, config: AtlassianConfiguration) {
 
   function inspect(value: unknown) {
     if (typeof value === "string" && secrets.some((secret) => value.includes(secret))) {
-      throw new ToolBoundaryError("Tool data contains configured Atlassian credentials");
+      throw new CredentialBoundaryError("Tool data contains configured Atlassian credentials");
     }
 
     if (value && typeof value === "object" && !seen.has(value)) {
@@ -448,6 +451,27 @@ function assertCatalogEntry(
   }
 }
 
+function wrapsResult(tool: McpToolList[number]): boolean {
+  const schema = tool.outputSchema as Record<string, unknown> | undefined;
+
+  return schema?.["x-fastmcp-wrap-result"] === true;
+}
+
+function unwrapResult(output: unknown): unknown {
+  const result =
+    output && typeof output === "object" ? (output as { result?: unknown }).result : undefined;
+
+  if (typeof result !== "string") {
+    return output;
+  }
+
+  try {
+    return JSON.parse(result) as unknown;
+  } catch {
+    return result;
+  }
+}
+
 function remoteRegistration(tool: McpToolList[number]): RemoteRegistration {
   const inputSchema = convertSchemaToJsonSchema(tool.inputSchema);
 
@@ -455,9 +479,15 @@ function remoteRegistration(tool: McpToolList[number]): RemoteRegistration {
     throw new ToolBoundaryError("Tool schema is unavailable");
   }
 
+  const wrapped = wrapsResult(tool);
+
   return {
     definition: { name: tool.name, description: tool.description, inputSchema },
-    handler: async (input, context) => tool.execute!(input, context),
+    handler: async (input, context) => {
+      const output: unknown = await tool.execute!(input, context);
+
+      return wrapped ? unwrapResult(output) : output;
+    },
   };
 }
 
@@ -581,18 +611,18 @@ function authorizeRemoteCall(
     }
 
     if (!requested.every((name) => atlassianTools.has(name))) {
-      throw new Error("Unknown tool");
+      throw new ToolAuthorizationError("Unknown tool");
     }
 
     return requested;
   }
 
   if (!atlassianTools.has(call.name)) {
-    throw new Error("Unknown tool");
+    throw new ToolAuthorizationError("Unknown tool");
   }
 
   if (!grantedNames(messages, config).has(call.name)) {
-    throw new ToolBoundaryError(
+    throw new ToolAuthorizationError(
       `Tool ${call.name} is not discovered; call ${discoveryToolName} first`,
     );
   }
@@ -612,6 +642,10 @@ async function executeLocalTool(
 
     return output;
   } catch (failure) {
+    if (failure instanceof CredentialBoundaryError) {
+      throw failure;
+    }
+
     guardCredentials(failure, config);
     throw new Error(failure instanceof Error ? failure.message : "Tool failed");
   }
@@ -808,7 +842,7 @@ export async function withAtlassianScope<T>(
         }
 
         if (config.mode === "local") {
-          throw new Error("Unknown tool");
+          throw new ToolAuthorizationError("Unknown tool");
         }
 
         const names = authorizeRemoteCall(messages, call, config);
@@ -818,6 +852,11 @@ export async function withAtlassianScope<T>(
         }
 
         return runRemoteTool(names, call, context, config, getRemote, retire);
+      },
+      async credentialGuard() {
+        const config = await getConfiguration();
+
+        return (value) => guardCredentials(value, config);
       },
     });
   } finally {
