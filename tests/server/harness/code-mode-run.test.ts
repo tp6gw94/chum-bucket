@@ -99,7 +99,7 @@ return text.split("\\n")[0];`;
               },
               tools,
             },
-            messages,
+            conversation: { display: messages, context: messages },
             model: "offline",
             prompt: "base prompt",
             checkpoint: directCheckpoint,
@@ -140,7 +140,7 @@ return text.split("\\n")[0];`;
     assert.ok(finished >= 0 && finished < toolResult);
     assert.equal(emitted.filter((event) => event.type === "TOOL_CALL_RESULT").length, 1);
     assert.doesNotMatch(JSON.stringify(custom), /confidential detail|external_read\(\{ path/);
-    assert.match(JSON.stringify(result.messages), /The report is green\./);
+    assert.match(JSON.stringify(result.conversation.display), /The report is green\./);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

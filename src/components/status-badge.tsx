@@ -12,13 +12,14 @@ export function StatusBadge({
   runningLabel: string;
   idleLabel: string;
 }) {
-  const running = status === "running";
+  const running = status !== "idle";
   const Icon = running ? LoaderCircleIcon : CircleIcon;
+  const label = status === "compacting" ? "compact..." : running ? runningLabel : idleLabel;
 
   return (
     <Badge variant={running ? "default" : "secondary"}>
       <Icon data-icon="inline-start" className={running ? "motion-safe:animate-spin" : undefined} />
-      {running ? runningLabel : idleLabel}
+      {label}
     </Badge>
   );
 }

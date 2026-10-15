@@ -85,12 +85,9 @@ function ChatMessageRow({
     );
   }
 
-  const align = message.role === "user" ? "end" : "start";
-  const header = message.metadata?.fromSummary
-    ? "摘要"
-    : message.role === "assistant"
-      ? agent
-      : null;
+  const summary = message.metadata?.fromSummary === true;
+  const align = message.role === "user" && !summary ? "end" : "start";
+  const header = summary ? "壓縮摘要" : message.role === "assistant" ? agent : null;
 
   return (
     <Message align={align}>
@@ -106,7 +103,7 @@ function ChatMessageRow({
             ) : null}
           </div>
         ) : (
-          <Bubble variant="default" align={align}>
+          <Bubble variant={summary ? "muted" : "default"} align={align}>
             <BubbleContent className="whitespace-pre-wrap">{text}</BubbleContent>
           </Bubble>
         )}

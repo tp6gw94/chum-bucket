@@ -1,6 +1,6 @@
 import type { UIMessage } from "@tanstack/ai-react";
 
-export type RunStatus = "running" | "idle";
+export type RunStatus = "running" | "compacting" | "idle";
 
 export type ChatMessage = UIMessage & {
   metadata?: { fromSummary?: boolean };

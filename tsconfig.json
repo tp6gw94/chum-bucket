@@ -17,6 +17,6 @@
       "@server/*": ["./server/*"]
     }
   },
-  "include": ["src", "server", "components", "lib", "scripts", "drizzle.config.ts"],
+  "include": ["src", "server", "shared", "components", "lib", "scripts", "drizzle.config.ts"],
   "exclude": ["node_modules", "dist"]
 }

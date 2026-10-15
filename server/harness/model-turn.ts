@@ -8,7 +8,79 @@ import {
   type AdapterYieldChunk,
 } from "@tanstack/ai";
 
+import type { AgentChatStream } from "./agent-loop";
+import type { MODEL } from "./run-store";
+
 export type ModelCall = { id: string; name: string; arguments: string; input: unknown };
+
+export const modelChatStream: AgentChatStream = async (options) => {
+  const { deepinfra } = await import("./provider");
+
+  return deepinfra(options.model as typeof MODEL).chatStream(options);
+};
+
+export class ContextOverflowError extends Error {
+  constructor(message = "Model context window exceeded") {
+    super(message);
+    this.name = "ContextOverflowError";
+  }
+}
+
+const OVERFLOW_CODES = new Set([
+  "context_length_exceeded",
+  "max_context_length_exceeded",
+  "context_window_exceeded",
+]);
+const OVERFLOW_MESSAGES = [
+  /maximum context length is \d+ tokens/i,
+  /context length (?:of \d+ tokens )?(?:is )?exceeded/i,
+  /exceeds? (?:the )?(?:model'?s )?(?:maximum )?context (?:window|length)/i,
+  /prompt is too long/i,
+];
+
+function providerCode(error: { code?: unknown; status?: unknown; error?: unknown }) {
+  const nested = error.error as { code?: unknown } | undefined;
+  const code = error.code ?? nested?.code ?? error.status;
+
+  return typeof code === "number" || typeof code === "string" ? String(code) : undefined;
+}
+
+export function isContextOverflow(error: unknown): boolean {
+  if (!error || typeof error !== "object") {
+    return typeof error === "string" && OVERFLOW_MESSAGES.some((pattern) => pattern.test(error));
+  }
+
+  const code = providerCode(error as { code?: unknown; status?: unknown; error?: unknown });
+  const message = String((error as { message?: unknown }).message ?? "");
+
+  if (code && OVERFLOW_CODES.has(code)) {
+    return true;
+  }
+
+  return (
+    (code === undefined || code === "400" || code === "413") &&
+    OVERFLOW_MESSAGES.some((pattern) => pattern.test(message))
+  );
+}
+
+export function throwProviderError(error: unknown): never {
+  if (error instanceof ContextOverflowError) {
+    throw error;
+  }
+
+  if (isContextOverflow(error)) {
+    throw new ContextOverflowError(
+      String((error as { message?: unknown } | null)?.message ?? "Model context window exceeded"),
+    );
+  }
+
+  if (error instanceof Error) {
+    throw error;
+  }
+
+  throw new Error(String((error as { message?: unknown } | null)?.message ?? error));
+}
+
 export type Turn = {
   messages: UIMessage[];
   calls: ModelCall[];
@@ -65,7 +137,7 @@ function validateToolEvent(event: StreamChunk, processor: StreamProcessor): void
 
 function assertLiveEvent(event: StreamChunk, processor: StreamProcessor, finished: boolean): void {
   if (event.type === "RUN_ERROR") {
-    throw new Error(event.message);
+    throwProviderError(event);
   }
 
   if (finished) {

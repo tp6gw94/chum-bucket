@@ -4,30 +4,55 @@ import { setTimeout as delay } from "node:timers/promises";
 import { and, eq, gt, sql } from "drizzle-orm";
 import { EventType, type StreamChunk, type UIMessage } from "@tanstack/ai";
 import { z } from "zod";
+import {
+  compactionEvent,
+  parseCompactionEvent,
+  type CompactionReason,
+  type CompactionState,
+} from "../../shared/compaction-event";
 import { chatEventsTable, chatRunsTable, threadsTable } from "../db/schema";
+import {
+  isSummaryMessage,
+  readProjection,
+  toProjection,
+  type ConversationState,
+} from "./conversation";
 import { openuiInstructions } from "./prompts";
 import { snapshot } from "./model-turn";
 
-export const BUILD = "durable-chat-loop-v5";
+export const BUILD = "durable-chat-loop-v6";
 export const MODEL = "deepseek-ai/DeepSeek-V4.1-Flash";
-const runIdSchema = z
+export const runIdSchema = z
   .string()
   .min(1)
   .max(200)
   .regex(/^[A-Za-z0-9_-]+$/);
-export const runInputSchema = z
+export const baseRevisionSchema = z.number().int().nonnegative().max(2_000_000_000);
+export const chatInputSchema = z
   .object({
     threadId: z.uuid(),
     runId: runIdSchema,
-    baseRevision: z.number().int().nonnegative().max(2_000_000_000),
+    baseRevision: baseRevisionSchema,
     message: z
-      .object({ id: z.string().min(1).max(200), text: z.string().trim().min(1).max(32_000) })
+      .object({
+        id: z.string().min(1).max(200),
+        text: z.string().trim().min(1).max(32_000),
+      })
       .strict(),
   })
   .strict();
+export const compactInputSchema = z
+  .object({
+    kind: z.literal("compact"),
+    threadId: z.uuid(),
+    runId: runIdSchema,
+    baseRevision: baseRevisionSchema,
+  })
+  .strict();
+const runInputSchema = z.union([chatInputSchema, compactInputSchema]);
 export type RunInput = z.infer<typeof runInputSchema>;
 export type AcceptedRun = RunInput & {
-  messages: UIMessage[];
+  conversation: ConversationState;
   prompt: string;
   model: typeof MODEL;
   build: typeof BUILD;
@@ -84,109 +109,236 @@ async function appendEvent(tx: Transaction, run: RunRow, key: string, event: Str
   run.next_sequence++;
 }
 
-export async function persistRun(value: RunInput) {
+async function anchoredContext(tx: Transaction, thread: ThreadRow): Promise<UIMessage[] | null> {
+  const anchors = await tx
+    .select({ projection: chatRunsTable.projection })
+    .from(chatRunsTable)
+    .where(
+      and(
+        eq(chatRunsTable.thread_id, thread.id),
+        sql`(${chatRunsTable.projection} ->> 'committedRevision')::integer = ${thread.revision}`,
+      ),
+    );
+
+  if (anchors.length > 1) {
+    throw new RunRequestError(409, "Multiple context anchors");
+  }
+
+  if (anchors.length === 0) {
+    return null;
+  }
+
+  const projection = readProjection(anchors[0]!.projection);
+
+  if (!isDeepStrictEqual(projection.display, thread.messages)) {
+    throw new RunRequestError(409, "Context anchor does not match the thread");
+  }
+
+  return projection.context;
+}
+
+async function threadContext(tx: Transaction, thread: ThreadRow): Promise<UIMessage[]> {
+  const anchored = await anchoredContext(tx, thread);
+
+  if (anchored) {
+    return anchored;
+  }
+
+  if (thread.messages.some(isSummaryMessage)) {
+    throw new RunRequestError(409, "Missing context anchor");
+  }
+
+  return thread.messages;
+}
+
+function initialConversation(input: RunInput, thread: ThreadRow, context: UIMessage[]) {
+  if ("kind" in input) {
+    return { display: thread.messages, context };
+  }
+
+  if (thread.messages.some((message) => message.id === input.message.id)) {
+    throw new RunRequestError(409, "Message ID already exists");
+  }
+
+  const message: UIMessage = {
+    id: input.message.id,
+    role: "user",
+    parts: [{ type: "text", content: input.message.text }],
+  };
+
+  return { display: [...thread.messages, message], context: [...context, message] };
+}
+
+type PersistedRun = Readonly<{ run: AcceptedRun; pending: boolean }>;
+
+async function persistRunIn(tx: Transaction, input: RunInput): Promise<PersistedRun> {
+  const [thread] = await tx
+    .select()
+    .from(threadsTable)
+    .where(eq(threadsTable.id, input.threadId))
+    .for("update");
+
+  if (!thread) {
+    throw new RunRequestError(404, "Unknown thread");
+  }
+
+  const [existing] = await tx.select().from(chatRunsTable).where(eq(chatRunsTable.id, input.runId));
+
+  if (existing) {
+    if (!isDeepStrictEqual(existing.request, input)) {
+      throw new RunRequestError(409, "Run input collision");
+    }
+
+    return { run: existing.accepted, pending: existing.state === "pending" };
+  }
+
+  if (thread.revision !== input.baseRevision || thread.active_run_id) {
+    throw new RunRequestError(409, "Thread revision or claim conflict");
+  }
+
+  const context = await threadContext(tx, thread);
+  const run: AcceptedRun = {
+    ...input,
+    conversation: initialConversation(input, thread, context),
+    prompt: openuiInstructions(),
+    model: MODEL,
+    build: BUILD,
+  };
+  const [inserted] = await tx
+    .insert(chatRunsTable)
+    .values({
+      id: run.runId,
+      thread_id: run.threadId,
+      request: input,
+      accepted: run,
+      projection: toProjection(run.conversation),
+    })
+    .onConflictDoNothing({ target: chatRunsTable.id })
+    .returning();
+
+  if (!inserted) {
+    throw new RunRequestError(409, "Run ID collision");
+  }
+
+  await tx
+    .update(threadsTable)
+    .set({ active_run_id: run.runId })
+    .where(eq(threadsTable.id, run.threadId));
+  await appendEvent(tx, inserted, "started", {
+    type: EventType.RUN_STARTED,
+    threadId: run.threadId,
+    runId: run.runId,
+  });
+
+  return { run, pending: true };
+}
+
+export async function persistRun(value: RunInput): Promise<PersistedRun> {
   const parsed = runInputSchema.safeParse(value);
 
   if (!parsed.success) {
     throw new RunRequestError(400, "Invalid run input");
   }
 
-  const input = parsed.data;
   const db = await database();
-  const accepted = await db.transaction(async (tx) => {
-    const [thread] = await tx
-      .select()
-      .from(threadsTable)
-      .where(eq(threadsTable.id, input.threadId))
-      .for("update");
 
-    if (!thread) {
-      throw new RunRequestError(404, "Unknown thread");
-    }
-
-    const [existing] = await tx
-      .select()
-      .from(chatRunsTable)
-      .where(eq(chatRunsTable.id, input.runId));
-
-    if (existing) {
-      if (!isDeepStrictEqual(existing.request, input)) {
-        throw new RunRequestError(409, "Run input collision");
-      }
-
-      return { run: existing.accepted, pending: existing.state === "pending" };
-    }
-
-    if (thread.revision !== input.baseRevision || thread.active_run_id) {
-      throw new RunRequestError(409, "Thread revision or claim conflict");
-    }
-
-    if (thread.messages.some((message) => message.id === input.message.id)) {
-      throw new RunRequestError(409, "Message ID already exists");
-    }
-
-    const run: AcceptedRun = {
-      ...input,
-      messages: [
-        ...thread.messages,
-        {
-          id: input.message.id,
-          role: "user",
-          parts: [{ type: "text", content: input.message.text }],
-        },
-      ],
-      prompt: openuiInstructions(),
-      model: MODEL,
-      build: BUILD,
-    };
-    const [inserted] = await tx
-      .insert(chatRunsTable)
-      .values({
-        id: run.runId,
-        thread_id: run.threadId,
-        request: input,
-        accepted: run,
-        projection: run.messages,
-      })
-      .onConflictDoNothing({ target: chatRunsTable.id })
-      .returning();
-
-    if (!inserted) {
-      throw new RunRequestError(409, "Run ID collision");
-    }
-
-    await tx
-      .update(threadsTable)
-      .set({ active_run_id: run.runId })
-      .where(eq(threadsTable.id, run.threadId));
-    await appendEvent(tx, inserted, "started", {
-      type: EventType.RUN_STARTED,
-      threadId: run.threadId,
-      runId: run.runId,
-    });
-
-    return { run, pending: true };
-  });
-
-  return accepted;
+  return db.transaction((tx) => persistRunIn(tx, parsed.data));
 }
 
-export async function emit(runId: string, event: StreamChunk, messages?: UIMessage[]) {
+export async function emit(runId: string, event: StreamChunk, conversation?: ConversationState) {
   const db = await database();
   await db.transaction(async (tx) => {
     const { run } = await lockRun(tx, runId);
     await appendEvent(tx, run, randomUUID(), event);
 
-    if (messages) {
+    if (conversation) {
       await tx
         .update(chatRunsTable)
-        .set({ projection: messages })
+        .set({ projection: toProjection(conversation) })
         .where(eq(chatRunsTable.id, runId));
     }
   });
 }
 
-export async function finishRun(runId: string, messages?: UIMessage[], code = "execution_failed") {
+export async function checkpointCompaction(
+  runId: string,
+  operationId: string,
+  conversation: ConversationState,
+  state: CompactionState,
+  reason: CompactionReason,
+) {
+  const db = await database();
+  const key = `compact:${operationId}`;
+  await db.transaction(async (tx) => {
+    const { run } = await lockRun(tx, runId);
+    const [saved] = await tx
+      .select({ payload: chatEventsTable.payload })
+      .from(chatEventsTable)
+      .where(and(eq(chatEventsTable.run_id, runId), eq(chatEventsTable.event_key, key)));
+
+    if (saved) {
+      if (parseCompactionEvent(saved.payload)?.state !== state) {
+        throw new Error("Compaction was already saved with a different result");
+      }
+
+      return;
+    }
+
+    if (state === "done") {
+      await tx
+        .update(chatRunsTable)
+        .set({ projection: toProjection(conversation) })
+        .where(eq(chatRunsTable.id, runId));
+      await appendEvent(tx, run, `${key}:snapshot`, snapshot(conversation.display));
+    }
+
+    await appendEvent(
+      tx,
+      run,
+      key,
+      compactionEvent({ runId, operationId, state, reason }) as StreamChunk,
+    );
+  });
+}
+
+function threadTitle(messages: UIMessage[]) {
+  return (
+    messages
+      .find((message) => message.role === "user" && !isSummaryMessage(message))
+      ?.parts.filter((part) => part.type === "text")
+      .map((part) => part.content)
+      .join("")
+      .slice(0, 10) || "新對話"
+  );
+}
+
+async function commitThread(
+  tx: Transaction,
+  run: RunRow,
+  thread: ThreadRow,
+  conversation: ConversationState,
+) {
+  await tx
+    .update(chatRunsTable)
+    .set({ projection: toProjection(conversation, thread.revision + 1) })
+    .where(eq(chatRunsTable.id, run.id));
+  await tx
+    .update(threadsTable)
+    .set({
+      messages: conversation.display,
+      title: threadTitle(conversation.display),
+      revision: sql`${threadsTable.revision} + 1`,
+      active_run_id: null,
+      updated_at: sql`now()`,
+    })
+    .where(eq(threadsTable.id, thread.id));
+}
+
+export async function finishRun(
+  runId: string,
+  conversation?: ConversationState,
+  code = "execution_failed",
+) {
   const db = await database();
   await db.transaction(async (tx) => {
     const { run, thread } = await lockRun(tx, runId);
@@ -199,27 +351,16 @@ export async function finishRun(runId: string, messages?: UIMessage[], code = "e
       throw new Error("Thread claim changed");
     }
 
-    if (messages) {
-      const title =
-        messages
-          .find((message) => message.role === "user")
-          ?.parts.filter((part) => part.type === "text")
-          .map((part) => part.content)
-          .join("")
-          .slice(0, 10) || "新對話";
-      await appendEvent(tx, run, "finished:snapshot", snapshot(messages));
-      await tx
-        .update(threadsTable)
-        .set({
-          messages,
-          title,
-          revision: sql`${threadsTable.revision} + 1`,
-          active_run_id: null,
-          updated_at: sql`now()`,
-        })
-        .where(eq(threadsTable.id, thread.id));
+    if (conversation) {
+      await appendEvent(tx, run, "finished:snapshot", snapshot(conversation.display));
+      await commitThread(tx, run, thread, conversation);
     } else {
-      await appendEvent(tx, run, "failed:snapshot", snapshot(run.projection));
+      await appendEvent(
+        tx,
+        run,
+        "failed:snapshot",
+        snapshot(readProjection(run.projection).display),
+      );
       await tx
         .update(threadsTable)
         .set({ active_run_id: null })
@@ -230,7 +371,7 @@ export async function finishRun(runId: string, messages?: UIMessage[], code = "e
       tx,
       run,
       "terminal",
-      messages
+      conversation
         ? { type: EventType.RUN_FINISHED, threadId: thread.id, runId }
         : {
             type: EventType.RUN_ERROR,
@@ -241,7 +382,7 @@ export async function finishRun(runId: string, messages?: UIMessage[], code = "e
     );
     await tx
       .update(chatRunsTable)
-      .set({ state: messages ? "succeeded" : "failed" })
+      .set({ state: conversation ? "succeeded" : "failed" })
       .where(eq(chatRunsTable.id, runId));
   });
 }
@@ -286,7 +427,7 @@ export async function hydrateThread(threadId: string) {
         throw new Error("Missing active run");
       }
 
-      messages = run.accepted.messages;
+      messages = run.accepted.conversation.display;
     }
 
     return {

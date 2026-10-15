@@ -289,15 +289,15 @@ test("append failure stops provider consumption and cannot complete a turn", asy
   assert.equal(continued, false);
 });
 
-const accepted: AcceptedRun = {
+const accepted: AcceptedRun & { message: { id: string; text: string } } = {
   threadId: "d08035f1-07df-49f3-b2d0-5cf5cb2b1e74",
   runId: "ca2f180a-8461-4cfb-9012-f413df6d72f9",
   baseRevision: 0,
   message: { id: "user-1", text: "Hello" },
-  messages: baseline,
+  conversation: { display: baseline, context: baseline },
   prompt: "offline",
   model: "deepseek-ai/DeepSeek-V4.1-Flash",
-  build: "durable-chat-loop-v5",
+  build: "durable-chat-loop-v6",
 };
 const toolTurn: Turn = {
   messages: baseline,
@@ -329,7 +329,7 @@ test("model checkpoint serialization failure halts all tools", async () => {
   );
   try {
     await assert.rejects(executeRun(accepted), /Checkpoint serialization rejected/);
-    assert.deepEqual(names, ["model:0"]);
+    assert.deepEqual(names, ["compact:0"]);
   } finally {
     stepping.mock.restore();
   }
@@ -1351,6 +1351,16 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
         runs.set(String(a), row);
         rows = [row];
       }
+    } else if (text.startsWith("select projection from chat_runs where")) {
+      assert.equal(
+        text,
+        "select projection from chat_runs where (thread_id = $1 and (projection ->> 'committedRevision')::integer = $2)",
+      );
+      rows = [...runs.values()].filter(
+        (row) =>
+          row.thread_id === a &&
+          (row.projection as { committedRevision?: number }).committedRevision === b,
+      );
     } else if (text.startsWith("update chat_runs set projection")) {
       runs.get(String(b))!.projection = JSON.parse(String(a));
     } else if (text.startsWith("update threads set title")) {
@@ -1464,7 +1474,7 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
     await reconcileRuns();
     assert.deepEqual(started, [accepted.runId]);
     const attached = await acceptRun(input);
-    assert.equal(attached.messages[0]!.id, "user-1");
+    assert.equal(attached.conversation.display[0]!.id, "user-1");
     await assert.rejects(
       acceptRun({ ...input, message: { id: "changed", text: "changed" } }),
       /collision/,
@@ -1477,7 +1487,7 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
     assert.ok(statements.at(-3)?.endsWith("from threads where id = $1 for share"));
     assert.equal(hydration.revision, 0);
     assert.equal(hydration.activeRun?.runId, accepted.runId);
-    assert.deepEqual(hydration.messages, attached.messages);
+    assert.deepEqual(hydration.messages, attached.conversation.display);
     await assert.rejects(checkCursor(accepted.runId, 1), /ahead/);
     const failure = mock.method(DBOS, "getWorkflowStatus", async () => {
       throw new Error("Status unavailable");
@@ -1522,14 +1532,18 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
     assert.equal(winner.status, "fulfilled");
     const winningRun = (winner as PromiseFulfilledResult<AcceptedRun>).value;
     const canonical = [
-      ...winningRun.messages,
+      ...winningRun.conversation.display,
       {
         id: "committed-assistant",
         role: "assistant" as const,
         parts: [{ type: "text" as const, content: "complete" }],
       },
     ];
-    const modelTurn: Turn = { calls: [], messages: canonical };
+    const modelTurn = {
+      state: "turn",
+      calls: [],
+      conversation: { display: canonical, context: canonical },
+    };
     const completed = new Map<string, unknown>();
     const failures = new Set(["finish"]);
     const steps = mock.method(
@@ -1554,7 +1568,7 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
       assert.deepEqual(threads.get(accepted.threadId)!.messages, canonical);
       assert.equal(
         threads.get(accepted.threadId)!.title,
-        winningRun.messages[0]!.parts.filter((part) => part.type === "text")
+        winningRun.conversation.display[0]!.parts.filter((part) => part.type === "text")
           .map((part) => part.content)
           .join("")
           .slice(0, 10),
@@ -1685,7 +1699,7 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
         rejectedStream = invalidEvents;
         await assert.rejects(executeRun(nextRun), error);
         assert.deepEqual(external, []);
-        assert.equal(cached.size, 0);
+        assert.deepEqual([...cached.keys()], ["compact:0"]);
         assert.equal(rejectedGenerations, executedModelCallbacks);
       }
       rejectedStream = undefined;
@@ -1696,7 +1710,7 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
       const firstProjection = structuredClone(runs.get(nextRun.runId)!.projection);
       const beforeRetry = runEvents().length;
       await assert.rejects(executeRun(nextRun), /Uncheckpointed tool:0:1/);
-      assert.deepEqual(runEvents()[beforeRetry]!.payload, snapshot(nextRun.messages));
+      assert.deepEqual(runEvents()[beforeRetry]!.payload, snapshot(nextRun.conversation.display));
       assert.notDeepEqual(runs.get(nextRun.runId)!.projection, firstProjection);
       assert.equal(modelCalls, 2);
       assert.deepEqual(external, ["TEST-1", "TEST-2"]);
@@ -1705,7 +1719,7 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
       await assert.rejects(executeRun(nextRun), /Uncheckpointed finish/);
       assert.deepEqual(
         runEvents()[beforeToolRetry]!.payload,
-        snapshot(cached.get("tool:0:0") as UIMessage[]),
+        snapshot((cached.get("tool:0:0") as { display: UIMessage[] }).display),
       );
       assert.deepEqual(external, ["TEST-1", "TEST-2", "TEST-2"]);
       assert.equal(modelCalls, 3);
@@ -1736,7 +1750,8 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
       cached.clear();
       gaps.add("model:0");
       await assert.rejects(executeRun(failedRun), /Uncheckpointed model:0/);
-      const speculative = runs.get(failedRun.runId)!.projection as UIMessage[];
+      const speculative = (runs.get(failedRun.runId)!.projection as { display: UIMessage[] })
+        .display;
       assert.equal(speculative.at(-1)!.parts[0]!.type, "text");
       statuses.set(failedRun.runId, "ERROR");
       await reconcileRuns();
@@ -1747,6 +1762,8 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
       assert.equal(threads.get(failedRun.threadId)!.revision, 2);
       assert.equal(threads.get(failedRun.threadId)!.active_run_id, null);
 
+      process.env.COMPACT_TRIGGER_TOKENS = "1000000000";
+      process.env.COMPACT_KEEP_RECENT_TOKENS = "1000";
       const largeThread = "424e1965-f80e-49a7-af4b-030a9b8055b9";
       const history: UIMessage[] = [
         {
@@ -1775,7 +1792,7 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
         /revision or claim conflict/,
       );
       const { run: largeRun } = await persistRun(largeInput);
-      assert.deepEqual(largeRun.messages[0], history[0]);
+      assert.deepEqual(largeRun.conversation.display[0], history[0]);
       assert.deepEqual(runs.get(largeRun.runId)!.accepted, largeRun);
       const largeRow = runs.get(largeRun.runId)!;
       largeRow.next_sequence = 100_000;
@@ -1791,10 +1808,16 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
       await largeReplay.return(undefined);
       const largeThreadRow = threads.get(largeThread)!;
       largeThreadRow.active_run_id = "other-run";
-      await assert.rejects(finishRun(largeRun.runId, largeRun.messages), /Thread claim changed/);
+      await assert.rejects(
+        finishRun(largeRun.runId, largeRun.conversation),
+        /Thread claim changed/,
+      );
       threads.get(largeThread)!.active_run_id = largeRun.runId;
       threads.get(largeThread)!.revision = 1;
-      await assert.rejects(finishRun(largeRun.runId, largeRun.messages), /Thread claim changed/);
+      await assert.rejects(
+        finishRun(largeRun.runId, largeRun.conversation),
+        /Thread claim changed/,
+      );
       threads.get(largeThread)!.revision = 0;
       cached.clear();
       gaps.clear();
@@ -1844,10 +1867,12 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
         Array.from({ length: sequences.length - 1 }, (_, index) => 100_000 + index),
       );
       const beforeTerminal = largeEvents().length;
-      await finishRun(largeRun.runId, largeSaved);
+      await finishRun(largeRun.runId, { display: largeSaved, context: largeSaved });
       await assert.rejects(emit(largeRun.runId, largeEvent), /Run is terminal/);
       assert.equal(largeEvents().length, beforeTerminal);
       assert.equal(threads.get(largeThread)!.revision, 1);
+      delete process.env.COMPACT_TRIGGER_TOKENS;
+      delete process.env.COMPACT_KEEP_RECENT_TOKENS;
 
       tool.mock.restore();
       const directory = await mkdtemp(join(tmpdir(), "chum-bucket-run-fs-"));
@@ -2357,7 +2382,7 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
         input: legacyInput,
       };
       const legacyProcessor = new StreamProcessor({
-        initialMessages: structuredClone(legacyRun.messages),
+        initialMessages: structuredClone(legacyRun.conversation.display),
       });
       legacyProcessor.processChunk({
         type: EventType.TOOL_CALL_START,
@@ -2374,8 +2399,10 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
         toolCallId: legacyCall.id,
         input: legacyInput,
       });
-      const savedOfficialTurn: Turn = {
-        messages: legacyProcessor.getMessages(),
+      const savedMessages = legacyProcessor.getMessages();
+      const savedOfficialTurn = {
+        state: "turn",
+        conversation: { display: savedMessages, context: savedMessages },
         calls: [legacyCall],
       };
       cached.clear();

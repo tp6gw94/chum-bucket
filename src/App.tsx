@@ -9,6 +9,7 @@ import type { Pane as PaneModel, ThreadSummary } from "./components/types";
 import {
   createThread,
   readPageEntry,
+  threadStatus,
   threadUrl,
   useThread,
   useThreadList,
@@ -67,7 +68,6 @@ function ThreadPage({ threadId }: { threadId: string }) {
   const { threads, error: listError } = useThreadList();
   const thread = useThread(threadId);
   const { messages, send } = thread;
-  const isLoading = thread.phase === "busy";
   const sendDisabled = thread.phase !== "ready";
 
   function openAgentPane() {
@@ -93,7 +93,7 @@ function ThreadPage({ threadId }: { threadId: string }) {
     id: threadId ?? "draft",
     title: threads.find((item) => item.id === threadId)?.title ?? "新對話",
     agent: "main",
-    status: isLoading ? "running" : "idle",
+    status: threadStatus(thread.phase),
     progress: [],
     messages,
     kind: "main",
@@ -137,6 +137,7 @@ function ThreadPage({ threadId }: { threadId: string }) {
                 sendDisabled={sendDisabled}
                 isHydrating={pane.kind === "main" && thread.phase === "loading"}
                 hydrationError={pane.kind === "main" ? thread.error : null}
+                notice={pane.kind === "main" ? thread.notice : null}
               />
             ))}
           </main>

@@ -1,8 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { z } from "zod";
 import { flushSync } from "react-dom";
-import type { StreamChunk } from "@tanstack/ai";
+import type { StreamChunk, UIMessage } from "@tanstack/ai";
 import { fetchServerSentEvents, useChat } from "@tanstack/ai-react";
+import { parseCompactionEvent, type CompactionState } from "../../shared/compaction-event";
+import { parseComposerCommand } from "../composer-commands";
 
 const threadSchema = z.object({ id: z.uuid(), title: z.string() });
 export type ThreadSummary = z.infer<typeof threadSchema>;
@@ -10,8 +12,89 @@ export type PageEntry =
   | { kind: "choose" }
   | { kind: "invalid" }
   | { kind: "thread"; threadId: string };
-export type ThreadPhase = "loading" | "ready" | "busy" | "uncertain" | "load-error";
+export type ThreadPhase = "loading" | "ready" | "busy" | "compacting" | "uncertain" | "load-error";
 export type SendResult = "succeeded" | "failed" | "uncertain";
+export type ThreadNotice = { state: Exclude<CompactionState, "started">; message: string };
+
+const PHASE_STATUS: Partial<Record<ThreadPhase, "running" | "compacting">> = {
+  busy: "running",
+  compacting: "compacting",
+};
+
+export function threadStatus(phase: ThreadPhase): "running" | "compacting" | "idle" {
+  return PHASE_STATUS[phase] ?? "idle";
+}
+
+const COMPACTION_NOTICES: Record<ThreadNotice["state"], string> = {
+  done: "上下文已整理，完整摘要與原文已保留。",
+  skipped: "目前沒有足夠的可整理歷史，原文與上下文未變更。",
+  failed: "整理上下文失敗，原文與上下文已保留。",
+};
+
+export function compactionNotice(event: unknown): ThreadNotice | "started" | null {
+  const value = parseCompactionEvent(event);
+
+  if (!value) {
+    return null;
+  }
+
+  return value.state === "started"
+    ? "started"
+    : { state: value.state, message: COMPACTION_NOTICES[value.state] };
+}
+
+export async function readServerSentEvents(
+  response: Response,
+  onEvent: (event: unknown) => void,
+): Promise<void> {
+  const reader = response.body!.pipeThrough(new TextDecoderStream()).getReader();
+  let buffer = "";
+
+  for (;;) {
+    const { value, done } = await reader.read();
+
+    if (done) {
+      return;
+    }
+
+    buffer += value;
+    const frames = buffer.split("\n\n");
+    buffer = frames.pop() ?? "";
+
+    for (const frame of frames) {
+      const data = frame
+        .split("\n")
+        .filter((line) => line.startsWith("data:"))
+        .map((line) => line.slice(5).trim())
+        .join("");
+
+      if (data) {
+        onEvent(JSON.parse(data));
+      }
+    }
+  }
+}
+
+async function threadRevision(threadId: string) {
+  const response = await fetch(`/api/thread/${encodeURIComponent(threadId)}`);
+
+  if (!response.ok) {
+    throw new Error(`載入對話失敗（HTTP ${response.status}）`);
+  }
+
+  return z.object({ revision: z.number().int().nonnegative() }).parse(await response.json())
+    .revision;
+}
+
+async function savedMessages(threadId: string): Promise<UIMessage[]> {
+  const response = await fetch(`/api/chat?threadId=${encodeURIComponent(threadId)}`);
+
+  if (!response.ok) {
+    throw new Error(`載入對話失敗（HTTP ${response.status}）`);
+  }
+
+  return ((await response.json()) as { messages: UIMessage[] }).messages;
+}
 
 export function readPageEntry(): PageEntry {
   const id = new URL(window.location.href).searchParams.get("threadId");
@@ -126,6 +209,7 @@ export function terminalResult(event: unknown, runId: string | null): SendResult
 export function useThread(threadId: string) {
   const [phase, setPhase] = useState<ThreadPhase>("loading");
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<ThreadNotice | null>(null);
   const owner = useRef({
     phase: "loading" as ThreadPhase,
     mounted: true,
@@ -159,6 +243,20 @@ export function useThread(threadId: string) {
     }
   }
 
+  function noteCompaction(chunk: unknown) {
+    const compaction = compactionNotice(chunk);
+
+    if (compaction === "started") {
+      publish("compacting");
+    } else if (compaction) {
+      setNotice(compaction);
+
+      if (owner.phase === "compacting") {
+        publish("busy");
+      }
+    }
+  }
+
   const connection = useMemo(() => {
     const base = fetchServerSentEvents("/api/chat");
     let hydration: ReturnType<NonNullable<typeof base.hydrate>> | undefined;
@@ -167,6 +265,7 @@ export function useThread(threadId: string) {
       try {
         for await (const chunk of stream) {
           const terminal = terminalResult(chunk, owner.runId);
+          noteCompaction(chunk);
 
           if (terminal) {
             owner.terminal = terminal;
@@ -244,27 +343,63 @@ export function useThread(threadId: string) {
     };
   }, [owner]);
 
+  async function compact(): Promise<SendResult> {
+    flushSync(() => publish("compacting"));
+    setError(null);
+    setNotice(null);
+    const runId = crypto.randomUUID();
+    let terminal: SendResult | null = null;
+
+    try {
+      const response = await fetch("/api/compact", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Run-Id": runId },
+        body: JSON.stringify({
+          kind: "compact",
+          threadId,
+          runId,
+          baseRevision: await threadRevision(threadId),
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`整理上下文失敗（HTTP ${response.status}）`);
+      }
+
+      await readServerSentEvents(response, (event) => {
+        terminal = terminalResult(event, runId) ?? terminal;
+        const compaction = compactionNotice(event);
+
+        if (compaction && compaction !== "started") {
+          setNotice(compaction);
+        }
+      });
+      chat.setMessages(await savedMessages(threadId));
+    } finally {
+      publish("ready");
+    }
+
+    return terminal ?? "uncertain";
+  }
+
   async function send(text: string): Promise<SendResult> {
     if (owner.phase !== "ready" || !text.trim()) {
       throw new Error("目前無法送出訊息");
+    }
+
+    if (parseComposerCommand(text) === "compact") {
+      return compact();
     }
 
     flushSync(() => publish("busy"));
     owner.submitting = true;
     owner.terminal = null;
     setError(null);
+    setNotice(null);
     let submitted = false;
 
     try {
-      const response = await fetch(`/api/thread/${encodeURIComponent(threadId)}`);
-
-      if (!response.ok) {
-        throw new Error(`載入對話失敗（HTTP ${response.status}）`);
-      }
-
-      const { revision } = z
-        .object({ revision: z.number().int().nonnegative() })
-        .parse(await response.json());
+      const revision = await threadRevision(threadId);
 
       if (!owner.mounted) {
         throw new Error("頁面已離開");
@@ -302,5 +437,5 @@ export function useThread(threadId: string) {
     return true;
   }
 
-  return { messages: chat.messages, phase, error, send, navigate };
+  return { messages: chat.messages, phase, error, notice, send, navigate };
 }

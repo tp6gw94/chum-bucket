@@ -1,6 +1,7 @@
 import type { ActionEvent } from "@openuidev/react-lang";
 import { PlusIcon, XIcon } from "lucide-react";
-import type { SendResult } from "../hooks/use-threads";
+import { cn } from "cn";
+import type { SendResult, ThreadNotice } from "../hooks/use-threads";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -14,6 +15,19 @@ import { type Pane as PaneModel } from "./types";
 
 const DEFAULT_WIDTH = { main: 720, agent: 440 } as const;
 
+function NoticeLine({ notice }: { notice: ThreadNotice }) {
+  const failed = notice.state === "failed";
+
+  return (
+    <p
+      role={failed ? "alert" : "status"}
+      className={cn("px-4 py-1 text-sm", failed ? "text-destructive" : "text-muted-foreground")}
+    >
+      {notice.message}
+    </p>
+  );
+}
+
 export function Pane({
   pane,
   onOpenAgentPane,
@@ -22,6 +36,7 @@ export function Pane({
   sendDisabled = false,
   isHydrating = false,
   hydrationError,
+  notice,
 }: {
   pane: PaneModel;
   onOpenAgentPane: () => void;
@@ -30,6 +45,7 @@ export function Pane({
   sendDisabled?: boolean;
   isHydrating?: boolean;
   hydrationError?: string | null;
+  notice?: ThreadNotice | null;
 }) {
   const isMain = pane.kind === "main";
 
@@ -69,7 +85,7 @@ export function Pane({
         {pane.messages.length === 0 ? (
           <p className="m-auto text-sm text-muted-foreground">
             {isMain
-              ? "還沒有訊息，輸入第一則訊息開始對話。"
+              ? "還沒有訊息，輸入第一則訊息開始對話。輸入 /compact 可以整理上下文。"
               : "這是預留的附屬對話窗格，尚未連接 agent 執行。"}
           </p>
         ) : (
@@ -91,6 +107,7 @@ export function Pane({
           正在載入對話…
         </p>
       ) : null}
+      {notice ? <NoticeLine notice={notice} /> : null}
       {hydrationError ? (
         <div role="alert" className="px-4 py-2 text-sm text-destructive">
           <p>{hydrationError}</p>
