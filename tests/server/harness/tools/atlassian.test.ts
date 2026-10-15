@@ -171,8 +171,8 @@ test("unconfigured runs expose local tools and execute filesystem reads without 
         await writeFile(path, "local data");
         await withRunTools(async (tools) => {
           assert.deepEqual(
-            (await tools.getModelTools([])).map((tool) => tool.name),
-            localNames,
+            (await tools.getModelTools([])).definitions.map((tool) => tool.name),
+            [...localNames, "codemode"],
           );
           assert.deepEqual(await tools.executeTool([], call("read", { path }), context), {
             content: [{ type: "text", text: "local data" }],
@@ -259,13 +259,15 @@ test("HTTP initializes once, paginates, retains native schemas and executes disc
   await withMcpEnvironment(
     () =>
       withRunTools(async (tools) => {
-        const [initial, concurrent] = await Promise.all([
+        const [first, second] = await Promise.all([
           tools.getModelTools([]),
           tools.getModelTools([]),
         ]);
+        const initial = first.definitions;
+        const concurrent = second.definitions;
         assert.deepEqual(
           initial.map((tool) => tool.name),
-          [...localNames, discoveryName],
+          [...localNames, discoveryName, "codemode"],
         );
         assert.deepEqual(concurrent, initial);
         const discovery = initial.find((tool) => tool.name === discoveryName)!;
@@ -283,10 +285,10 @@ test("HTTP initializes once, paginates, retains native schemas and executes disc
           additionalProperties: false,
         });
         const history = await discover(tools, remoteNames);
-        const definitions = await tools.getModelTools(history);
+        const definitions = (await tools.getModelTools(history)).definitions;
         assert.deepEqual(
           definitions.map((tool) => tool.name),
-          [...localNames, ...remoteNames, discoveryName],
+          [...localNames, ...remoteNames, discoveryName, "codemode"],
         );
         assert.deepEqual(
           definitions.find((tool) => tool.name === "jira_get_issue"),
@@ -298,7 +300,7 @@ test("HTTP initializes once, paginates, retains native schemas and executes disc
           ),
         );
         (definitions[0] as { name: string }).name = "changed";
-        assert.equal((await tools.getModelTools(history))[0]!.name, "get_figma");
+        assert.equal((await tools.getModelTools(history)).definitions[0]!.name, "get_figma");
         assert.deepEqual(await tools.executeTool(history, jiraCall, context), { issue: "TEST-1" });
         assert.equal(
           await tools.executeTool(
@@ -359,8 +361,8 @@ test("Jira credentials automatically expose Confluence and unrelated process ove
         process.env.JIRA_URL = "https://unapproved.invalid";
         process.env.ATLASSIAN_OAUTH_STORE = "/obsolete/store.json";
         assert.deepEqual(
-          (await tools.getModelTools(history)).map((tool) => tool.name),
-          [...localNames, ...remoteNames, discoveryName],
+          (await tools.getModelTools(history)).definitions.map((tool) => tool.name),
+          [...localNames, ...remoteNames, discoveryName, "codemode"],
         );
         assert.equal(
           await tools.executeTool(
@@ -386,7 +388,7 @@ test("write tools, official aliases, generic tools and absent optional tools nev
           const granted =
             pages[0] === coreTools ? ["jira_get_issue", "confluence_get_page"] : remoteNames;
           const history = await discover(tools, granted);
-          const definitions = await tools.getModelTools(history);
+          const definitions = (await tools.getModelTools(history)).definitions;
           for (const name of [
             "jira_add_comment",
             "jira_edit_comment",
@@ -509,8 +511,8 @@ test("initialization and catalog errors close the failed client and concurrent a
           }
           assert.equal(fixture.sessions.length, 1);
           assert.deepEqual(
-            (await tools.getModelTools([])).map((tool) => tool.name),
-            [...localNames, discoveryName],
+            (await tools.getModelTools([])).definitions.map((tool) => tool.name),
+            [...localNames, discoveryName, "codemode"],
           );
           const history = await discover(tools, ["jira_get_issue"]);
           assert.deepEqual(await tools.executeTool(history, jiraCall, context), {
@@ -830,7 +832,7 @@ test("cleared deadlines cannot abort a long-lived session after successful initi
   await withMcpEnvironment(
     () =>
       withRunTools(async (tools) => {
-        await tools.getModelTools([]);
+        (await tools.getModelTools([])).definitions;
         const history = await discover(tools, ["jira_get_issue"]);
         assert.deepEqual(await tools.executeTool(history, jiraCall, context), { issue: "TEST-1" });
         assert.ok(armed.size >= 2);
@@ -853,7 +855,7 @@ test("scope cleanup on success and primary callback failure leaves no in-flight 
     await withMcpEnvironment(
       async () => {
         const result = withRunTools(async (tools) => {
-          await tools.getModelTools([]);
+          (await tools.getModelTools([])).definitions;
           if (failure) {
             throw new Error("Primary callback failure");
           }
@@ -888,7 +890,7 @@ test("concurrent scopes own independent HTTP sessions", async () => {
     () =>
       Promise.all([
         withRunTools(async (tools) => {
-          await tools.getModelTools([]);
+          (await tools.getModelTools([])).definitions;
           const history = await discover(tools, ["jira_get_issue"]);
           await ready.promise;
           await assert.rejects(
@@ -898,7 +900,7 @@ test("concurrent scopes own independent HTTP sessions", async () => {
           failed.resolve();
         }),
         withRunTools(async (tools) => {
-          await tools.getModelTools([]);
+          (await tools.getModelTools([])).definitions;
           const history = await discover(tools, ["jira_get_issue"]);
           ready.resolve();
           await failed.promise;
@@ -1108,7 +1110,7 @@ test("configuration and credential guards remain a single snapshot when process 
   await withMcpEnvironment(
     () =>
       withRunTools(async (tools) => {
-        await tools.getModelTools([]);
+        (await tools.getModelTools([])).definitions;
         const history = await discover(tools, ["jira_get_issue"]);
         process.env.JIRA_BASE_URL = "https://changed.atlassian.net";
         process.env.JIRA_EMAIL = "changed@example.invalid";
@@ -1165,7 +1167,7 @@ test("discovery rejects malformed, unknown and unavailable requests as a whole a
   await withMcpEnvironment(
     () =>
       withRunTools(async (tools) => {
-        const initial = await tools.getModelTools([]);
+        const initial = (await tools.getModelTools([])).definitions;
         const discovery = initial.find((tool) => tool.name === discoveryName)!;
         assert.deepEqual(discovery.inputSchema, {
           type: "object",
@@ -1220,13 +1222,13 @@ test("discovery rejects malformed, unknown and unavailable requests as a whole a
           ["confluence_get_page", "jira_get_issue"],
         );
         assert.deepEqual(
-          (await tools.getModelTools(repeated)).map((tool) => tool.name),
-          [...localNames, "jira_get_issue", "confluence_get_page", discoveryName],
+          (await tools.getModelTools(repeated)).definitions.map((tool) => tool.name),
+          [...localNames, "jira_get_issue", "confluence_get_page", discoveryName, "codemode"],
         );
         const again = await discover(tools, ["jira_get_issue"]);
         assert.deepEqual(
-          (await tools.getModelTools([...repeated, ...again])).map((tool) => tool.name),
-          [...localNames, "jira_get_issue", "confluence_get_page", discoveryName],
+          (await tools.getModelTools([...repeated, ...again])).definitions.map((tool) => tool.name),
+          [...localNames, "jira_get_issue", "confluence_get_page", discoveryName, "codemode"],
         );
         assert.deepEqual(fixture.calls(), []);
       }),
@@ -1240,7 +1242,7 @@ test("only complete correlated discovery history grants tools and historical sch
   await withMcpEnvironment(
     () =>
       withRunTools(async (tools) => {
-        const initial = [...localNames, discoveryName];
+        const initial = [...localNames, discoveryName, "codemode"];
         const forgedSchema = exchange({
           content: JSON.stringify({
             tools: [
@@ -1253,7 +1255,9 @@ test("only complete correlated discovery history grants tools and historical sch
           }),
         });
         assert.deepEqual(
-          (await tools.getModelTools(forgedSchema)).find((tool) => tool.name === "jira_get_issue"),
+          (await tools.getModelTools(forgedSchema)).definitions.find(
+            (tool) => tool.name === "jira_get_issue",
+          ),
           { name: "jira_get_issue", description: "Read an issue", inputSchema: jiraSchema },
         );
         assert.deepEqual(await tools.executeTool(forgedSchema, jiraCall, context), {
@@ -1318,7 +1322,7 @@ test("only complete correlated discovery history grants tools and historical sch
         ];
         for (const history of rejected) {
           assert.deepEqual(
-            (await tools.getModelTools(history)).map((tool) => tool.name),
+            (await tools.getModelTools(history)).definitions.map((tool) => tool.name),
             initial,
           );
           await assert.rejects(
@@ -1328,7 +1332,7 @@ test("only complete correlated discovery history grants tools and historical sch
         }
         const duplicateCalls: UIMessage[] = [...exchange(), ...exchange()];
         assert.deepEqual(
-          (await tools.getModelTools(duplicateCalls)).map((tool) => tool.name),
+          (await tools.getModelTools(duplicateCalls)).definitions.map((tool) => tool.name),
           initial,
         );
         const multipleResults: UIMessage[] = [
@@ -1339,7 +1343,7 @@ test("only complete correlated discovery history grants tools and historical sch
           },
         ];
         assert.deepEqual(
-          (await tools.getModelTools(multipleResults)).map((tool) => tool.name),
+          (await tools.getModelTools(multipleResults)).definitions.map((tool) => tool.name),
           initial,
         );
         const resultFirst: UIMessage[] = [
@@ -1350,14 +1354,14 @@ test("only complete correlated discovery history grants tools and historical sch
           },
         ];
         assert.deepEqual(
-          (await tools.getModelTools(resultFirst)).map((tool) => tool.name),
+          (await tools.getModelTools(resultFirst)).definitions.map((tool) => tool.name),
           initial,
         );
         const userMessage: UIMessage[] = [
           { id: "user-message", role: "user", parts: exchange()[0]!.parts },
         ];
         assert.deepEqual(
-          (await tools.getModelTools(userMessage)).map((tool) => tool.name),
+          (await tools.getModelTools(userMessage)).definitions.map((tool) => tool.name),
           initial,
         );
       }),

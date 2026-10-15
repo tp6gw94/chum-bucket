@@ -7,6 +7,7 @@ import {
 import { createMCPClient, type MCPClient } from "@tanstack/ai-mcp";
 import { z } from "zod";
 import type { ModelCall } from "../model-turn";
+import { ToolBoundaryError, ToolViolationError } from "./boundary";
 import {
   atlassianTools,
   readAtlassianConfiguration,
@@ -21,6 +22,7 @@ export type ModelTool = Readonly<{
 export type AtlassianCatalog = ReadonlyMap<string, ModelTool>;
 export type LocalToolHandler = (input: unknown, context: ToolExecutionContext) => Promise<unknown>;
 export type AtlassianScope = Readonly<{
+  createGuard: () => Promise<(value: unknown) => void>;
   getModelTools: (
     messages: readonly UIMessage[],
     compose: (remote: AtlassianCatalog) => ModelTool[],
@@ -49,7 +51,7 @@ type RemoteSession = Readonly<{
 
 const MCP_TIMEOUT_MS = 60_000;
 
-const discoveryToolName = "discover_atlassian_tools";
+export const discoveryToolName = "discover_atlassian_tools";
 
 const discoveryRequestSchema = z.object({ toolNames: z.array(z.string()).min(1) }).strict();
 
@@ -86,8 +88,6 @@ function discoveryDefinition(names: readonly string[]): ModelTool {
     },
   };
 }
-
-class ToolBoundaryError extends Error {}
 
 function parseDiscoveryRequest(argumentsText: string): readonly string[] | undefined {
   let parsed: unknown;
@@ -371,7 +371,7 @@ function guardCredentials(value: unknown, config: AtlassianConfiguration) {
 
   function inspect(value: unknown) {
     if (typeof value === "string" && secrets.some((secret) => value.includes(secret))) {
-      throw new ToolBoundaryError("Tool data contains configured Atlassian credentials");
+      throw new ToolViolationError("Tool data contains configured Atlassian credentials");
     }
 
     if (value && typeof value === "object" && !seen.has(value)) {
@@ -448,6 +448,26 @@ function assertCatalogEntry(
   }
 }
 
+function wrapsResult(tool: McpToolList[number]): boolean {
+  const schema = tool.outputSchema ? convertSchemaToJsonSchema(tool.outputSchema) : undefined;
+
+  return !!schema && (schema as Record<string, unknown>)["x-fastmcp-wrap-result"] === true;
+}
+
+function unwrapResult(output: unknown): unknown {
+  const wrapped = (output as { result?: unknown } | null)?.result;
+
+  if (typeof wrapped !== "string") {
+    return output;
+  }
+
+  try {
+    return JSON.parse(wrapped);
+  } catch {
+    return wrapped;
+  }
+}
+
 function remoteRegistration(tool: McpToolList[number]): RemoteRegistration {
   const inputSchema = convertSchemaToJsonSchema(tool.inputSchema);
 
@@ -455,9 +475,15 @@ function remoteRegistration(tool: McpToolList[number]): RemoteRegistration {
     throw new ToolBoundaryError("Tool schema is unavailable");
   }
 
+  const wrapped = wrapsResult(tool);
+
   return {
     definition: { name: tool.name, description: tool.description, inputSchema },
-    handler: async (input, context) => tool.execute!(input, context),
+    handler: async (input, context) => {
+      const output = await tool.execute!(input, context);
+
+      return wrapped ? unwrapResult(output) : output;
+    },
   };
 }
 
@@ -592,7 +618,7 @@ function authorizeRemoteCall(
   }
 
   if (!grantedNames(messages, config).has(call.name)) {
-    throw new ToolBoundaryError(
+    throw new ToolViolationError(
       `Tool ${call.name} is not discovered; call ${discoveryToolName} first`,
     );
   }
@@ -612,6 +638,10 @@ async function executeLocalTool(
 
     return output;
   } catch (failure) {
+    if (failure instanceof ToolViolationError) {
+      throw failure;
+    }
+
     guardCredentials(failure, config);
     throw new Error(failure instanceof Error ? failure.message : "Tool failed");
   }
@@ -780,6 +810,11 @@ export async function withAtlassianScope<T>(
 
   try {
     return await use({
+      async createGuard() {
+        const config = await getConfiguration();
+
+        return (value) => guardCredentials(value, config);
+      },
       async getModelTools(messages, compose) {
         const config = await getConfiguration();
         const session = config.mode === "http" ? getRemote(config) : undefined;

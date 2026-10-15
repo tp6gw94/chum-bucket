@@ -34,4 +34,16 @@ test("tool calls expose their name, partial arguments and lifecycle state", () =
   );
   assert.doesNotMatch(escaped, /<script>/);
   assert.match(escaped, /&lt;script&gt;/);
+
+  const code = renderToStaticMarkup(
+    <ToolCall
+      part={{
+        ...part,
+        name: "codemode",
+        arguments: JSON.stringify({ code: "const a = 1;\nreturn a;" }),
+        state: "complete",
+      }}
+    />,
+  );
+  assert.match(code, /<code>const a = 1;\nreturn a;<\/code>/);
 });

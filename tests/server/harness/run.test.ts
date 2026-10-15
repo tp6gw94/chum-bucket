@@ -963,7 +963,7 @@ test("real compatible adapter preserves native MCP schema advertisement and cano
     () =>
       withRunTools(async (tools) => {
         const history = await discoveryHistory(tools, ["jira_get_issue"]);
-        const definitions = await tools.getModelTools(history);
+        const definitions = (await tools.getModelTools(history)).definitions;
         assert.deepEqual(
           definitions.find((tool) => tool.name === "jira_get_issue")!.inputSchema,
           jiraSchema,
@@ -1050,7 +1050,7 @@ test("representative confluence_search MCP catalog and real adapter dispatch can
     () =>
       withRunTools(async (tools) => {
         const history = await discoveryHistory(tools, ["confluence_search"]);
-        const definitions = await tools.getModelTools(history);
+        const definitions = (await tools.getModelTools(history)).definitions;
         assert.deepEqual(
           definitions.find((tool) => tool.name === "confluence_search"),
           representativeConfluenceSearch,

@@ -8,6 +8,7 @@ import {
 } from "@tanstack/ai";
 import { resolveDebugOption } from "@tanstack/ai/adapter-internals";
 import { snapshot, streamModelTurn, type ModelCall, type Turn } from "./model-turn";
+import { createToolEventBuffer } from "./tool-events";
 import type { ModelTool } from "./tools/atlassian";
 import type { RunTools } from "./tools";
 
@@ -75,14 +76,14 @@ async function modelStep(
 ): Promise<Turn> {
   const { messages, model, prompt } = input;
   await session.emit(session.runId, snapshot(messages), messages);
-  const definitions = await session.tools.getModelTools(messages);
+  const toolset = await session.tools.getModelTools(messages);
   const result = await streamModelTurn({
     messages,
     stream: await session.chatStream({
       model,
       messages: convertMessagesToModelMessages(messages),
-      systemPrompts: [prompt],
-      tools: definitions,
+      systemPrompts: [prompt, toolset.systemPrompt],
+      tools: toolset.definitions,
       logger: resolveDebugOption(false),
       request: { signal: AbortSignal.timeout(MODEL_REQUEST_TIMEOUT_MS) },
     }),
@@ -121,12 +122,28 @@ async function settleToolStep(
   return next;
 }
 
+async function persistToolEvents(
+  session: AgentSession,
+  call: ModelCall,
+  events: ReturnType<ReturnType<typeof createToolEventBuffer>["close"]>,
+): Promise<void> {
+  for (const event of events) {
+    await session.emit(session.runId, {
+      type: EventType.CUSTOM,
+      name: event.name,
+      value: { ...event.value, toolCallId: call.id, sequence: event.sequence },
+      timestamp: Date.now(),
+    });
+  }
+}
+
 async function executeToolStep(
   session: AgentSession,
   input: { messages: UIMessage[]; call: ModelCall },
 ): Promise<UIMessage[]> {
   const { messages, call } = input;
   await session.emit(session.runId, snapshot(messages), messages);
+  const buffer = createToolEventBuffer();
   let output: unknown;
   let error = false;
 
@@ -134,15 +151,15 @@ async function executeToolStep(
     const context = {
       toolCallId: call.id,
       abortSignal: AbortSignal.timeout(TOOL_REQUEST_TIMEOUT_MS),
-      emitCustomEvent: () => {
-        throw new Error("Tool custom events are not supported");
-      },
+      emitCustomEvent: (name: string, value: Record<string, unknown>) => buffer.push(name, value),
     };
     output = await session.tools.executeTool(messages, call, context);
   } catch (failure) {
     output = { error: failure instanceof Error ? failure.message.slice(0, 2000) : "Tool failed" };
     error = true;
   }
+
+  await persistToolEvents(session, call, buffer.close());
 
   return settleToolStep(session, { messages, call, output, error });
 }

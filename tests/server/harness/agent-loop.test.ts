@@ -74,13 +74,16 @@ function scriptedSession(steps: Step[]) {
       })();
     },
     tools: {
-      getModelTools: async () => [
-        {
-          name: "jira_get_issue",
-          description: "Read an issue",
-          inputSchema: { type: "object", properties: { issue_key: { type: "string" } } },
-        },
-      ],
+      getModelTools: async () => ({
+        definitions: [
+          {
+            name: "jira_get_issue",
+            description: "Read an issue",
+            inputSchema: { type: "object", properties: { issue_key: { type: "string" } } },
+          },
+        ],
+        systemPrompt: "tools",
+      }),
       executeTool: async (_messages, call) => {
         counts.tool++;
         return { issue: (call.input as { issue_key: string }).issue_key };
@@ -148,4 +151,47 @@ test("a rerun reuses completed checkpoints and only executes unfinished steps", 
   assert.equal(result.state, "done");
   assert.deepEqual(second.counts, { model: 1, tool: 0 });
   assert.match(JSON.stringify(result.messages), /"issue":"PROJ-1"/);
+});
+
+test("custom events from a tool are saved in order before the single tool result", async () => {
+  const saved: string[] = [];
+  const { session } = scriptedSession([
+    { tool: "codemode", input: { code: "return 1" } },
+    { text: "done" },
+  ]);
+  const tools: AgentSession["tools"] = {
+    ...session.tools,
+    executeTool: async (_messages, _call, context) => {
+      context.emitCustomEvent("code_mode:execution_started", { codeLength: 8 });
+      context.emitCustomEvent("code_mode:execution_finished", { success: true });
+      return { success: true, result: 1 };
+    },
+  };
+  const result = await runAgentLoop({
+    session: {
+      ...session,
+      tools,
+      emit: async (_runId, event) => {
+        saved.push(
+          event.type === "CUSTOM"
+            ? `${event.name}#${(event.value as { sequence: number }).sequence}`
+            : event.type,
+        );
+      },
+    },
+    messages,
+    model: "offline",
+    prompt: "prompt",
+    checkpoint: cachedCheckpoint(new Map(), []),
+  });
+
+  assert.equal(result.state, "done");
+  const events = saved.filter(
+    (entry) => entry.startsWith("code_mode") || entry === "TOOL_CALL_RESULT",
+  );
+  assert.deepEqual(events, [
+    "code_mode:execution_started#0",
+    "code_mode:execution_finished#1",
+    "TOOL_CALL_RESULT",
+  ]);
 });

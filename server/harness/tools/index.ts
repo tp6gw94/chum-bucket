@@ -1,16 +1,21 @@
 import {
   convertSchemaToJsonSchema,
+  type JSONSchema,
   type Tool,
   type ToolExecutionContext,
   type UIMessage,
 } from "@tanstack/ai";
 import type { ModelCall } from "../model-turn";
 import {
+  discoveryToolName,
   withAtlassianScope,
   type AtlassianCatalog,
   type LocalToolHandler,
   type ModelTool,
 } from "./atlassian";
+import { atlassianOutputSchemas } from "./atlassian-output";
+import { ToolBoundaryError } from "./boundary";
+import { codeModeToolName, composeCodeModeTurn } from "./code-mode";
 import { getFigma } from "./get-figma";
 import { read, write, edit } from "./fs";
 
@@ -20,8 +25,10 @@ type Registration = Readonly<{
 }>;
 type Catalog = ReadonlyMap<string, Registration>;
 
+export type ModelToolset = Readonly<{ definitions: ModelTool[]; systemPrompt: string }>;
+
 export type RunTools = Readonly<{
-  getModelTools: (messages: readonly UIMessage[]) => Promise<ModelTool[]>;
+  getModelTools: (messages: readonly UIMessage[]) => Promise<ModelToolset>;
   executeTool: (
     messages: readonly UIMessage[],
     call: ModelCall,
@@ -29,16 +36,22 @@ export type RunTools = Readonly<{
   ) => Promise<unknown>;
 }>;
 
-class ToolBoundaryError extends Error {}
+const localOutputSchemas = new Map<string, JSONSchema>();
 
 function registration(
-  tool: Pick<Tool, "name" | "description" | "inputSchema">,
+  tool: Pick<Tool, "name" | "description" | "inputSchema" | "outputSchema">,
   handler: Registration["handler"],
 ): Registration {
   const inputSchema = convertSchemaToJsonSchema(tool.inputSchema);
 
   if (!inputSchema) {
     throw new ToolBoundaryError("Tool schema is unavailable");
+  }
+
+  const outputSchema = tool.outputSchema ? convertSchemaToJsonSchema(tool.outputSchema) : undefined;
+
+  if (outputSchema) {
+    localOutputSchemas.set(tool.name, outputSchema);
   }
 
   return {
@@ -72,12 +85,64 @@ function mergeLocalDefinitions(remote: AtlassianCatalog): ModelTool[] {
   return [...definitions.values()];
 }
 
+const outputSchemas: ReadonlyMap<string, JSONSchema> = new Map([
+  ...localOutputSchemas,
+  ...atlassianOutputSchemas,
+]);
+
 export async function withRunTools<T>(use: (tools: RunTools) => Promise<T>): Promise<T> {
-  return withAtlassianScope((scope) =>
-    use({
-      getModelTools: (messages) => scope.getModelTools(messages, mergeLocalDefinitions),
-      executeTool: (messages, call, context) =>
-        scope.executeTool(messages, call, context, localCatalog.get(call.name)?.handler),
-    }),
-  );
+  return withAtlassianScope(async (scope) => {
+    const pending = new Set<Promise<unknown>>();
+
+    const dispatcher =
+      (messages: readonly UIMessage[]) =>
+      (call: ModelCall, context: ToolExecutionContext): Promise<unknown> => {
+        const work = scope.executeTool(
+          messages,
+          call,
+          context,
+          localCatalog.get(call.name)?.handler,
+        );
+        const settle = () => pending.delete(work);
+        pending.add(work);
+        work.then(settle, settle);
+
+        return work;
+      };
+
+    const codeModeTurn = async (messages: readonly UIMessage[], advertised: ModelTool[]) =>
+      composeCodeModeTurn({
+        definitions: advertised,
+        dispatch: dispatcher(messages),
+        guard: await scope.createGuard(),
+        outputSchemas,
+        excluded: new Set([discoveryToolName]),
+      });
+
+    try {
+      return await use({
+        async getModelTools(messages) {
+          const advertised = await scope.getModelTools(messages, mergeLocalDefinitions);
+          const turn = await codeModeTurn(messages, advertised);
+
+          return {
+            definitions: [...advertised, turn.definition],
+            systemPrompt: turn.systemPrompt,
+          };
+        },
+        async executeTool(messages, call, context) {
+          if (call.name !== codeModeToolName) {
+            return dispatcher(messages)(call, context);
+          }
+
+          const advertised = await scope.getModelTools(messages, mergeLocalDefinitions);
+          const turn = await codeModeTurn(messages, advertised);
+
+          return turn.execute(call.input, context);
+        },
+      });
+    } finally {
+      await Promise.allSettled(pending);
+    }
+  });
 }
