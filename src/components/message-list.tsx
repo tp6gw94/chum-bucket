@@ -1,4 +1,4 @@
-import { createParser, Renderer, type ParseResult } from "@openuidev/react-lang";
+import { createParser, Renderer, type ActionEvent, type ParseResult } from "@openuidev/react-lang";
 import { MarkDownRenderer } from "@openuidev/react-ui";
 import { openuiLibrary } from "@openuidev/react-ui/genui-lib";
 import { useMemo } from "react";
@@ -18,7 +18,15 @@ export function parseAssistantReply(text: string): ParseResult {
   return assistantReplyParser.parse(text);
 }
 
-function AssistantMessage({ text, isStreaming }: { text: string; isStreaming: boolean }) {
+function AssistantMessage({
+  text,
+  isStreaming,
+  onAction,
+}: {
+  text: string;
+  isStreaming: boolean;
+  onAction?: (event: ActionEvent) => void;
+}) {
   const result = useMemo(
     () => (isStreaming ? null : parseAssistantReply(text)),
     [text, isStreaming],
@@ -43,7 +51,12 @@ function AssistantMessage({ text, isStreaming }: { text: string; isStreaming: bo
           {[...new Set(errors.map((error) => error.component))].join("、")}
         </p>
       ) : null}
-      <Renderer response={text} library={openuiLibrary} isStreaming={isStreaming} />
+      <Renderer
+        response={text}
+        library={openuiLibrary}
+        isStreaming={isStreaming}
+        onAction={onAction}
+      />
     </div>
   );
 }
@@ -52,10 +65,12 @@ function ChatMessageRow({
   message,
   agent,
   isStreaming,
+  onAction,
 }: {
   message: ChatMessage;
   agent: string;
   isStreaming: boolean;
+  onAction?: (event: ActionEvent) => void;
 }) {
   const text = message.parts
     .filter((part) => part.type === "text")
@@ -86,7 +101,9 @@ function ChatMessageRow({
             {message.parts.map((part) =>
               part.type === "tool-call" ? <ToolCall key={part.id} part={part} /> : null,
             )}
-            {text.trim() !== "" ? <AssistantMessage text={text} isStreaming={isStreaming} /> : null}
+            {text.trim() !== "" ? (
+              <AssistantMessage text={text} isStreaming={isStreaming} onAction={onAction} />
+            ) : null}
           </div>
         ) : (
           <Bubble variant="default" align={align}>
@@ -102,10 +119,12 @@ export function MessageList({
   messages,
   agent,
   isStreaming = false,
+  onAction,
 }: {
   messages: ChatMessage[];
   agent: string;
   isStreaming?: boolean;
+  onAction?: (event: ActionEvent) => void;
 }) {
   const streamingId = isStreaming ? messages.at(-1)?.id : undefined;
 
@@ -117,6 +136,7 @@ export function MessageList({
           message={message}
           agent={agent}
           isStreaming={message.id === streamingId && message.role === "assistant"}
+          onAction={onAction}
         />
       ))}
     </MessageGroup>

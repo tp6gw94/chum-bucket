@@ -1,3 +1,4 @@
+import type { ActionEvent } from "@openuidev/react-lang";
 import { PlusIcon, XIcon } from "lucide-react";
 import type { SendResult } from "../hooks/use-threads";
 
@@ -5,6 +6,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Composer } from "./composer";
 import { MessageList } from "./message-list";
+import { runAction } from "./openui-actions";
 import { PaneShell } from "./pane-shell";
 import { ProgressPanel } from "./progress-panel";
 import { StatusBadge } from "./status-badge";
@@ -30,6 +32,14 @@ export function Pane({
   hydrationError?: string | null;
 }) {
   const isMain = pane.kind === "main";
+
+  function handleAction(event: ActionEvent) {
+    runAction(event, {
+      open: (url) => window.open(url, "_blank", "noopener,noreferrer"),
+      send:
+        onSend && !sendDisabled ? (text) => void onSend(text).catch(() => undefined) : undefined,
+    });
+  }
 
   return (
     <PaneShell
@@ -67,6 +77,7 @@ export function Pane({
             messages={pane.messages}
             agent={pane.agent}
             isStreaming={pane.status === "running"}
+            onAction={handleAction}
           />
         )}
         <ProgressPanel
