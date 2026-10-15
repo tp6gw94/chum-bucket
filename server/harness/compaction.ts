@@ -9,7 +9,7 @@ import type { CompactionReason, CompactionState } from "../../shared/compaction-
 import type { AgentChatStream } from "./agent-loop";
 import { isSummaryMessage, type ConversationState } from "./conversation";
 import { throwProviderError } from "./model-turn";
-import { compactionSystemPrompt, summaryPreamble } from "./prompts";
+import { compactionSystemPrompt, sideSummarySystemPrompt, summaryPreamble } from "./prompts";
 import type { ModelTool } from "./tools/atlassian";
 import type { RunTools } from "./tools";
 
@@ -223,9 +223,11 @@ export function planCompaction(
   return { previousSummary, transcript: rest.slice(0, cut), tail: rest.slice(cut) };
 }
 
-type SummaryInput = Readonly<{
+export type SummaryPurpose = "compaction" | "side-summary";
+
+export type SummaryInput = Readonly<{
   previousSummary: string | null;
-  transcript: readonly UIMessage[];
+  transcript: readonly UIMessage[] | readonly string[];
 }>;
 
 export type SummaryDependencies = Readonly<{
@@ -233,6 +235,12 @@ export type SummaryDependencies = Readonly<{
   model: string;
   signal?: AbortSignal;
 }>;
+
+function transcriptPayload(transcript: SummaryInput["transcript"]) {
+  return transcript.every((entry) => typeof entry === "string")
+    ? transcript
+    : convertMessagesToModelMessages([...(transcript as UIMessage[])]);
+}
 
 type SummaryRead = { text: string; finishReason: string | undefined };
 
@@ -278,8 +286,9 @@ function checkedSummary(read: SummaryRead): string {
   return text;
 }
 
-async function summarizeTranscript(
+export async function summarizeTranscript(
   input: SummaryInput,
+  purpose: SummaryPurpose,
   deps: SummaryDependencies,
 ): Promise<string> {
   const signal = AbortSignal.any([
@@ -293,11 +302,11 @@ async function summarizeTranscript(
         role: "user",
         content: JSON.stringify({
           previousSummary: input.previousSummary,
-          transcript: convertMessagesToModelMessages([...input.transcript]),
+          transcript: transcriptPayload(input.transcript),
         }),
       },
     ],
-    systemPrompts: [compactionSystemPrompt],
+    systemPrompts: [purpose === "compaction" ? compactionSystemPrompt : sideSummarySystemPrompt],
     tools: [],
     modelOptions: { max_tokens: SUMMARY_MAX_TOKENS },
     logger: resolveDebugOption(false),
@@ -369,7 +378,7 @@ export async function prepareCompaction(input: PrepareCompactionInput): Promise<
   let summary: string;
 
   try {
-    summary = await summarizeTranscript(plan, input.summary);
+    summary = await summarizeTranscript(plan, "compaction", input.summary);
   } catch (error) {
     if (input.summary.signal?.aborted) {
       throw error;

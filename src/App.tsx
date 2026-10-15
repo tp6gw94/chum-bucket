@@ -3,6 +3,7 @@ import "./styles/globals.css";
 import { useEffect, useRef, useState } from "react";
 
 import { Pane } from "./components/pane";
+import { SideChatPane } from "./components/side-chat-pane";
 import { ThreadSidebar } from "./components/thread-sidebar";
 import { TopBar } from "./components/top-bar";
 import type { Pane as PaneModel, ThreadSummary } from "./components/types";
@@ -14,6 +15,7 @@ import {
   useThread,
   useThreadList,
 } from "./hooks/use-threads";
+import { useSideChats } from "./hooks/use-side-chats";
 import { Button } from "@/components/ui/button";
 import { Provider } from "./Provider";
 
@@ -62,87 +64,118 @@ function ThreadEntry() {
   );
 }
 
-function ThreadPage({ threadId }: { threadId: string }) {
+function threadTitle(threads: { id: string; title: string }[], threadId: string) {
+  return threads.find((item) => item.id === threadId)?.title ?? "新對話";
+}
+
+function firstError(...errors: (string | null)[]) {
+  return errors.find((error) => error !== null) ?? null;
+}
+
+function summarizeThreads(
+  threads: { id: string; title: string }[],
+  threadId: string,
+  current: Pick<ThreadSummary, "status" | "paneCount">,
+): ThreadSummary[] {
+  const idle = { status: "idle" as const, paneCount: 1 };
+
+  return threads.map((item) => ({
+    ...item,
+    agent: "main",
+    ...(item.id === threadId ? current : idle),
+  }));
+}
+
+function ThreadWorkspace({
+  threadId,
+  sideChats,
+  onTransferred,
+}: {
+  threadId: string;
+  sideChats: ReturnType<typeof useSideChats>;
+  onTransferred: (id: string) => void;
+}) {
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  const [agentPanes, setAgentPanes] = useState<PaneModel[]>([]);
   const { threads, error: listError } = useThreadList();
   const thread = useThread(threadId);
-  const { messages, send } = thread;
   const sendDisabled = thread.phase !== "ready";
-
-  function openAgentPane() {
-    setAgentPanes((panes) => [
-      ...panes,
-      {
-        id: crypto.randomUUID(),
-        title: `附屬對話 ${panes.length + 1}`,
-        agent: "尚未連接",
-        status: "idle",
-        progress: [],
-        messages: [],
-        kind: "agent",
-      },
-    ]);
-  }
-
-  function closeAgentPane(id: string) {
-    setAgentPanes((panes) => panes.filter((pane) => pane.id !== id));
-  }
+  const status = threadStatus(thread.phase);
 
   const mainPane: PaneModel = {
-    id: threadId ?? "draft",
-    title: threads.find((item) => item.id === threadId)?.title ?? "新對話",
+    id: threadId,
+    title: threadTitle(threads, threadId),
     agent: "main",
-    status: threadStatus(thread.phase),
+    status,
     progress: [],
-    messages,
+    messages: thread.messages,
     kind: "main",
   };
-  const panes = [mainPane, ...agentPanes];
+  const openSideChat = sendDisabled ? undefined : () => void sideChats.open();
+  const threadSummaries = summarizeThreads(threads, threadId, {
+    status,
+    paneCount: 1 + sideChats.chats.length,
+  });
 
-  const threadSummaries: ThreadSummary[] = threads.map((thread) => ({
-    ...thread,
-    agent: "main",
-    status: thread.id === threadId ? mainPane.status : "idle",
-    paneCount: thread.id === threadId ? panes.length : 1,
-  }));
+  return (
+    <div className="flex h-dvh flex-col overflow-hidden bg-background text-foreground">
+      <TopBar sidebarOpen={sidebarOpen} onToggleSidebar={() => setSidebarOpen((open) => !open)} />
+      <div className="flex min-h-0 flex-1">
+        <ThreadSidebar
+          threads={threadSummaries}
+          open={sidebarOpen}
+          selectedThreadId={threadId}
+          error={firstError(listError, sideChats.error)}
+          disabled={sendDisabled}
+          onNewThread={() => thread.navigate(null)}
+          onSelectThread={thread.navigate}
+        />
+        <main
+          role="region"
+          aria-label="對話窗格，可左右捲動"
+          tabIndex={0}
+          className="flex min-w-0 flex-1 snap-x snap-proximity items-stretch overflow-x-auto overflow-y-hidden overscroll-x-contain"
+        >
+          <Pane
+            pane={mainPane}
+            onOpenAgentPane={openSideChat}
+            onSend={thread.send}
+            sendDisabled={sendDisabled}
+            isHydrating={thread.phase === "loading"}
+            hydrationError={thread.error}
+            notice={thread.notice}
+          />
+          {sideChats.chats.map((chat) => (
+            <SideChatPane
+              key={chat.id}
+              chat={chat}
+              mainReady={!sendDisabled}
+              onClose={() => void sideChats.close(chat.id)}
+              onTransferred={() => onTransferred(chat.id)}
+            />
+          ))}
+        </main>
+      </div>
+    </div>
+  );
+}
+
+function ThreadPage({ threadId }: { threadId: string }) {
+  const sideChats = useSideChats(threadId);
+  const [epoch, setEpoch] = useState(0);
+
+  function transferred(id: string) {
+    sideChats.forget(id);
+    setEpoch((value) => value + 1);
+  }
 
   return (
     <Provider>
-      <div className="flex h-dvh flex-col overflow-hidden bg-background text-foreground">
-        <TopBar sidebarOpen={sidebarOpen} onToggleSidebar={() => setSidebarOpen((open) => !open)} />
-        <div className="flex min-h-0 flex-1">
-          <ThreadSidebar
-            threads={threadSummaries}
-            open={sidebarOpen}
-            selectedThreadId={threadId}
-            error={listError}
-            disabled={sendDisabled}
-            onNewThread={() => thread.navigate(null)}
-            onSelectThread={thread.navigate}
-          />
-          <main
-            role="region"
-            aria-label="對話窗格，可左右捲動"
-            tabIndex={0}
-            className="flex min-w-0 flex-1 snap-x snap-proximity items-stretch overflow-x-auto overflow-y-hidden overscroll-x-contain"
-          >
-            {panes.map((pane) => (
-              <Pane
-                key={pane.id}
-                pane={pane}
-                onOpenAgentPane={openAgentPane}
-                onClose={pane.kind === "agent" ? () => closeAgentPane(pane.id) : undefined}
-                onSend={pane.kind === "main" ? send : undefined}
-                sendDisabled={sendDisabled}
-                isHydrating={pane.kind === "main" && thread.phase === "loading"}
-                hydrationError={pane.kind === "main" ? thread.error : null}
-                notice={pane.kind === "main" ? thread.notice : null}
-              />
-            ))}
-          </main>
-        </div>
-      </div>
+      <ThreadWorkspace
+        key={epoch}
+        threadId={threadId}
+        sideChats={sideChats}
+        onTransferred={transferred}
+      />
     </Provider>
   );
 }

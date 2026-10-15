@@ -295,6 +295,7 @@ const accepted: AcceptedRun & { message: { id: string; text: string } } = {
   baseRevision: 0,
   message: { id: "user-1", text: "Hello" },
   conversation: { display: baseline, context: baseline },
+  sideChat: false,
   prompt: "offline",
   model: "deepseek-ai/DeepSeek-V4.1-Flash",
   build: "durable-chat-loop-v6",

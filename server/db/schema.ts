@@ -1,7 +1,7 @@
 import { sql } from "drizzle-orm";
 import type { UIMessage, StreamChunk } from "@tanstack/ai";
 import type { RunInput, AcceptedRun } from "../harness/run-store";
-import type { RunProjection } from "../harness/conversation";
+import type { ConversationState, RunProjection } from "../harness/conversation";
 import {
   pgTable,
   uuid,
@@ -72,5 +72,24 @@ export const chatEventsTable = pgTable(
     primaryKey({ columns: [t.run_id, t.sequence] }),
     unique("chat_events_key_unique").on(t.run_id, t.event_key),
     check("chat_events_sequence_nonnegative", sql`${t.sequence} >= 0`),
+  ],
+);
+
+export const sideChatsTable = pgTable(
+  "side_chats",
+  {
+    id: uuid()
+      .primaryKey()
+      .references(() => threadsTable.id),
+    parent_thread_id: uuid()
+      .notNull()
+      .references(() => threadsTable.id),
+    state: text().notNull().$type<"open" | "closing">().default("open"),
+    seed: jsonb().notNull().$type<ConversationState>(),
+    created_at: timestamp({ withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    index("side_chats_parent_thread_id_idx").on(t.parent_thread_id),
+    check("side_chats_state_check", sql`${t.state} in ('open', 'closing')`),
   ],
 );

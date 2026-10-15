@@ -12,7 +12,8 @@ import {
   type CompactionOutcome,
   type CompactionPolicy,
 } from "../../../server/harness/compaction";
-import { compactionSystemPrompt } from "../../../server/harness/prompts";
+import { compactionSystemPrompt, sideSummarySystemPrompt } from "../../../server/harness/prompts";
+import { summarizeTranscript } from "../../../server/harness/compaction";
 import type { RunTools } from "../../../server/harness/tools";
 import type { ModelTool } from "../../../server/harness/tools/atlassian";
 
@@ -409,4 +410,16 @@ test("publishing appends the summary to display and swaps the context only when 
   });
   assert.equal(kept, conversation);
   assert.deepEqual(saved, ["op:done:manual", "op2:skipped"]);
+});
+
+test("side summaries use their own prompt and accept raw transcript fragments", async () => {
+  const model = fakeModel([textReply("附屬對話結論")]);
+  const text = await summarizeTranscript(
+    { previousSummary: null, transcript: ['{"id":"m1"}'] },
+    "side-summary",
+    { chatStream: model.chatStream, model: "offline" },
+  );
+  assert.equal(text, "附屬對話結論");
+  assert.deepEqual(model.requests[0]!.systemPrompts, [sideSummarySystemPrompt]);
+  assert.match(String(model.requests[0]!.messages[0]!.content), /\{\\"id\\":\\"m1\\"\}/);
 });

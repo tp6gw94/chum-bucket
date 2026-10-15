@@ -37,6 +37,7 @@ export const chatInputSchema = z
       .object({
         id: z.string().min(1).max(200),
         text: z.string().trim().min(1).max(32_000),
+        sideChatTransfer: z.literal(true).optional(),
       })
       .strict(),
   })
@@ -53,13 +54,14 @@ const runInputSchema = z.union([chatInputSchema, compactInputSchema]);
 export type RunInput = z.infer<typeof runInputSchema>;
 export type AcceptedRun = RunInput & {
   conversation: ConversationState;
+  sideChat: boolean;
   prompt: string;
   model: typeof MODEL;
   build: typeof BUILD;
 };
 type RunRow = typeof chatRunsTable.$inferSelect;
 type ThreadRow = typeof threadsTable.$inferSelect;
-type Transaction = Parameters<Parameters<typeof import("../db").db.transaction>[0]>[0];
+export type Transaction = Parameters<Parameters<typeof import("../db").db.transaction>[0]>[0];
 export const database = async () => (await import("../db")).db;
 
 export class RunRequestError extends Error {
@@ -109,6 +111,8 @@ async function appendEvent(tx: Transaction, run: RunRow, key: string, event: Str
   run.next_sequence++;
 }
 
+export type ContextSource = (tx: Transaction, thread: ThreadRow) => Promise<UIMessage[] | null>;
+
 async function anchoredContext(tx: Transaction, thread: ThreadRow): Promise<UIMessage[] | null> {
   const anchors = await tx
     .select({ projection: chatRunsTable.projection })
@@ -137,11 +141,21 @@ async function anchoredContext(tx: Transaction, thread: ThreadRow): Promise<UIMe
   return projection.context;
 }
 
-async function threadContext(tx: Transaction, thread: ThreadRow): Promise<UIMessage[]> {
+export async function threadContext(
+  tx: Transaction,
+  thread: ThreadRow,
+  fallback?: ContextSource,
+): Promise<UIMessage[]> {
   const anchored = await anchoredContext(tx, thread);
 
   if (anchored) {
     return anchored;
+  }
+
+  const seeded = await fallback?.(tx, thread);
+
+  if (seeded) {
+    return seeded;
   }
 
   if (thread.messages.some(isSummaryMessage)) {
@@ -164,14 +178,26 @@ function initialConversation(input: RunInput, thread: ThreadRow, context: UIMess
     id: input.message.id,
     role: "user",
     parts: [{ type: "text", content: input.message.text }],
+    ...(input.message.sideChatTransfer ? { metadata: { sideChatTransfer: true } } : {}),
   };
 
   return { display: [...thread.messages, message], context: [...context, message] };
 }
 
-type PersistedRun = Readonly<{ run: AcceptedRun; pending: boolean }>;
+export type RunAdmission = Readonly<{
+  sideChat: boolean;
+  context?: ContextSource;
+}>;
 
-async function persistRunIn(tx: Transaction, input: RunInput): Promise<PersistedRun> {
+export type PersistedRun = Readonly<{ run: AcceptedRun; pending: boolean }>;
+
+export async function persistRunIn(
+  tx: Transaction,
+  input: RunInput,
+  admit: (tx: Transaction, thread: ThreadRow) => Promise<RunAdmission> = async () => ({
+    sideChat: false,
+  }),
+): Promise<PersistedRun> {
   const [thread] = await tx
     .select()
     .from(threadsTable)
@@ -196,10 +222,12 @@ async function persistRunIn(tx: Transaction, input: RunInput): Promise<Persisted
     throw new RunRequestError(409, "Thread revision or claim conflict");
   }
 
-  const context = await threadContext(tx, thread);
+  const admission = await admit(tx, thread);
+  const context = await threadContext(tx, thread, admission.context);
   const run: AcceptedRun = {
     ...input,
     conversation: initialConversation(input, thread, context),
+    sideChat: admission.sideChat,
     prompt: openuiInstructions(),
     model: MODEL,
     build: BUILD,
@@ -233,7 +261,10 @@ async function persistRunIn(tx: Transaction, input: RunInput): Promise<Persisted
   return { run, pending: true };
 }
 
-export async function persistRun(value: RunInput): Promise<PersistedRun> {
+export async function persistRun(
+  value: RunInput,
+  admit?: (tx: Transaction, thread: ThreadRow) => Promise<RunAdmission>,
+): Promise<PersistedRun> {
   const parsed = runInputSchema.safeParse(value);
 
   if (!parsed.success) {
@@ -242,7 +273,7 @@ export async function persistRun(value: RunInput): Promise<PersistedRun> {
 
   const db = await database();
 
-  return db.transaction((tx) => persistRunIn(tx, parsed.data));
+  return db.transaction((tx) => persistRunIn(tx, parsed.data, admit));
 }
 
 export async function emit(runId: string, event: StreamChunk, conversation?: ConversationState) {
@@ -312,6 +343,14 @@ function threadTitle(messages: UIMessage[]) {
   );
 }
 
+function transferredMessage(run: RunRow): UIMessage | undefined {
+  const last = run.accepted.conversation.display.at(-1);
+
+  return (last?.metadata as { sideChatTransfer?: unknown } | undefined)?.sideChatTransfer === true
+    ? last
+    : undefined;
+}
+
 async function commitThread(
   tx: Transaction,
   run: RunRow,
@@ -326,12 +365,28 @@ async function commitThread(
     .update(threadsTable)
     .set({
       messages: conversation.display,
-      title: threadTitle(conversation.display),
+      title: thread.parent_thread_id ? thread.title : threadTitle(conversation.display),
       revision: sql`${threadsTable.revision} + 1`,
       active_run_id: null,
       updated_at: sql`now()`,
     })
     .where(eq(threadsTable.id, thread.id));
+}
+
+async function releaseFailedRun(tx: Transaction, run: RunRow, thread: ThreadRow) {
+  await appendEvent(tx, run, "failed:snapshot", snapshot(readProjection(run.projection).display));
+  const transferred = transferredMessage(run);
+
+  if (transferred) {
+    await commitThread(tx, run, thread, {
+      display: [...thread.messages, transferred],
+      context: run.accepted.conversation.context,
+    });
+
+    return;
+  }
+
+  await tx.update(threadsTable).set({ active_run_id: null }).where(eq(threadsTable.id, thread.id));
 }
 
 export async function finishRun(
@@ -355,16 +410,7 @@ export async function finishRun(
       await appendEvent(tx, run, "finished:snapshot", snapshot(conversation.display));
       await commitThread(tx, run, thread, conversation);
     } else {
-      await appendEvent(
-        tx,
-        run,
-        "failed:snapshot",
-        snapshot(readProjection(run.projection).display),
-      );
-      await tx
-        .update(threadsTable)
-        .set({ active_run_id: null })
-        .where(eq(threadsTable.id, thread.id));
+      await releaseFailedRun(tx, run, thread);
     }
 
     await appendEvent(

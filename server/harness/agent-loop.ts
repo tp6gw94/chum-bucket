@@ -84,15 +84,21 @@ type AgentLoopInput = {
   prompt: string;
   checkpoint: AgentCheckpoint;
   compact?: AgentCompact;
+  signal?: AbortSignal;
+  assertExecution?: () => Promise<void>;
 };
 
 type ModelStepResult =
   | { state: "turn"; conversation: ConversationState; calls: ModelCall[] }
   | { state: "overflow" };
 
+function stepSignal(timeoutMs: number, signal: AbortSignal | undefined): AbortSignal {
+  return AbortSignal.any([AbortSignal.timeout(timeoutMs), ...(signal ? [signal] : [])]);
+}
+
 async function modelStream(
   session: AgentSession,
-  input: { context: UIMessage[]; model: string; prompt: string },
+  input: { context: UIMessage[]; model: string; prompt: string; signal?: AbortSignal },
 ) {
   const { definitions, systemPrompt } = await session.tools.getModelTools(input.context);
 
@@ -103,7 +109,7 @@ async function modelStream(
       systemPrompts: [input.prompt, systemPrompt],
       tools: definitions,
       logger: resolveDebugOption(false),
-      request: { signal: AbortSignal.timeout(MODEL_REQUEST_TIMEOUT_MS) },
+      request: { signal: stepSignal(MODEL_REQUEST_TIMEOUT_MS, input.signal) },
     });
   } catch (error) {
     throwProviderError(error);
@@ -112,7 +118,7 @@ async function modelStream(
 
 async function modelStep(
   session: AgentSession,
-  input: { conversation: ConversationState; model: string; prompt: string },
+  input: { conversation: ConversationState; model: string; prompt: string; signal?: AbortSignal },
 ): Promise<ModelStepResult> {
   const { conversation } = input;
   await session.emit(session.runId, snapshot(conversation.display), conversation);
@@ -169,7 +175,7 @@ async function settleToolStep(
 
 async function executeToolStep(
   session: AgentSession,
-  input: { conversation: ConversationState; call: ModelCall },
+  input: { conversation: ConversationState; call: ModelCall; signal?: AbortSignal },
 ): Promise<ConversationState> {
   const { conversation, call } = input;
   await session.emit(session.runId, snapshot(conversation.display), conversation);
@@ -180,7 +186,7 @@ async function executeToolStep(
   try {
     const context = {
       toolCallId: call.id,
-      abortSignal: AbortSignal.timeout(TOOL_REQUEST_TIMEOUT_MS),
+      abortSignal: stepSignal(TOOL_REQUEST_TIMEOUT_MS, input.signal),
       emitCustomEvent: events.emit,
     };
     output = await session.tools.executeTool(conversation.context, call, context);
@@ -203,10 +209,12 @@ async function toolTurn(
   let conversation = initial;
 
   for (const [index, call] of calls.entries()) {
+    await input.assertExecution?.();
     const current = conversation;
     conversation = await input.checkpoint({
       name: `tool:${turn}:${index}`,
-      work: () => executeToolStep(input.session, { conversation: current, call }),
+      work: () =>
+        executeToolStep(input.session, { conversation: current, call, signal: input.signal }),
     });
   }
 
@@ -233,6 +241,7 @@ function requestModel(input: AgentLoopInput, conversation: ConversationState, na
         conversation,
         model: input.model,
         prompt: input.prompt,
+        signal: input.signal,
       }),
   });
 }
@@ -275,6 +284,7 @@ export async function runAgentLoop(input: AgentLoopInput): Promise<AgentLoopResu
   let conversation = input.conversation;
 
   for (let turn = 0; turn < MAX_TURN; turn++) {
+    await input.assertExecution?.();
     conversation = await compactBeforeModel(input, conversation, turn);
     const first = await requestModel(input, conversation, `model:${turn}`);
     const result =
