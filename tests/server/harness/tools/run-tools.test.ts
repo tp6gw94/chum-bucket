@@ -8,7 +8,13 @@ import type { ModelCall } from "../../../../server/harness/model-turn";
 import { atlassianToolNames } from "../../../../server/harness/tools/atlassian-policy";
 import { atlassianOutputs } from "../../../../server/harness/tools/atlassian-output";
 import { withRunTools, type RunTools } from "../../../../server/harness/tools/index";
-import { allTools, fakeToken, mcpFixture, withMcpEnvironment } from "../../../fixtures/mcp-fixture";
+import {
+  allTools,
+  fakeToken,
+  mcpFixture,
+  scopeAccess,
+  withMcpEnvironment,
+} from "../../../fixtures/mcp-fixture";
 
 const context: ToolExecutionContext = { toolCallId: "outer", emitCustomEvent: () => {} };
 const codemode = (code: string): ModelCall => ({
@@ -63,7 +69,7 @@ test("code mode reaches local tools through the same handler as direct calls", a
   await withMcpEnvironment(
     () =>
       withTemporaryFile("local data", (path) =>
-        withRunTools(async (tools) => {
+        withRunTools(scopeAccess, async (tools) => {
           const turn = await tools.getModelTools([]);
           assert.equal(turn.definitions.at(-1)!.name, "codemode");
           assert.match(turn.systemPrompt, /declare function external_read\(/);
@@ -126,7 +132,7 @@ test("code mode only exposes discovered Atlassian tools and unwraps mcp-atlassia
   });
   await withMcpEnvironment(
     () =>
-      withRunTools(async (tools) => {
+      withRunTools(scopeAccess, async (tools) => {
         const before = await tools.getModelTools([]);
         assert.doesNotMatch(before.systemPrompt, /external_jira_get_issue/);
         assert.deepEqual(
@@ -188,7 +194,7 @@ return issue.summary;`),
 test("credential guards apply to results read inside code mode", async () => {
   await withMcpEnvironment(() =>
     withTemporaryFile(`token=${fakeToken}`, (path) =>
-      withRunTools(async (tools) => {
+      withRunTools(scopeAccess, async (tools) => {
         const events: unknown[] = [];
         const output = await tools.executeTool(
           [],

@@ -41,6 +41,8 @@ export type AgentSession = Readonly<{
   emit: AgentEmit;
   chatStream: ChatStream;
   tools: RunTools;
+  signal?: AbortSignal;
+  toolTimeoutMs?: number;
 }>;
 
 export type AgentCheckpoint = <T>(input: {
@@ -55,6 +57,12 @@ export type AgentCompact = (input: {
   name: string;
 }) => Promise<CompactionResult>;
 
+type AgentBounds = Readonly<{ maxTurn: number; finalPrompt: string }>;
+
+export type AgentOrchestration = (
+  call: ModelCall,
+) => Promise<{ state: "handled"; output: unknown; error?: boolean } | { state: "unhandled" }>;
+
 export type AgentLoopResult = Readonly<{
   outcome: "done" | "limit";
   conversation: ConversationState;
@@ -66,8 +74,8 @@ type AgentLoopInput = {
   model: string;
   prompt: string;
   checkpoint: AgentCheckpoint;
-  compact: AgentCompact;
-};
+  orchestration?: AgentOrchestration;
+} & ({ compact: AgentCompact; bounded?: never } | { bounded: AgentBounds; compact?: never });
 
 type ModelStep =
   | { kind: "turn"; conversation: ConversationState; calls: ModelCall[] }
@@ -75,22 +83,34 @@ type ModelStep =
 
 type ModelTurnStep = Extract<ModelStep, { kind: "turn" }>;
 
-async function modelStep(
-  session: AgentSession,
-  input: { conversation: ConversationState; model: string; prompt: string },
-): Promise<ModelStep> {
-  const { conversation, model, prompt } = input;
+type ModelStepInput = Readonly<{
+  conversation: ConversationState;
+  model: string;
+  prompt: string;
+  finalPrompt?: string;
+}>;
+
+function withSessionSignal(session: AgentSession, signal: AbortSignal): AbortSignal {
+  return session.signal ? AbortSignal.any([signal, session.signal]) : signal;
+}
+
+async function modelStep(session: AgentSession, input: ModelStepInput): Promise<ModelStep> {
+  const { conversation, model, prompt, finalPrompt } = input;
   await session.emit(session.runId, snapshot(conversation.display), conversation);
-  const tools = await session.tools.getModelTools(conversation.display);
+  const tools =
+    finalPrompt === undefined
+      ? await session.tools.getModelTools(conversation.display)
+      : { definitions: [], systemPrompt: finalPrompt };
 
   try {
     const turn = await requestModelTurn({
       chatStream: session.chatStream,
       model,
       messages: conversation.context,
-      systemPrompts: [prompt, tools.systemPrompt],
+      systemPrompts: [prompt, tools.systemPrompt].filter(Boolean),
       tools: tools.definitions,
       timeoutMs: MODEL_REQUEST_TIMEOUT_MS,
+      ...(session.signal ? { signal: session.signal } : {}),
       append: (event) => session.emit(session.runId, event),
     });
     const next = advanceConversation(conversation, turn.messages);
@@ -150,7 +170,10 @@ async function executeToolStep(
   try {
     const context = {
       toolCallId: call.id,
-      abortSignal: AbortSignal.timeout(TOOL_REQUEST_TIMEOUT_MS),
+      abortSignal: withSessionSignal(
+        session,
+        AbortSignal.timeout(session.toolTimeoutMs ?? TOOL_REQUEST_TIMEOUT_MS),
+      ),
       emitCustomEvent: events.emitCustomEvent,
     };
     output = await session.tools.executeTool(conversation.display, call, context);
@@ -174,9 +197,18 @@ async function toolTurn(
 
   for (const [index, call] of calls.entries()) {
     const current = conversation;
+    const orchestrated = input.orchestration ? await input.orchestration(call) : undefined;
     conversation = await input.checkpoint({
       name: `tool:${turn}:${index}`,
-      work: () => executeToolStep(input.session, { conversation: current, call }),
+      work: () =>
+        orchestrated?.state === "handled"
+          ? settleToolStep(input.session, {
+              conversation: current,
+              call,
+              output: orchestrated.output,
+              error: orchestrated.error ?? false,
+            })
+          : executeToolStep(input.session, { conversation: current, call }),
     });
   }
 
@@ -187,13 +219,20 @@ function modelCheckpoint(
   input: AgentLoopInput,
   conversation: ConversationState,
   name: string,
+  finalPrompt?: string,
 ): Promise<ModelStep> {
   const { session, model, prompt } = input;
 
   return input.checkpoint({
     name,
     retry: MODEL_RETRY,
-    work: () => modelStep(session, { conversation, model, prompt }),
+    work: () =>
+      modelStep(session, {
+        conversation,
+        model,
+        prompt,
+        ...(finalPrompt === undefined ? {} : { finalPrompt }),
+      }),
   });
 }
 
@@ -206,6 +245,10 @@ async function requestWithRecovery(
 
   if (first.kind === "turn") {
     return first;
+  }
+
+  if (!input.compact) {
+    throw new ContextOverflowError(first.message);
   }
 
   const compacted = await input.compact({
@@ -227,13 +270,65 @@ async function requestWithRecovery(
   return retry;
 }
 
+async function boundedTurn(
+  input: AgentLoopInput & { bounded: AgentBounds },
+  conversation: ConversationState,
+  turn: number,
+): Promise<ModelTurnStep> {
+  if (turn < input.bounded.maxTurn - 1) {
+    return requestWithRecovery(input, conversation, turn);
+  }
+
+  const final = await modelCheckpoint(
+    input,
+    conversation,
+    `model:${turn}`,
+    input.bounded.finalPrompt,
+  );
+
+  if (final.kind === "overflow") {
+    throw new ContextOverflowError(final.message);
+  }
+
+  return final;
+}
+
+async function runBoundedLoop(
+  input: AgentLoopInput & { bounded: AgentBounds },
+): Promise<AgentLoopResult> {
+  let conversation = input.conversation;
+
+  for (let turn = 0; turn < input.bounded.maxTurn; turn++) {
+    const result = await boundedTurn(input, conversation, turn);
+    conversation = result.conversation;
+
+    if (!result.calls.length) {
+      return { outcome: "done", conversation };
+    }
+
+    conversation = await toolTurn(input, conversation, result.calls, turn);
+  }
+
+  return { outcome: "limit", conversation };
+}
+
 export async function runAgentLoop(input: AgentLoopInput): Promise<AgentLoopResult> {
+  if (input.bounded) {
+    return runBoundedLoop({ ...input, bounded: input.bounded });
+  }
+
+  const compact = input.compact;
+
+  if (!compact) {
+    throw new Error("Chat loops require compaction");
+  }
+
   let conversation = input.conversation;
   let thresholdOpen = true;
 
   for (let turn = 0; turn < MAX_TURN; turn++) {
     if (thresholdOpen && shouldCompact(conversation.context, input.prompt)) {
-      const compacted = await input.compact({
+      const compacted = await compact({
         conversation,
         trigger: "threshold",
         name: `compact:${turn}`,

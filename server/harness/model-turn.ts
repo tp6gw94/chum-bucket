@@ -39,6 +39,7 @@ export type ModelRequest = Readonly<{
   systemPrompts: string[];
   tools: ModelToolDefinition[];
   timeoutMs: number;
+  signal?: AbortSignal;
   append: (event: StreamChunk) => Promise<void>;
 }>;
 
@@ -213,7 +214,11 @@ export async function requestModelTurn(input: ModelRequest): Promise<Turn> {
       systemPrompts: input.systemPrompts,
       tools: input.tools,
       logger: resolveDebugOption(false),
-      request: { signal: AbortSignal.timeout(input.timeoutMs) },
+      request: {
+        signal: input.signal
+          ? AbortSignal.any([input.signal, AbortSignal.timeout(input.timeoutMs)])
+          : AbortSignal.timeout(input.timeoutMs),
+      },
     })
     .catch((error: unknown) => {
       throw toContextOverflow(error);

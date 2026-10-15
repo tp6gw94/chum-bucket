@@ -8,7 +8,10 @@ import {
   type CompactionEvent,
   type CompactionTrigger,
 } from "../../shared/compaction-event";
+import { parseTestingProjectionEvent } from "../../shared/testing";
 import { commandRunBody, parseComposerCommand } from "../composer-commands";
+import { withPublishedTasks } from "../lib/testing-api";
+import { mergeTestingView, mergeTestingViews, type TestingViews } from "../lib/testing-views";
 
 const threadSchema = z.object({ id: z.uuid(), title: z.string() });
 export type ThreadSummary = z.infer<typeof threadSchema>;
@@ -167,6 +170,7 @@ export function useThread(threadId: string) {
   const [phase, setPhase] = useState<ThreadPhase>("loading");
   const [error, setError] = useState<string | null>(null);
   const [compaction, setCompaction] = useState<CompactionEvent | null>(null);
+  const [testing, setTesting] = useState<TestingViews>({});
   const owner = useRef({
     phase: "loading" as ThreadPhase,
     mounted: true,
@@ -201,7 +205,13 @@ export function useThread(threadId: string) {
   }
 
   const connection = useMemo(() => {
-    const base = fetchServerSentEvents("/api/chat");
+    const base = fetchServerSentEvents("/api/chat", {
+      fetchClient: withPublishedTasks((views) => {
+        if (owner.mounted) {
+          setTesting((current) => mergeTestingViews(current, views));
+        }
+      }),
+    });
     let hydration: ReturnType<NonNullable<typeof base.hydrate>> | undefined;
 
     const observe = async function* (stream: AsyncIterable<StreamChunk>) {
@@ -209,6 +219,7 @@ export function useThread(threadId: string) {
         for await (const chunk of stream) {
           const terminal = terminalResult(chunk, owner.runId);
           const compacted = readCompactionEvent(chunk);
+          const view = parseTestingProjectionEvent(chunk);
 
           if (terminal) {
             owner.terminal = terminal;
@@ -216,6 +227,10 @@ export function useThread(threadId: string) {
 
           if (compacted && owner.mounted) {
             setCompaction(compacted);
+          }
+
+          if (view && owner.mounted) {
+            setTesting((current) => mergeTestingView(current, view));
           }
 
           yield chunk;
@@ -355,6 +370,9 @@ export function useThread(threadId: string) {
     phase,
     error,
     progress: compactionLines(compaction),
+    testing,
+    updateTesting: (view: Parameters<typeof mergeTestingView>[1]) =>
+      setTesting((current) => mergeTestingView(current, view)),
     send,
     navigate,
   };

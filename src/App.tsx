@@ -79,6 +79,8 @@ function ThreadPage({ threadId }: { threadId: string }) {
     progress: thread.progress,
     messages: thread.messages,
     kind: "main",
+    testing: thread.testing,
+    onTestingUpdate: thread.updateTesting,
   };
 
   const threadSummaries: ThreadSummary[] = threads.map((thread) => ({

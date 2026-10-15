@@ -12,6 +12,7 @@ import {
   RunRequestError,
   runInputSchema,
 } from "./harness/run-store";
+import { publishedTasks } from "./harness/testing-store";
 
 const app = new Hono();
 const bodySchema = z.object({
@@ -179,7 +180,9 @@ app.get("/", async (c) => {
     throw new RunRequestError(400, "A thread or run ID is required");
   }
 
-  return c.json(await hydrateThread(threadId));
+  const hydrated = await hydrateThread(threadId);
+
+  return c.json({ ...hydrated, publishedTasks: await publishedTasks(threadId) });
 });
 
 export default app;

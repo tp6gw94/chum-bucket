@@ -1,4 +1,6 @@
 import type { UIMessage } from "@tanstack/ai-react";
+import type { TestView } from "../../shared/testing";
+import type { TestingViews } from "../lib/testing-views";
 
 export type RunStatus = "running" | "idle";
 
@@ -14,6 +16,8 @@ export interface Pane {
   progress: string[];
   messages: ChatMessage[];
   kind: "main" | "agent";
+  testing?: TestingViews;
+  onTestingUpdate?: (view: TestView) => void;
 }
 
 export interface ThreadSummary {

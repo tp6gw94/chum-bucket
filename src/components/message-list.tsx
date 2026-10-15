@@ -7,8 +7,16 @@ import remarkGfm from "remark-gfm";
 import { Bubble, BubbleContent } from "@/components/ui/bubble";
 import { Marker, MarkerContent } from "@/components/ui/marker";
 import { Message, MessageContent, MessageGroup, MessageHeader } from "@/components/ui/message";
+import type { TestView } from "../../shared/testing";
+import type { TestingViews } from "../lib/testing-views";
+import { TestingPanel } from "./testing-panel";
 import { type ChatMessage } from "./types";
 import { ToolCall } from "./tool-call";
+
+type TestingProps = {
+  testing?: TestingViews;
+  onTestingUpdate?: (view: TestView) => void;
+};
 
 const assistantReplyParser = createParser(openuiLibrary.toJSONSchema(), openuiLibrary.root);
 const openuiStart = /^\s*\$?[A-Za-z_]\w*\s*=(?!=)/;
@@ -66,11 +74,28 @@ function SummaryMessage({ text }: { text: string }) {
   );
 }
 
+function ToolCallWithTesting({
+  part,
+  testing,
+  onTestingUpdate,
+}: TestingProps & { part: Extract<ChatMessage["parts"][number], { type: "tool-call" }> }) {
+  const view = part.name === "delegate_task" ? testing?.[part.id] : undefined;
+
+  return (
+    <>
+      <ToolCall part={part} />
+      {view ? <TestingPanel view={view} onUpdate={onTestingUpdate ?? (() => undefined)} /> : null}
+    </>
+  );
+}
+
 function ChatMessageRow({
   message,
   agent,
   isStreaming,
-}: {
+  testing,
+  onTestingUpdate,
+}: TestingProps & {
   message: ChatMessage;
   agent: string;
   isStreaming: boolean;
@@ -102,7 +127,14 @@ function ChatMessageRow({
         {message.role === "assistant" ? (
           <div className="flex min-w-0 flex-col gap-2">
             {message.parts.map((part) =>
-              part.type === "tool-call" ? <ToolCall key={part.id} part={part} /> : null,
+              part.type === "tool-call" ? (
+                <ToolCallWithTesting
+                  key={part.id}
+                  part={part}
+                  testing={testing}
+                  onTestingUpdate={onTestingUpdate}
+                />
+              ) : null,
             )}
             {text.trim() !== "" ? <AssistantMessage text={text} isStreaming={isStreaming} /> : null}
           </div>
@@ -120,7 +152,9 @@ export function MessageList({
   messages,
   agent,
   isStreaming = false,
-}: {
+  testing,
+  onTestingUpdate,
+}: TestingProps & {
   messages: ChatMessage[];
   agent: string;
   isStreaming?: boolean;
@@ -135,6 +169,8 @@ export function MessageList({
           message={message}
           agent={agent}
           isStreaming={message.id === streamingId && message.role === "assistant"}
+          testing={testing}
+          onTestingUpdate={onTestingUpdate}
         />
       ))}
     </MessageGroup>

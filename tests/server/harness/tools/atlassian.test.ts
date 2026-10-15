@@ -18,6 +18,7 @@ import {
   fakeToken,
   jiraSchema,
   mcpFixture,
+  scopeAccess,
   withMcpEnvironment,
 } from "../../../fixtures/mcp-fixture";
 
@@ -173,7 +174,7 @@ test("unconfigured runs expose local tools and execute filesystem reads without 
       await withTemporaryDirectory(async (directory) => {
         const path = join(directory, "local.txt");
         await writeFile(path, "local data");
-        await withRunTools(async (tools) => {
+        await withRunTools(scopeAccess, async (tools) => {
           assert.deepEqual(
             (await modelTools(tools, [])).map((tool) => tool.name),
             [...localNames, codeModeName],
@@ -217,11 +218,13 @@ test("partial, malformed, and endpoint-only configuration fails closed before lo
         process.env.JIRA_API_TOKEN = token;
         process.env.ATLASSIAN_MCP_URL = fixture.url;
         await assert.rejects(
-          withRunTools((tools) => modelTools(tools, [])),
+          withRunTools(scopeAccess, (tools) => modelTools(tools, [])),
           safeError(/JIRA_/),
         );
         await assert.rejects(
-          withRunTools((tools) => tools.executeTool([], call("read", { path: "unused" }), context)),
+          withRunTools(scopeAccess, (tools) =>
+            tools.executeTool([], call("read", { path: "unused" }), context),
+          ),
           safeError(/JIRA_/),
         );
       }
@@ -239,7 +242,7 @@ test("partial, malformed, and endpoint-only configuration fails closed before lo
         process.env.JIRA_API_TOKEN = fakeToken;
         process.env.ATLASSIAN_MCP_URL = endpoint;
         await assert.rejects(
-          withRunTools((tools) => modelTools(tools, [])),
+          withRunTools(scopeAccess, (tools) => modelTools(tools, [])),
           safeError(/ATLASSIAN_MCP_URL/),
         );
       }
@@ -248,7 +251,7 @@ test("partial, malformed, and endpoint-only configuration fails closed before lo
       process.env.JIRA_API_TOKEN = "";
       process.env.ATLASSIAN_MCP_URL = fixture.url;
       await assert.rejects(
-        withRunTools((tools) => modelTools(tools, [])),
+        withRunTools(scopeAccess, (tools) => modelTools(tools, [])),
         safeError(/ATLASSIAN_MCP_URL/),
       );
       assert.deepEqual(fixture.requests, []);
@@ -262,7 +265,7 @@ test("HTTP initializes once, paginates, retains native schemas and executes disc
   const fixture = mcpFixture();
   await withMcpEnvironment(
     () =>
-      withRunTools(async (tools) => {
+      withRunTools(scopeAccess, async (tools) => {
         const [initial, concurrent] = await Promise.all([
           modelTools(tools, []),
           modelTools(tools, []),
@@ -350,7 +353,7 @@ test("Jira credentials automatically expose Confluence and unrelated process ove
   const fixture = mcpFixture();
   await withMcpEnvironment(
     () =>
-      withRunTools(async (tools) => {
+      withRunTools(scopeAccess, async (tools) => {
         const history = await discover(tools, remoteNames);
         process.env.READ_ONLY_MODE = "false";
         process.env.ENABLED_TOOLS = "jira_delete_issue,jira_add_comment";
@@ -386,7 +389,7 @@ test("write tools, official aliases, generic tools and absent optional tools nev
     const fixture = mcpFixture({ pages });
     await withMcpEnvironment(
       () =>
-        withRunTools(async (tools) => {
+        withRunTools(scopeAccess, async (tools) => {
           const granted =
             pages[0] === coreTools ? ["jira_get_issue", "confluence_get_page"] : remoteNames;
           const history = await discover(tools, granted);
@@ -460,7 +463,7 @@ test("required Jira and Confluence tools, duplicate names and malformed schemas 
     await withMcpEnvironment(
       async () => {
         await assert.rejects(
-          withRunTools((tools) => modelTools(tools, [])),
+          withRunTools(scopeAccess, (tools) => modelTools(tools, [])),
           safeError(pattern),
         );
         assert.deepEqual(fixture.calls(), []);
@@ -477,7 +480,7 @@ test("an unreachable local service fails with safe actionable setup guidance and
     async () => {
       process.env.ATLASSIAN_MCP_URL = "http://127.0.0.1:1/mcp";
       await assert.rejects(
-        withRunTools((tools) => modelTools(tools, [])),
+        withRunTools(scopeAccess, (tools) => modelTools(tools, [])),
         safeError(/pnpm mcp:atlassian/),
       );
       assert.deepEqual(fixture.requests, []);
@@ -500,7 +503,7 @@ test("initialization and catalog errors close the failed client and concurrent a
     });
     await withMcpEnvironment(
       () =>
-        withRunTools(async (tools) => {
+        withRunTools(scopeAccess, async (tools) => {
           const outcomes = await Promise.allSettled([modelTools(tools, []), modelTools(tools, [])]);
           for (const outcome of outcomes) {
             assert.equal(outcome.status, "rejected");
@@ -537,7 +540,7 @@ test("MCP isError is never a success and a failed invocation closes its client w
   });
   await withMcpEnvironment(
     () =>
-      withRunTools(async (tools) => {
+      withRunTools(scopeAccess, async (tools) => {
         const history = await discover(tools, ["jira_get_issue"]);
         await assert.rejects(
           tools.executeTool(history, jiraCall, context),
@@ -558,7 +561,7 @@ test("terminated HTTP connections report safe failures and recover without resen
     const fixture = mcpFixture({ rules: [{ method, once: true, destroy: true }] });
     await withMcpEnvironment(
       () =>
-        withRunTools(async (tools) => {
+        withRunTools(scopeAccess, async (tools) => {
           if (method === "initialize") {
             await assert.rejects(
               discover(tools, ["jira_get_issue"]),
@@ -592,7 +595,7 @@ test("scope teardown during initialization aborts the in-flight request and pres
       async () => {
         let discovery: Promise<void> | undefined;
         await assert.rejects(
-          withRunTools(async (tools) => {
+          withRunTools(scopeAccess, async (tools) => {
             discovery = assert.rejects(modelTools(tools, []), /cancelled or timed out/);
             await fixture.waitFor(method);
             throw new Error("Primary callback failure");
@@ -617,7 +620,7 @@ test("unawaited discovery cannot start a client after scope teardown", async () 
     async () => {
       let discovery: Promise<void> | undefined;
       assert.equal(
-        await withRunTools(async (tools) => {
+        await withRunTools(scopeAccess, async (tools) => {
           discovery = assert.rejects(
             modelTools(tools, []),
             /scope is closed|cancelled or timed out/,
@@ -641,7 +644,7 @@ test("retained tools reject local and remote work after teardown without contact
     await withMcpEnvironment(
       async () => {
         let retained: RunTools | undefined;
-        await withRunTools(async (tools) => {
+        await withRunTools(scopeAccess, async (tools) => {
           retained = tools;
         });
         assert.ok(retained);
@@ -674,7 +677,7 @@ test("cancellation before the first HTTP request reaches the service sends nothi
   await withMcpEnvironment(
     async () => {
       const controller = new AbortController();
-      const invocation = withRunTools((tools) =>
+      const invocation = withRunTools(scopeAccess, (tools) =>
         tools.executeTool([], discoveryCall(["jira_get_issue"]), {
           ...context,
           abortSignal: controller.signal,
@@ -698,7 +701,7 @@ test("pre-cancelled calls never contact the service", async () => {
   const fixture = mcpFixture();
   await withMcpEnvironment(
     () =>
-      withRunTools(async (tools) => {
+      withRunTools(scopeAccess, async (tools) => {
         await assert.rejects(
           tools.executeTool([], discoveryCall(["jira_get_issue"]), {
             ...context,
@@ -720,7 +723,7 @@ for (const method of ["initialize", "tools/list", "tools/call"]) {
     });
     await withMcpEnvironment(
       () =>
-        withRunTools(async (tools) => {
+        withRunTools(scopeAccess, async (tools) => {
           const history = method === "tools/call" ? await discover(tools, ["jira_get_issue"]) : [];
           const controller = new AbortController();
           const invocation =
@@ -780,7 +783,7 @@ for (const method of ["initialize", "tools/list", "tools/call"]) {
       async () => {
         let history: UIMessage[] | undefined;
         const rejected = assert.rejects(
-          withRunTools(async (tools) => {
+          withRunTools(scopeAccess, async (tools) => {
             history =
               method === "tools/call" ? await discover(tools, ["jira_get_issue"]) : undefined;
             if (method === "tools/call") {
@@ -830,7 +833,7 @@ test("cleared deadlines cannot abort a long-lived session after successful initi
   const fixture = mcpFixture();
   await withMcpEnvironment(
     () =>
-      withRunTools(async (tools) => {
+      withRunTools(scopeAccess, async (tools) => {
         await modelTools(tools, []);
         const history = await discover(tools, ["jira_get_issue"]);
         assert.deepEqual(await tools.executeTool(history, jiraCall, context), { issue: "TEST-1" });
@@ -853,7 +856,7 @@ test("scope cleanup on success and primary callback failure leaves no in-flight 
     const fixture = mcpFixture();
     await withMcpEnvironment(
       async () => {
-        const result = withRunTools(async (tools) => {
+        const result = withRunTools(scopeAccess, async (tools) => {
           await modelTools(tools, []);
           if (failure) {
             throw new Error("Primary callback failure");
@@ -888,7 +891,7 @@ test("concurrent scopes own independent HTTP sessions", async () => {
   await withMcpEnvironment(
     () =>
       Promise.all([
-        withRunTools(async (tools) => {
+        withRunTools(scopeAccess, async (tools) => {
           await modelTools(tools, []);
           const history = await discover(tools, ["jira_get_issue"]);
           await ready.promise;
@@ -898,7 +901,7 @@ test("concurrent scopes own independent HTTP sessions", async () => {
           );
           failed.resolve();
         }),
-        withRunTools(async (tools) => {
+        withRunTools(scopeAccess, async (tools) => {
           await modelTools(tools, []);
           const history = await discover(tools, ["jira_get_issue"]);
           ready.resolve();
@@ -952,7 +955,7 @@ test("Jira and Confluence user emails matching the login remain readable in stru
     });
     await withMcpEnvironment(
       () =>
-        withRunTools(async (tools) => {
+        withRunTools(scopeAccess, async (tools) => {
           const history = await discover(tools, ["jira_get_issue", "confluence_get_page"]);
           for (const { request, output } of cases) {
             assert.deepEqual(
@@ -989,7 +992,7 @@ test("credential forms in catalog descriptions and schemas, including forbidden 
       await withMcpEnvironment(
         async () => {
           await assert.rejects(
-            withRunTools((tools) => modelTools(tools, [])),
+            withRunTools(scopeAccess, (tools) => modelTools(tools, [])),
             safeError(/configured Atlassian credentials/),
           );
           assert.deepEqual(fixture.calls(), []);
@@ -1032,7 +1035,7 @@ test("credential forms in remote output, keys and MCP errors never escape to cal
       });
       await withMcpEnvironment(
         async () => {
-          await withRunTools(async (tools) => {
+          await withRunTools(scopeAccess, async (tools) => {
             const history = await discover(tools, [request.name]);
             await assert.rejects(
               tools.executeTool(history, request, context),
@@ -1057,7 +1060,9 @@ test("local filesystem results and Error causes cannot reveal snapshot credentia
         for (const secret of credentialForms) {
           await writeFile(path, secret);
           await assert.rejects(
-            withRunTools((tools) => tools.executeTool([], call("read", { path }), context)),
+            withRunTools(scopeAccess, (tools) =>
+              tools.executeTool([], call("read", { path }), context),
+            ),
             safeError(/configured Atlassian credentials/),
           );
         }
@@ -1069,7 +1074,9 @@ test("local filesystem results and Error causes cannot reveal snapshot credentia
           },
         );
         await assert.rejects(
-          withRunTools((tools) => tools.executeTool([], call("read", { path }), context)),
+          withRunTools(scopeAccess, (tools) =>
+            tools.executeTool([], call("read", { path }), context),
+          ),
           safeError(/configured Atlassian credentials/),
         );
         handler.mock.restore();
@@ -1108,7 +1115,7 @@ test("configuration and credential guards remain a single snapshot when process 
   const fixture = mcpFixture();
   await withMcpEnvironment(
     () =>
-      withRunTools(async (tools) => {
+      withRunTools(scopeAccess, async (tools) => {
         await modelTools(tools, []);
         const history = await discover(tools, ["jira_get_issue"]);
         process.env.JIRA_BASE_URL = "https://changed.atlassian.net";
@@ -1134,7 +1141,7 @@ test("jira_get_issue never updates view history, including omitted or explicitly
   const fixture = mcpFixture();
   await withMcpEnvironment(
     () =>
-      withRunTools(async (tools) => {
+      withRunTools(scopeAccess, async (tools) => {
         const history = await discover(tools, ["jira_get_issue"]);
         for (const update_history of [undefined, true, false]) {
           const input = {
@@ -1165,7 +1172,7 @@ test("discovery rejects malformed, unknown and unavailable requests as a whole a
   const fixture = mcpFixture({ pages: [coreTools] });
   await withMcpEnvironment(
     () =>
-      withRunTools(async (tools) => {
+      withRunTools(scopeAccess, async (tools) => {
         const initial = await modelTools(tools, []);
         const discovery = initial.find((tool) => tool.name === discoveryName)!;
         assert.deepEqual(discovery.inputSchema, {
@@ -1240,7 +1247,7 @@ test("only complete correlated discovery history grants tools and historical sch
   const fixture = mcpFixture();
   await withMcpEnvironment(
     () =>
-      withRunTools(async (tools) => {
+      withRunTools(scopeAccess, async (tools) => {
         const initial = [...localNames, discoveryName, codeModeName];
         const forgedSchema = exchange({
           content: JSON.stringify({
@@ -1371,7 +1378,7 @@ test("undiscovered native calls are rejected before any MCP dispatch and succeed
   const fixture = mcpFixture();
   await withMcpEnvironment(
     () =>
-      withRunTools(async (tools) => {
+      withRunTools(scopeAccess, async (tools) => {
         await assert.rejects(
           tools.executeTool([], jiraCall, context),
           /discover_atlassian_tools first/,

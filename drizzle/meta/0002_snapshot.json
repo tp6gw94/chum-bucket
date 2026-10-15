@@ -1,0 +1,1052 @@
+{
+  "id": "4a7f71f4-be6c-440a-b86e-26f051c73a8f",
+  "prevId": "caef54a6-6dfe-481a-9369-56a154543ab8",
+  "version": "7",
+  "dialect": "postgresql",
+  "tables": {
+    "public.chat_events": {
+      "name": "chat_events",
+      "schema": "",
+      "columns": {
+        "run_id": {
+          "name": "run_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "sequence": {
+          "name": "sequence",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "event_key": {
+          "name": "event_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "payload": {
+          "name": "payload",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "chat_events_run_id_chat_runs_id_fk": {
+          "name": "chat_events_run_id_chat_runs_id_fk",
+          "tableFrom": "chat_events",
+          "tableTo": "chat_runs",
+          "columnsFrom": ["run_id"],
+          "columnsTo": ["id"],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "chat_events_run_id_sequence_pk": {
+          "name": "chat_events_run_id_sequence_pk",
+          "columns": ["run_id", "sequence"]
+        }
+      },
+      "uniqueConstraints": {
+        "chat_events_key_unique": {
+          "name": "chat_events_key_unique",
+          "nullsNotDistinct": false,
+          "columns": ["run_id", "event_key"]
+        }
+      },
+      "policies": {},
+      "checkConstraints": {
+        "chat_events_sequence_nonnegative": {
+          "name": "chat_events_sequence_nonnegative",
+          "value": "\"chat_events\".\"sequence\" >= 0"
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.chat_runs": {
+      "name": "chat_runs",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "thread_id": {
+          "name": "thread_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "request": {
+          "name": "request",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "accepted": {
+          "name": "accepted",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "projection": {
+          "name": "projection",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "state": {
+          "name": "state",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'pending'"
+        },
+        "next_sequence": {
+          "name": "next_sequence",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "chat_runs_pending_idx": {
+          "name": "chat_runs_pending_idx",
+          "columns": [
+            {
+              "expression": "state",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "chat_runs_thread_id_threads_id_fk": {
+          "name": "chat_runs_thread_id_threads_id_fk",
+          "tableFrom": "chat_runs",
+          "tableTo": "threads",
+          "columnsFrom": ["thread_id"],
+          "columnsTo": ["id"],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "chat_runs_state_check": {
+          "name": "chat_runs_state_check",
+          "value": "\"chat_runs\".\"state\" in ('pending', 'succeeded', 'failed')"
+        },
+        "chat_runs_sequence_nonnegative": {
+          "name": "chat_runs_sequence_nonnegative",
+          "value": "\"chat_runs\".\"next_sequence\" >= 0"
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.testing_artifacts": {
+      "name": "testing_artifacts",
+      "schema": "",
+      "columns": {
+        "ref": {
+          "name": "ref",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "thread_id": {
+          "name": "thread_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "operation_id": {
+          "name": "operation_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "role": {
+          "name": "role",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "kind": {
+          "name": "kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "scope_digest": {
+          "name": "scope_digest",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "payload_digest": {
+          "name": "payload_digest",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "metadata": {
+          "name": "metadata",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "payload": {
+          "name": "payload",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "testing_artifacts_thread_idx": {
+          "name": "testing_artifacts_thread_idx",
+          "columns": [
+            {
+              "expression": "thread_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "testing_artifacts_thread_id_threads_id_fk": {
+          "name": "testing_artifacts_thread_id_threads_id_fk",
+          "tableFrom": "testing_artifacts",
+          "tableTo": "threads",
+          "columnsFrom": ["thread_id"],
+          "columnsTo": ["id"],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "testing_artifacts_operation_id_testing_operations_id_fk": {
+          "name": "testing_artifacts_operation_id_testing_operations_id_fk",
+          "tableFrom": "testing_artifacts",
+          "tableTo": "testing_operations",
+          "columnsFrom": ["operation_id"],
+          "columnsTo": ["id"],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.testing_decisions": {
+      "name": "testing_decisions",
+      "schema": "",
+      "columns": {
+        "operation_id": {
+          "name": "operation_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "decision_index": {
+          "name": "decision_index",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "decision_key": {
+          "name": "decision_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "kind": {
+          "name": "kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "payload": {
+          "name": "payload",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "testing_decisions_operation_id_testing_operations_id_fk": {
+          "name": "testing_decisions_operation_id_testing_operations_id_fk",
+          "tableFrom": "testing_decisions",
+          "tableTo": "testing_operations",
+          "columnsFrom": ["operation_id"],
+          "columnsTo": ["id"],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "testing_decisions_operation_id_decision_index_pk": {
+          "name": "testing_decisions_operation_id_decision_index_pk",
+          "columns": ["operation_id", "decision_index"]
+        }
+      },
+      "uniqueConstraints": {
+        "testing_decisions_key_unique": {
+          "name": "testing_decisions_key_unique",
+          "nullsNotDistinct": false,
+          "columns": ["operation_id", "decision_key"]
+        }
+      },
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.testing_deliveries": {
+      "name": "testing_deliveries",
+      "schema": "",
+      "columns": {
+        "delivery_key": {
+          "name": "delivery_key",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "operation_id": {
+          "name": "operation_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "task_id": {
+          "name": "task_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "kind": {
+          "name": "kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "acknowledgement": {
+          "name": "acknowledgement",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "testing_deliveries_operation_id_testing_operations_id_fk": {
+          "name": "testing_deliveries_operation_id_testing_operations_id_fk",
+          "tableFrom": "testing_deliveries",
+          "tableTo": "testing_operations",
+          "columnsFrom": ["operation_id"],
+          "columnsTo": ["id"],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "testing_deliveries_task_id_testing_tasks_id_fk": {
+          "name": "testing_deliveries_task_id_testing_tasks_id_fk",
+          "tableFrom": "testing_deliveries",
+          "tableTo": "testing_tasks",
+          "columnsFrom": ["task_id"],
+          "columnsTo": ["id"],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.testing_operations": {
+      "name": "testing_operations",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "parent_run_id": {
+          "name": "parent_run_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "thread_id": {
+          "name": "thread_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "request_key": {
+          "name": "request_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "role": {
+          "name": "role",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "intent": {
+          "name": "intent",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "runtime": {
+          "name": "runtime",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "deadline": {
+          "name": "deadline",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "cancel_accepted_at": {
+          "name": "cancel_accepted_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "finished_at": {
+          "name": "finished_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "terminal_outcome": {
+          "name": "terminal_outcome",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "testing_operations_thread_idx": {
+          "name": "testing_operations_thread_idx",
+          "columns": [
+            {
+              "expression": "thread_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "testing_operations_open_idx": {
+          "name": "testing_operations_open_idx",
+          "columns": [
+            {
+              "expression": "finished_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "testing_operations_parent_run_id_chat_runs_id_fk": {
+          "name": "testing_operations_parent_run_id_chat_runs_id_fk",
+          "tableFrom": "testing_operations",
+          "tableTo": "chat_runs",
+          "columnsFrom": ["parent_run_id"],
+          "columnsTo": ["id"],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "testing_operations_thread_id_threads_id_fk": {
+          "name": "testing_operations_thread_id_threads_id_fk",
+          "tableFrom": "testing_operations",
+          "tableTo": "threads",
+          "columnsFrom": ["thread_id"],
+          "columnsTo": ["id"],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {
+        "testing_operations_request_unique": {
+          "name": "testing_operations_request_unique",
+          "nullsNotDistinct": false,
+          "columns": ["parent_run_id", "request_key"]
+        }
+      },
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.testing_pins": {
+      "name": "testing_pins",
+      "schema": "",
+      "columns": {
+        "operation_id": {
+          "name": "operation_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "ref": {
+          "name": "ref",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "testing_pins_operation_id_testing_operations_id_fk": {
+          "name": "testing_pins_operation_id_testing_operations_id_fk",
+          "tableFrom": "testing_pins",
+          "tableTo": "testing_operations",
+          "columnsFrom": ["operation_id"],
+          "columnsTo": ["id"],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "testing_pins_ref_testing_artifacts_ref_fk": {
+          "name": "testing_pins_ref_testing_artifacts_ref_fk",
+          "tableFrom": "testing_pins",
+          "tableTo": "testing_artifacts",
+          "columnsFrom": ["ref"],
+          "columnsTo": ["ref"],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "testing_pins_operation_id_ref_pk": {
+          "name": "testing_pins_operation_id_ref_pk",
+          "columns": ["operation_id", "ref"]
+        }
+      },
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.testing_publications": {
+      "name": "testing_publications",
+      "schema": "",
+      "columns": {
+        "operation_id": {
+          "name": "operation_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "version": {
+          "name": "version",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "digest": {
+          "name": "digest",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "view": {
+          "name": "view",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "testing_publications_operation_id_testing_operations_id_fk": {
+          "name": "testing_publications_operation_id_testing_operations_id_fk",
+          "tableFrom": "testing_publications",
+          "tableTo": "testing_operations",
+          "columnsFrom": ["operation_id"],
+          "columnsTo": ["id"],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "testing_publications_operation_id_version_pk": {
+          "name": "testing_publications_operation_id_version_pk",
+          "columns": ["operation_id", "version"]
+        }
+      },
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.testing_receipts": {
+      "name": "testing_receipts",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "task_id": {
+          "name": "task_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "attempt": {
+          "name": "attempt",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "slot": {
+          "name": "slot",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "native_name": {
+          "name": "native_name",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "route": {
+          "name": "route",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "input": {
+          "name": "input",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "output": {
+          "name": "output",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "input_digest": {
+          "name": "input_digest",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "output_digest": {
+          "name": "output_digest",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "bindings": {
+          "name": "bindings",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "testing_receipts_task_idx": {
+          "name": "testing_receipts_task_idx",
+          "columns": [
+            {
+              "expression": "task_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "testing_receipts_task_id_testing_tasks_id_fk": {
+          "name": "testing_receipts_task_id_testing_tasks_id_fk",
+          "tableFrom": "testing_receipts",
+          "tableTo": "testing_tasks",
+          "columnsFrom": ["task_id"],
+          "columnsTo": ["id"],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {
+        "testing_receipts_slot_unique": {
+          "name": "testing_receipts_slot_unique",
+          "nullsNotDistinct": false,
+          "columns": ["task_id", "attempt", "slot", "native_name"]
+        }
+      },
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.testing_tasks": {
+      "name": "testing_tasks",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "operation_id": {
+          "name": "operation_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "role": {
+          "name": "role",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "child_workflow_id": {
+          "name": "child_workflow_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "attempt_nonce": {
+          "name": "attempt_nonce",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "input_digest": {
+          "name": "input_digest",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "input": {
+          "name": "input",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "model_steps": {
+          "name": "model_steps",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "native_calls": {
+          "name": "native_calls",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "nested_calls": {
+          "name": "nested_calls",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "step_attempts": {
+          "name": "step_attempts",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'{}'::jsonb"
+        },
+        "activity": {
+          "name": "activity",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "testing_tasks_operation_id_testing_operations_id_fk": {
+          "name": "testing_tasks_operation_id_testing_operations_id_fk",
+          "tableFrom": "testing_tasks",
+          "tableTo": "testing_operations",
+          "columnsFrom": ["operation_id"],
+          "columnsTo": ["id"],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {
+        "testing_tasks_role_unique": {
+          "name": "testing_tasks_role_unique",
+          "nullsNotDistinct": false,
+          "columns": ["operation_id", "role"]
+        },
+        "testing_tasks_workflow_unique": {
+          "name": "testing_tasks_workflow_unique",
+          "nullsNotDistinct": false,
+          "columns": ["child_workflow_id"]
+        }
+      },
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.threads": {
+      "name": "threads",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "title": {
+          "name": "title",
+          "type": "varchar(255)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "agent": {
+          "name": "agent",
+          "type": "varchar(255)",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'default'"
+        },
+        "revision": {
+          "name": "revision",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "active_run_id": {
+          "name": "active_run_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "messages": {
+          "name": "messages",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'[]'::jsonb"
+        },
+        "context_anchor": {
+          "name": "context_anchor",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "parent_thread_id": {
+          "name": "parent_thread_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "closed_at": {
+          "name": "closed_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "threads_updated_at_id_idx": {
+          "name": "threads_updated_at_id_idx",
+          "columns": [
+            {
+              "expression": "updated_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "threads_parent_thread_id_idx": {
+          "name": "threads_parent_thread_id_idx",
+          "columns": [
+            {
+              "expression": "parent_thread_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "threads_parent_thread_id_threads_id_fk": {
+          "name": "threads_parent_thread_id_threads_id_fk",
+          "tableFrom": "threads",
+          "tableTo": "threads",
+          "columnsFrom": ["parent_thread_id"],
+          "columnsTo": ["id"],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "threads_revision_nonnegative": {
+          "name": "threads_revision_nonnegative",
+          "value": "\"threads\".\"revision\" >= 0"
+        }
+      },
+      "isRLSEnabled": false
+    }
+  },
+  "enums": {},
+  "schemas": {},
+  "sequences": {},
+  "roles": {},
+  "policies": {},
+  "views": {},
+  "_meta": {
+    "columns": {},
+    "schemas": {},
+    "tables": {}
+  }
+}

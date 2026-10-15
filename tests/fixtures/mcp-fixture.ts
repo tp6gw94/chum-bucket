@@ -3,6 +3,13 @@ import { randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { setTimeout as delay } from "node:timers/promises";
+import type { ToolAccess } from "../../server/harness/agents";
+import { atlassianToolNames } from "../../server/harness/tools/atlassian-policy";
+
+export const scopeAccess: ToolAccess = {
+  permits: (name) => name !== "delegate_task",
+  atlassianNames: atlassianToolNames,
+};
 
 export const fakeEmail = "mcp-test@example.invalid";
 export const fakeToken = "offline-atlassian-token-7319";

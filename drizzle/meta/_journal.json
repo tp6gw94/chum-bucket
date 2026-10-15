@@ -15,6 +15,13 @@
       "when": 1792046350222,
       "tag": "0001_context_compaction",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1792048486004,
+      "tag": "0002_testing_delegation",
+      "breakpoints": true
     }
   ]
 }

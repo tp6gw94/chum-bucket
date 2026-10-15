@@ -14,11 +14,10 @@ import {
   type ConversationState,
   type RunProjection,
 } from "./conversation";
-import { openuiInstructions } from "./prompts";
+import { MODEL, agentRegistry, type ConversationAgentId } from "./agents";
 import { snapshot } from "./model-turn";
 
-export const BUILD = "durable-chat-loop-v6";
-export const MODEL = "deepseek-ai/DeepSeek-V4.1-Flash";
+export const BUILD = "durable-chat-loop-v7";
 export const runIdSchema = z
   .string()
   .min(1)
@@ -50,13 +49,14 @@ export type RunInput = z.infer<typeof runInputSchema>;
 export type AcceptedRun = RunInput &
   RunProjection & {
     parentContext?: UIMessage[];
+    agent: ConversationAgentId;
     prompt: string;
     model: typeof MODEL;
     build: typeof BUILD;
   };
 type RunRow = typeof chatRunsTable.$inferSelect;
 type ThreadRow = typeof threadsTable.$inferSelect;
-type Transaction = Parameters<Parameters<typeof import("../db").db.transaction>[0]>[0];
+export type Transaction = Parameters<Parameters<typeof import("../db").db.transaction>[0]>[0];
 export const database = async () => (await import("../db")).db;
 
 export class RunRequestError extends Error {
@@ -216,11 +216,13 @@ export async function persistRun(value: RunInput) {
     }
 
     const projection = threadProjection(thread);
+    const agent: ConversationAgentId = thread.parent_thread_id ? "side" : "main";
     const run: AcceptedRun = {
       ...input,
       ...projection,
       ...(await acceptedMessages(tx, thread, input)),
-      prompt: openuiInstructions(),
+      agent,
+      prompt: agentRegistry[agent].systemPrompt(),
       model: MODEL,
       build: BUILD,
     };
@@ -273,6 +275,23 @@ export async function emit(runId: string, event: StreamChunk, conversation?: Con
       await saveProjection(tx, runId, conversation);
     }
   });
+}
+
+export async function appendRunEvent(
+  tx: Transaction,
+  runId: string,
+  key: string,
+  event: StreamChunk,
+): Promise<boolean> {
+  const { run } = await lockRun(tx, runId);
+
+  if (run.state !== "pending") {
+    return false;
+  }
+
+  await appendEvent(tx, run, key, event);
+
+  return true;
 }
 
 export async function recordCompaction(

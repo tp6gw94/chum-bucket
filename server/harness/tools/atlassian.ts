@@ -24,7 +24,11 @@ export type CredentialGuard = (value: unknown) => void;
 export type AtlassianScope = Readonly<{
   getModelTools: <T>(
     messages: readonly UIMessage[],
-    compose: (granted: AtlassianCatalog, discovery: ModelTool | undefined) => T,
+    compose: (
+      granted: AtlassianCatalog,
+      discovery: ModelTool | undefined,
+      advertised: readonly string[],
+    ) => T,
   ) => Promise<T>;
   executeTool: (
     messages: readonly UIMessage[],
@@ -51,7 +55,7 @@ type RemoteSession = Readonly<{
 
 const MCP_TIMEOUT_MS = 60_000;
 
-const discoveryToolName = "discover_atlassian_tools";
+export const discoveryToolName = "discover_atlassian_tools";
 
 const discoveryRequestSchema = z.object({ toolNames: z.array(z.string()).min(1) }).strict();
 
@@ -69,7 +73,7 @@ const discoveryResultSchema = z
   })
   .strict();
 
-function discoveryDefinition(names: readonly string[]): ModelTool {
+export function discoveryDefinition(names: readonly string[]): ModelTool {
   return {
     name: discoveryToolName,
     description:
@@ -803,6 +807,7 @@ export async function withAtlassianScope<T>(
           const advertised = compose(
             selectDefinitions(catalog, grantedNames(messages, config)),
             advertisedDiscovery(catalog),
+            [...(catalog?.registrations.keys() ?? [])],
           );
           guardCredentials(advertised, config);
 

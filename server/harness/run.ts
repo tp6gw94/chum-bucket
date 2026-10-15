@@ -2,10 +2,12 @@ import { setTimeout as delay } from "node:timers/promises";
 import { DBOS } from "@dbos-inc/dbos-sdk";
 import type { UIMessage } from "@tanstack/ai";
 import type { CompactionTrigger } from "../../shared/compaction-event";
+import { agentAccess, MODEL } from "./agents";
 import {
   runAgentLoop,
   type AgentCheckpoint,
   type AgentCompact,
+  type AgentOrchestration,
   type AgentSession,
 } from "./agent-loop";
 import {
@@ -17,9 +19,11 @@ import {
 import { conversationFromProjection, type ConversationState } from "./conversation";
 import type { ChatStream } from "./model-turn";
 import { withRunTools, type RunTools } from "./tools";
+import { delegateTaskToolName } from "./tools/delegate-task";
+import { delegateTask, DelegationRejected } from "./testing-run";
+import { reconcileTestingOperations, registerTestingQueue } from "./testing-child";
 import {
   BUILD,
-  MODEL,
   RunRequestError,
   database,
   persistRun,
@@ -153,6 +157,32 @@ async function seededConversation(run: AcceptedRun): Promise<ConversationState> 
   return result.status === "done" ? result.conversation : conversation;
 }
 
+function testingOrchestration(run: AcceptedRun): AgentOrchestration | undefined {
+  if (run.agent !== "main") {
+    return undefined;
+  }
+
+  return async (call) => {
+    if (call.name !== delegateTaskToolName) {
+      return { state: "unhandled" };
+    }
+
+    try {
+      return { state: "handled", output: await delegateTask(run, call) };
+    } catch (failure) {
+      const message =
+        failure instanceof Error ? failure.message.slice(0, 2_000) : "Delegation failed";
+      const decisions = failure instanceof DelegationRejected ? failure.decisions : undefined;
+
+      return {
+        state: "handled",
+        output: decisions ? { error: message, decisions } : { error: message },
+        error: true,
+      };
+    }
+  };
+}
+
 export async function executeRun(run: AcceptedRun) {
   if (run.build !== BUILD || run.model !== MODEL) {
     throw new Error("Incompatible run build");
@@ -163,8 +193,9 @@ export async function executeRun(run: AcceptedRun) {
   }
 
   const conversation = await seededConversation(run);
+  const orchestration = testingOrchestration(run);
 
-  return withRunTools(async (tools) => {
+  return withRunTools(agentAccess(run.agent), async (tools) => {
     const result = await runAgentLoop({
       session: runSession(run, tools),
       conversation,
@@ -172,6 +203,7 @@ export async function executeRun(run: AcceptedRun) {
       prompt: run.prompt,
       checkpoint: runCheckpoint,
       compact: runCompaction(run),
+      ...(orchestration ? { orchestration } : {}),
     });
 
     if (result.outcome === "limit") {
@@ -228,7 +260,9 @@ export async function launchChatRuntime() {
 
   try {
     await DBOS.launch();
+    await registerTestingQueue();
     await reconcileRuns();
+    await reconcileTestingOperations();
   } catch (error) {
     await DBOS.shutdown();
     const db = await database();
@@ -248,6 +282,7 @@ export async function launchChatRuntime() {
 
       try {
         await reconcileRuns();
+        await reconcileTestingOperations();
       } catch (error) {
         console.error("Chat reconciliation failed", error);
       }
