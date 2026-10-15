@@ -1,5 +1,6 @@
 import { PlusIcon, XIcon } from "lucide-react";
 import type { ComposerCommand } from "../composer-commands";
+import type { ToolApproval } from "../../shared/tool-approval";
 import type { CompactionNotice as Notice, SendResult } from "../hooks/use-threads";
 
 import { Badge } from "@/components/ui/badge";
@@ -10,6 +11,7 @@ import { MessageList } from "./message-list";
 import { PaneShell } from "./pane-shell";
 import { ProgressPanel } from "./progress-panel";
 import { StatusBadge } from "./status-badge";
+import { ToolApprovals } from "./tool-approvals";
 import { type Pane as PaneModel } from "./types";
 
 const DEFAULT_WIDTH = { main: 720, agent: 440 } as const;
@@ -31,6 +33,8 @@ export function Pane({
   onSend,
   onCommand,
   notice,
+  approvals,
+  onDecideApproval,
   sendDisabled = false,
   isHydrating = false,
   hydrationError,
@@ -41,6 +45,8 @@ export function Pane({
   onSend?: (text: string) => Promise<SendResult>;
   onCommand?: (command: ComposerCommand) => Promise<SendResult>;
   notice?: Notice | null;
+  approvals?: readonly ToolApproval[];
+  onDecideApproval?: (approval: ToolApproval, approved: boolean) => Promise<void>;
   sendDisabled?: boolean;
   isHydrating?: boolean;
   hydrationError?: string | null;
@@ -85,6 +91,9 @@ export function Pane({
             isStreaming={pane.status !== "idle"}
           />
         )}
+        {isMain && approvals && onDecideApproval ? (
+          <ToolApprovals approvals={approvals} onDecide={onDecideApproval} />
+        ) : null}
         <ProgressPanel
           status={pane.status}
           label={isMain ? "主對話進度" : "附屬對話進度"}

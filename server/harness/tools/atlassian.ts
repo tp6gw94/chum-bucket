@@ -6,7 +6,9 @@ import {
 } from "@tanstack/ai";
 import { createMCPClient, type MCPClient } from "@tanstack/ai-mcp";
 import { z } from "zod";
+import { approvalToolNames, toolArgumentSchemas } from "../../../shared/tool-approval";
 import type { ModelCall } from "../model-turn";
+import { remoteData } from "../testing-domain";
 import {
   atlassianTools,
   assertCredentialFree,
@@ -51,6 +53,14 @@ type RemoteSession = Readonly<{
 const MCP_TIMEOUT_MS = 60_000;
 
 const discoveryToolName = "discover_atlassian_tools";
+
+export const APPROVAL_REQUIRED = "Jira comments require durable orchestration approval";
+
+const approvalTools: ReadonlySet<string> = new Set(approvalToolNames);
+
+function modelTool(name: string): boolean {
+  return atlassianTools.has(name) && !approvalTools.has(name);
+}
 
 const discoveryRequestSchema = z.object({ toolNames: z.array(z.string()).min(1) }).strict();
 
@@ -286,7 +296,7 @@ function discoveryNamesGranted(names: readonly string[], requested: readonly str
   return (
     names.length === requested.length &&
     names.every((name, index) => name === requested[index]) &&
-    names.every((name) => atlassianTools.has(name))
+    names.every(modelTool)
   );
 }
 
@@ -552,7 +562,7 @@ function advertisedTools(
     return definitions;
   }
 
-  return [...definitions, discoveryDefinition([...catalog.registrations.keys()])];
+  return [...definitions, discoveryDefinition([...catalog.registrations.keys()].filter(modelTool))];
 }
 
 function authorizeRemoteCall(
@@ -567,11 +577,15 @@ function authorizeRemoteCall(
       throw new ToolBoundaryError("Invalid discover_atlassian_tools input");
     }
 
-    if (!requested.every((name) => atlassianTools.has(name))) {
+    if (!requested.every(modelTool)) {
       throw new Error("Unknown tool");
     }
 
     return requested;
+  }
+
+  if (approvalTools.has(call.name)) {
+    throw new ToolBoundaryError(APPROVAL_REQUIRED);
   }
 
   if (!atlassianTools.has(call.name)) {
@@ -710,6 +724,96 @@ async function runRemoteTool(
     signal.removeEventListener("abort", onAbort);
   }
 }
+
+async function invokeApprovedComment(
+  config: HttpConfig,
+  input: unknown,
+  signal: AbortSignal,
+): Promise<unknown> {
+  const controller = new AbortController();
+  const deadlines = new Set<AbortSignal>();
+  const callDeadline = armedDeadline(deadlines, MCP_TIMEOUT_MS);
+  const aborted = AbortSignal.any([signal, callDeadline.signal]);
+  const onAbort = () => controller.abort();
+  aborted.addEventListener("abort", onAbort, { once: true });
+
+  try {
+    const catalog = await openRemote(config, controller, deadlines);
+
+    try {
+      const entry = catalog.registrations.get("jira_add_comment");
+
+      if (!entry) {
+        throw new ToolBoundaryError("Atlassian MCP is missing tool jira_add_comment");
+      }
+
+      const output = await withAbort(
+        entry.handler(input, {
+          toolCallId: "jira_add_comment",
+          abortSignal: aborted,
+          emitCustomEvent: () => undefined,
+        }),
+        aborted,
+      );
+      guardCredentials(output, config);
+
+      return remoteData(output);
+    } finally {
+      await catalog.close();
+    }
+  } catch (failure) {
+    guardCredentials(failure, config);
+    throwRemoteFailure(failure, aborted.aborted, signal);
+  } finally {
+    callDeadline.release();
+    aborted.removeEventListener("abort", onAbort);
+  }
+}
+
+async function sendApprovedJiraComment(
+  input: unknown,
+  site: string,
+  signal: AbortSignal,
+): Promise<unknown> {
+  const parsed = toolArgumentSchemas.jira_add_comment.parse(input);
+  const config = readAtlassianConfiguration(process.env);
+
+  if (config.mode !== "http" || config.serviceEnvironment.JIRA_URL !== site) {
+    throw new ToolBoundaryError("Configured Jira site does not match the approved site");
+  }
+
+  return invokeApprovedComment(config, parsed, signal);
+}
+
+function commentId(data: unknown): string | undefined {
+  if (!data || typeof data !== "object") {
+    return undefined;
+  }
+
+  const record = data as { id?: unknown; comment?: unknown };
+  const id = record.id ?? (record.comment as { id?: unknown } | undefined)?.id;
+
+  return (typeof id === "string" && id.length > 0) || typeof id === "number"
+    ? String(id)
+    : undefined;
+}
+
+export const jiraCommentApproval = {
+  tool: "jira_add_comment",
+  async dispatch(
+    input: unknown,
+    site: string,
+    signal: AbortSignal,
+  ): Promise<{ externalId: string }> {
+    const externalId = commentId(await sendApprovedJiraComment(input, site, signal));
+
+    if (!externalId) {
+      throw new ToolBoundaryError("Jira did not return a comment ID");
+    }
+
+    return { externalId };
+  },
+} as const;
 
 export async function withAtlassianScope<T>(
   use: (scope: AtlassianScope) => Promise<T>,

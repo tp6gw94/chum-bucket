@@ -4,6 +4,12 @@ import { flushSync } from "react-dom";
 import type { StreamChunk } from "@tanstack/ai";
 import { fetchServerSentEvents, useChat, type UIMessage } from "@tanstack/ai-react";
 import { parseCompactionEvent, type CompactionState } from "../../shared/compaction-event";
+import {
+  applyToolApprovalEvent,
+  parseToolApprovalEvent,
+  toolApprovalListSchema,
+  type ToolApproval,
+} from "../../shared/tool-approval";
 import type { ComposerCommand } from "../composer-commands";
 
 const threadSchema = z.object({ id: z.uuid(), title: z.string() });
@@ -221,6 +227,36 @@ async function readThread(threadId: string) {
     .parse(await response.json());
 }
 
+async function readApprovals(threadId: string): Promise<ToolApproval[]> {
+  const response = await fetch(`/api/chat?threadId=${encodeURIComponent(threadId)}`);
+
+  if (!response.ok) {
+    throw new Error(`載入批准失敗（HTTP ${response.status}）`);
+  }
+
+  return z.object({ approvals: toolApprovalListSchema }).parse(await response.json()).approvals;
+}
+
+async function sendApprovalDecision(approval: ToolApproval, approved: boolean) {
+  const response = await fetch(
+    `/api/chat/approvals/${encodeURIComponent(approval.approvalId)}/decision`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Tool-Approval": "1" },
+      body: JSON.stringify({
+        threadId: approval.threadId,
+        digest: approval.digest,
+        tool: approval.tool,
+        approved,
+      }),
+    },
+  );
+
+  if (!response.ok) {
+    throw new Error(`決策未確認（HTTP ${response.status}）`);
+  }
+}
+
 class RunRejectedError extends Error {}
 
 function compactRejection(status: number) {
@@ -248,6 +284,7 @@ export function useThread(threadId: string) {
   const [phase, setPhase] = useState<ThreadPhase>("loading");
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<CompactionNotice | null>(null);
+  const [approvals, setApprovals] = useState<ToolApproval[]>([]);
   const owner = useRef({
     phase: "loading" as ThreadPhase,
     compactingFrom: null as ThreadPhase | null,
@@ -321,6 +358,14 @@ export function useThread(threadId: string) {
       hydrate(...args: Parameters<NonNullable<typeof base.hydrate>>) {
         return (hydration ??= base.hydrate!(...args)
           .then((result) => {
+            void readApprovals(threadId)
+              .then((loaded) => {
+                if (owner.mounted) {
+                  setApprovals(loaded);
+                }
+              })
+              .catch(() => undefined);
+
             if (owner.mounted) {
               owner.runId = result.activeRun?.runId ?? null;
 
@@ -384,11 +429,22 @@ export function useThread(threadId: string) {
     owner.compactingFrom = null;
   }
 
+  function observeApproval(name: string, value: unknown) {
+    const event = parseToolApprovalEvent(name, value);
+
+    if (event && owner.mounted) {
+      setApprovals((current) => applyToolApprovalEvent(current, event));
+    }
+  }
+
   const chat = useChat({
     connection,
     threadId,
     persistence: true,
-    onCustomEvent: (name, value) => observeCompaction(name, value),
+    onCustomEvent: (name, value) => {
+      observeCompaction(name, value);
+      observeApproval(name, value);
+    },
   });
   useEffect(() => {
     owner.mounted = true;
@@ -509,5 +565,15 @@ export function useThread(threadId: string) {
     return true;
   }
 
-  return { messages: chat.messages, phase, error, notice, send, runCommand, navigate };
+  return {
+    messages: chat.messages,
+    phase,
+    error,
+    notice,
+    approvals,
+    decideApproval: sendApprovalDecision,
+    send,
+    runCommand,
+    navigate,
+  };
 }

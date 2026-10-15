@@ -388,8 +388,15 @@ test("write tools, official aliases, generic tools and absent optional tools nev
             pages[0] === coreTools ? ["jira_get_issue", "confluence_get_page"] : remoteNames;
           const history = await discover(tools, granted);
           const definitions = await tools.getModelTools(history);
+          assert.equal(
+            definitions.some((tool) => tool.name === "jira_add_comment"),
+            false,
+          );
+          await assert.rejects(
+            tools.executeTool(history, call("jira_add_comment"), context),
+            /Jira comments require durable orchestration approval/,
+          );
           for (const name of [
-            "jira_add_comment",
             "jira_edit_comment",
             "jira_delete_issue",
             "confluence_add_comment",

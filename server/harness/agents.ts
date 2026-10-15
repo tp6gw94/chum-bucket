@@ -5,10 +5,11 @@ import { verifyAc, verifyUi } from "./tools/verify-browser";
 import { rolePrompt } from "./role-prompts";
 import { openuiInstructions } from "./prompts";
 import type { Role } from "../../shared/testing";
+import { atlassianRouteAllowed } from "./tools/atlassian-policy";
 
 export const AGENT_MODEL = "deepseek-ai/DeepSeek-V4.1-Flash";
 const atlassianFactory = {
-  names: ["jira_get_issue", "confluence_get_page"],
+  names: ["jira_get_issue", "confluence_get_page", "jira_add_comment"],
 } as const;
 const main = {
   kind: "conversation",
@@ -93,7 +94,15 @@ export function allowsTool(agentId: AgentId, name: string, route: ToolRoute): bo
     "names" in entry ? entry.names.includes(name) : entry.name === name,
   );
 
-  return !!tool && (route === "direct" || !("metadata" in tool && tool.metadata?.direct));
+  if (!tool) {
+    return false;
+  }
+
+  if ("names" in tool) {
+    return atlassianRouteAllowed(name, route);
+  }
+
+  return route === "direct" || !("metadata" in tool && tool.metadata?.direct);
 }
 
 export function roleSystemPrompt(role: Role, profile: string): string {

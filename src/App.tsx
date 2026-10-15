@@ -71,6 +71,8 @@ function mainPaneProps(thread: ReturnType<typeof useThread>) {
     onSend: thread.send,
     onCommand: thread.runCommand,
     notice: thread.notice,
+    approvals: thread.approvals,
+    onDecideApproval: thread.decideApproval,
     isHydrating: thread.phase === "loading",
     hydrationError: thread.error,
   };

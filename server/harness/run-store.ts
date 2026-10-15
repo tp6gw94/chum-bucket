@@ -235,6 +235,21 @@ export async function emit(runId: string, event: StreamChunk, conversation?: Con
   });
 }
 
+export async function appendKeyedEvent(runId: string, key: string, event: StreamChunk) {
+  const db = await database();
+  await db.transaction(async (tx) => {
+    const { run } = await lockRun(tx, runId);
+    const [existing] = await tx
+      .select({ key: chatEventsTable.event_key })
+      .from(chatEventsTable)
+      .where(and(eq(chatEventsTable.run_id, runId), eq(chatEventsTable.event_key, key)));
+
+    if (!existing) {
+      await appendEvent(tx, run, key, event);
+    }
+  });
+}
+
 export async function checkpointCompaction(
   runId: string,
   operationId: string,

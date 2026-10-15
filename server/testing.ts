@@ -4,6 +4,7 @@ import { z } from "zod";
 import { testingOperationsTable } from "./db/schema";
 import { database } from "./harness/run-store";
 import { cancelOperation } from "./harness/testing-store";
+import { wakePendingApprovals } from "./harness/tool-approval-store";
 
 const app = new Hono();
 app.get("/:runId", async (c) => {
@@ -47,6 +48,10 @@ app.post("/:runId/cancel", async (c) => {
   }
 
   const accepted = await cancelOperation(c.req.param("runId"), body.data.threadId);
+
+  if (accepted) {
+    await wakePendingApprovals(c.req.param("runId"));
+  }
 
   return c.json({ accepted });
 });

@@ -1,6 +1,8 @@
+import { DBOS } from "@dbos-inc/dbos-sdk";
 import { Hono, type Context, type ErrorHandler } from "hono";
 import { z } from "zod";
 import type { StreamChunk } from "@tanstack/ai";
+import { approvalDecisionKey, toolApprovalDecisionSchema } from "../shared/tool-approval";
 import { acceptRun } from "./harness/run";
 import {
   checkCursor,
@@ -10,6 +12,7 @@ import {
   chatInputSchema,
   compactInputSchema,
 } from "./harness/run-store";
+import { readToolApprovalRequest, readToolApprovals } from "./harness/tool-approval-store";
 
 const app = new Hono();
 const bodySchema = z.object({
@@ -159,7 +162,62 @@ async function startRun(c: Context, input: Parameters<typeof acceptRun>[0]) {
   return eventResponse((signal) => observeRun(input.runId, cursor, signal), c.req.raw.signal);
 }
 
+function trustedApprovalRequest(c: Context): boolean {
+  return (
+    c.req.header("X-Tool-Approval") === "1" &&
+    (c.req.header("Sec-Fetch-Site") === "same-origin" ||
+      c.req.header("Origin") === new URL(c.req.url).origin)
+  );
+}
+
+function parseApprovalDecision(c: Context, id: string, body: unknown) {
+  if (!trustedApprovalRequest(c)) {
+    throw new RunRequestError(409, "Approval request is not from this application");
+  }
+
+  const approvalId = z.uuid().safeParse(id);
+  const decision = toolApprovalDecisionSchema.safeParse(body);
+
+  if (!approvalId.success || !decision.success) {
+    throw new RunRequestError(400, "Invalid approval decision");
+  }
+
+  return { approvalId: approvalId.data, decision: decision.data };
+}
+
 app.onError(handleError);
+
+app.post("/approvals/:id/decision", async (c) => {
+  const { approvalId, decision } = parseApprovalDecision(
+    c,
+    c.req.param("id"),
+    await c.req.json().catch(() => null),
+  );
+  const approval = await readToolApprovalRequest(approvalId);
+
+  if (
+    !approval ||
+    approval.state !== "pending" ||
+    approval.tool !== decision.tool ||
+    approval.digest !== decision.digest ||
+    approval.threadId !== decision.threadId
+  ) {
+    throw new RunRequestError(409, "Approval is not pending or does not match");
+  }
+
+  try {
+    await DBOS.send(
+      approval.childWorkflowId,
+      { approvalId, tool: decision.tool, digest: decision.digest, approved: decision.approved },
+      approval.topic,
+      approvalDecisionKey(approvalId),
+    );
+  } catch {
+    throw new RunRequestError(409, "Approval decision was not recorded");
+  }
+
+  return c.json({ accepted: true }, 202);
+});
 
 app.post("/", async (c) =>
   startRun(c, parseRunBody(await c.req.json().catch(() => null), c.req.header("X-Run-Id"))),
@@ -180,7 +238,9 @@ app.get("/", async (c) => {
     throw new RunRequestError(400, "A thread or run ID is required");
   }
 
-  return c.json(await hydrateThread(threadId));
+  const hydrated = await hydrateThread(threadId);
+
+  return c.json({ ...hydrated, approvals: await readToolApprovals(threadId) });
 });
 
 export const compact = new Hono();

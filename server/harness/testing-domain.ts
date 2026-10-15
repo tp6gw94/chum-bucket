@@ -38,7 +38,7 @@ export type Validation =
   | { valid: true; payload: ArtifactPayload }
   | { valid: false; issues: string[] };
 
-function remoteData(output: unknown): unknown {
+export function remoteData(output: unknown): unknown {
   if (typeof output === "string") {
     try {
       return remoteData(JSON.parse(output));

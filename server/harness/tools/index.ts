@@ -12,6 +12,7 @@ import {
   type ModelTool,
 } from "./atlassian";
 import {
+  atlassianRouteAllowed,
   atlassianToolNames,
   configuredAtlassianSecrets,
   assertCredentialFree,
@@ -67,7 +68,11 @@ const localCatalog: Catalog = new Map(
   ].map((entry) => [entry.definition.name, entry]),
 );
 
-const sandboxed: ReadonlySet<string> = new Set([getFigma.name, read.name, ...atlassianToolNames]);
+const sandboxed: ReadonlySet<string> = new Set([
+  getFigma.name,
+  read.name,
+  ...atlassianToolNames.filter((name) => atlassianRouteAllowed(name, "codemode")),
+]);
 
 function mergeLocalDefinitions(remote: AtlassianCatalog): ModelTool[] {
   const definitions = new Map([...localCatalog].map(([name, entry]) => [name, entry.definition]));

@@ -1,12 +1,13 @@
 import { convertSchemaToJsonSchema, type ToolExecutionContext, type UIMessage } from "@tanstack/ai";
 import type { Evidence, Receipt, Role, RoleTask } from "../../shared/testing";
+import { approvalToolNames, toolArgumentSchemas } from "../../shared/tool-approval";
 import { toolNamesFor } from "./agents";
 import { agentTools } from "./tool-policy";
 import { digestOf } from "./testing-domain";
 import { designValues, scopedFigmaCall } from "./testing-figma";
 import type { ModelCall } from "./model-turn";
 import { withRunTools, type RunTools } from "./tools";
-import type { ModelTool } from "./tools/atlassian";
+import { APPROVAL_REQUIRED, type ModelTool } from "./tools/atlassian";
 import { getFigma } from "./tools/get-figma";
 import { browserVerifier, verifyAc, verifyUi } from "./tools/verify-browser";
 
@@ -40,14 +41,31 @@ function authorizedRead(call: ModelCall, task: RoleTask): ModelCall {
   return { ...call, input: next, arguments: JSON.stringify(next) };
 }
 
+const approvalTools: ReadonlySet<string> = new Set(approvalToolNames);
+
+function discoverableNames(): string[] {
+  return toolNamesFor("atlassian").filter((name) => !approvalTools.has(name));
+}
+
+const commentProposal: ModelTool = {
+  name: "jira_add_comment",
+  description:
+    "Propose this exact Jira comment for user approval. Nothing is posted before approval. After a rejection this task cannot propose another comment.",
+  inputSchema: convertSchemaToJsonSchema(toolArgumentSchemas.jira_add_comment)!,
+};
+
 function atlassianCall(call: ModelCall, task: RoleTask) {
+  if (approvalTools.has(call.name)) {
+    throw new Error(APPROVAL_REQUIRED);
+  }
+
   if (call.name !== "discover_atlassian_tools") {
     return authorizedRead(call, task);
   }
 
   const names = (call.input as { toolNames?: unknown }).toolNames;
 
-  if (!Array.isArray(names) || !names.every((name) => toolNamesFor("atlassian").includes(name))) {
+  if (!Array.isArray(names) || !names.every((name) => discoverableNames().includes(name))) {
     throw new Error("Discovery is outside delegated scope");
   }
 
@@ -58,9 +76,9 @@ async function atlassianDefinitions(
   remote: RunTools,
   messages: readonly UIMessage[],
 ): Promise<ModelTool[]> {
-  const allowed = new Set(toolNamesFor("atlassian"));
+  const allowed = new Set(discoverableNames());
 
-  return (await remote.getModelTools(messages))
+  const definitions = (await remote.getModelTools(messages))
     .filter((tool) => allowed.has(tool.name) || tool.name === "discover_atlassian_tools")
     .map((tool) =>
       tool.name !== "discover_atlassian_tools"
@@ -81,6 +99,8 @@ async function atlassianDefinitions(
             },
           },
     );
+
+  return [...definitions, commentProposal];
 }
 
 function recordFor(

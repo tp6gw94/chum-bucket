@@ -66,12 +66,14 @@ test("full Jira configuration maps the service environment and derives Confluenc
     );
     assert.equal(configuration.serviceEnvironment.CONFLUENCE_USERNAME, full.JIRA_EMAIL);
     assert.equal(configuration.serviceEnvironment.CONFLUENCE_API_TOKEN, full.JIRA_API_TOKEN);
-    assert.equal(configuration.serviceEnvironment.READ_ONLY_MODE, "true");
+    assert.equal(configuration.serviceEnvironment.READ_ONLY_MODE, "false");
+    assert.equal(configuration.serviceEnvironment.ATLASSIAN_RETRY_TOTAL, "0");
+    assert.equal(configuration.serviceEnvironment.ATLASSIAN_RETRY_INCLUDE_WRITES, "false");
     assert.equal(configuration.serviceEnvironment.PYTHON_DOTENV_DISABLED, "1");
     assert.equal(configuration.serviceEnvironment.ALLOW_GLOBAL_CRED_FALLBACK, "true");
     assert.equal(
       configuration.serviceEnvironment.TOOLSETS,
-      "jira_issues,confluence_pages,confluence_comments",
+      "jira_issues,jira_comments,confluence_pages,confluence_comments",
     );
     assert.equal(configuration.serviceEnvironment.ENABLED_TOOLS, atlassianToolNames.join(","));
     for (const secret of [
@@ -114,20 +116,21 @@ test("endpoint accepts only literal loopback HTTP URLs and defaults to the fixed
   }
 });
 
-test("readonly policy names the five native tools and keeps both required readers", () => {
+test("policy names the five readers plus the direct-only comment writer", () => {
   assert.deepEqual(atlassianToolNames, [
     "jira_get_issue",
     "jira_search",
     "confluence_get_page",
     "confluence_search",
     "confluence_get_comments",
+    "jira_add_comment",
   ]);
   const configuration = readAtlassianConfiguration(full);
   assert.equal(configuration.mode, "http");
   if (configuration.mode === "http") {
     assert.equal(
       configuration.serviceEnvironment.ENABLED_TOOLS,
-      "jira_get_issue,jira_search,confluence_get_page,confluence_search,confluence_get_comments",
+      "jira_get_issue,jira_search,confluence_get_page,confluence_search,confluence_get_comments,jira_add_comment",
     );
   }
 });

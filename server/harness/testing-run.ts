@@ -7,6 +7,7 @@ import type { AcceptedRun } from "./run-store";
 import type { ModelCall } from "./model-turn";
 import type { AgentOrchestration } from "./agent-loop";
 import { assembleToolResults, digestOf } from "./testing-domain";
+import { readCommentOutcome, type CommentOutcome } from "./tool-approval-store";
 import {
   TESTING_WORKFLOW_VERSION,
   admitOperation,
@@ -36,6 +37,7 @@ export type DelegationResult = {
     conflictingChecks?: string[];
   };
   progress: { state: "completed" | "failed"; reasonCode?: string; issues?: string[] };
+  comment?: CommentOutcome | null;
 };
 
 async function prepareTask(
@@ -212,7 +214,14 @@ export async function delegateTask(run: AcceptedRun, call: ModelCall): Promise<D
     name: `${input.operationId}:quiet`,
   });
 
-  return DBOS.runStep(() => closeOperation(input, result), { name: `${input.operationId}:close` });
+  return DBOS.runStep(
+    async () =>
+      closeOperation(input, {
+        ...result,
+        comment: await readCommentOutcome(input.parentRunId, input.operationId),
+      }),
+    { name: `${input.operationId}:close` },
+  );
 }
 
 export function testingOrchestration(run: AcceptedRun): AgentOrchestration {

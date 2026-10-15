@@ -7,6 +7,7 @@ import { roleFinalTurnPrompt } from "./role-prompts";
 import { runRolePasses } from "./testing-role";
 import { withRoleTools, type RoleToolState } from "./testing-tools";
 import { digestOf, validateCandidate } from "./testing-domain";
+import { gateToolApproval, type ApprovalRun } from "./tool-approval";
 import {
   assertChildIdentity,
   TESTING_WORKFLOW_VERSION,
@@ -17,6 +18,17 @@ import {
   readReceipts,
   cancellationRequested,
 } from "./testing-store";
+
+function approvalRun(input: TestingInput): ApprovalRun {
+  return {
+    parentRunId: input.parentRunId,
+    threadId: input.threadId,
+    operationId: input.operationId,
+    taskId: input.childWorkflowId,
+    childWorkflowId: input.childWorkflowId,
+    role: input.intent.role,
+  };
+}
 
 async function roleLoops(
   input: TestingInput,
@@ -79,6 +91,11 @@ async function roleLoops(
             prompt,
             checkpoint: checkpoint(prefix),
             compact: async ({ conversation }) => ({ state: "skipped", conversation }),
+            orchestration: (call) =>
+              gateToolApproval(approvalRun(input), call, {
+                signal,
+                guard: (step) => guardActualIO(input, "tool", step),
+              }),
             maxTurns,
             finalTurnPrompt: roleFinalTurnPrompt(role),
             signal,
