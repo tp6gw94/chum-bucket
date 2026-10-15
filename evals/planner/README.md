@@ -9,10 +9,10 @@
 ```sh
 pnpm eval:planner
 pnpm eval:planner --filter-metadata id=S01-login-wrong-password
-pnpm exec promptfoo view
+pnpm eval:planner:view
 ```
 
-第一行跑全部 case，第二行只跑一個 case，第三行開啟結果頁面。
+第一行跑全部 case，第二行只跑一個 case，第三行開啟結果頁面。兩個 script 都把 `PROMPTFOO_CONFIG_DIR` 設成 `.data/promptfoo`，所以結果與標注存在專案內的 `.data/promptfoo/promptfoo.db`，不在 `~/.promptfoo`。這個目錄不進 git。
 
 ## 評分
 

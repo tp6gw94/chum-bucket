@@ -31,5 +31,6 @@ dist
 .fallow/
 .data/browser-executions/
 .data/browser-evidence/
+.data/promptfoo/
 
 .worktree/
