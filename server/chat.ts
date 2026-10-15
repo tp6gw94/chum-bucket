@@ -1,6 +1,8 @@
+import { DBOS } from "@dbos-inc/dbos-sdk";
 import { Hono } from "hono";
 import { z } from "zod";
 import type { StreamChunk } from "@tanstack/ai";
+import { toolApprovalDecisionSchema, type ToolApprovalDecision } from "../shared/tool-approval";
 import { acceptRun } from "./harness/run";
 import {
   baseRevisionSchema,
@@ -12,6 +14,7 @@ import {
   RunRequestError,
   runIdSchema,
 } from "./harness/run-store";
+import { findToolApproval, readRunApprovals } from "./harness/tool-approval-store";
 
 const app = new Hono();
 export const compact = new Hono();
@@ -175,6 +178,61 @@ app.post("/", async (c) => {
   return eventResponse((signal) => observeRun(input.runId, cursor, signal), c.req.raw.signal);
 });
 
+function assertSameOrigin(headers: Headers, url: string) {
+  if (headers.get("X-Tool-Approval") !== "1") {
+    throw new RunRequestError(409, "Approval header is required");
+  }
+
+  if (
+    headers.get("Sec-Fetch-Site") !== "same-origin" &&
+    headers.get("Origin") !== new URL(url).origin
+  ) {
+    throw new RunRequestError(409, "Approval must come from this site");
+  }
+}
+
+function parseDecision(id: string, body: unknown): ToolApprovalDecision {
+  const decision = toolApprovalDecisionSchema.safeParse(body);
+
+  if (!z.uuid().safeParse(id).success || !decision.success) {
+    throw new RunRequestError(400, "Invalid approval decision");
+  }
+
+  return decision.data;
+}
+
+async function deliverDecision(id: string, decision: ToolApprovalDecision) {
+  const approval = await findToolApproval(id);
+  const request = approval?.request;
+
+  if (
+    !request ||
+    approval.state !== "pending" ||
+    request.threadId !== decision.threadId ||
+    request.tool !== decision.tool ||
+    request.digest !== decision.digest
+  ) {
+    throw new RunRequestError(409, "Approval is not pending or does not match");
+  }
+
+  await DBOS.send(
+    request.workflowId,
+    { approvalId: id, tool: decision.tool, digest: decision.digest, approved: decision.approved },
+    request.topic,
+    `approval-decision:${id}`,
+  ).catch(() => {
+    throw new RunRequestError(409, "Approval decision was not delivered");
+  });
+}
+
+app.post("/approvals/:id/decision", async (c) => {
+  assertSameOrigin(c.req.raw.headers, c.req.url);
+  const decision = parseDecision(c.req.param("id"), await c.req.json().catch(() => null));
+  await deliverDecision(c.req.param("id"), decision);
+
+  return c.json({ delivered: true }, 202);
+});
+
 app.get("/", async (c) => {
   const runId = c.req.query("runId");
   const threadId = c.req.query("threadId");
@@ -190,7 +248,10 @@ app.get("/", async (c) => {
     throw new RunRequestError(400, "A thread or run ID is required");
   }
 
-  return c.json(await hydrateThread(threadId));
+  const hydrated = await hydrateThread(threadId);
+  const approvals = hydrated.activeRun ? await readRunApprovals(hydrated.activeRun.runId) : [];
+
+  return c.json({ ...hydrated, approvals });
 });
 
 export default app;

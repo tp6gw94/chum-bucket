@@ -6,6 +6,7 @@ import {
 } from "@tanstack/ai";
 import { createMCPClient, type MCPClient } from "@tanstack/ai-mcp";
 import { z } from "zod";
+import { toolArgumentSchemas } from "../../../shared/tool-approval";
 import type { ModelCall } from "../model-turn";
 import {
   atlassianTools,
@@ -49,6 +50,11 @@ type RemoteSession = Readonly<{
 }>;
 
 const MCP_TIMEOUT_MS = 60_000;
+
+const jiraCommentToolName = "jira_add_comment";
+
+const jiraCommentDescription =
+  "Propose this exact Jira comment to the user for approval. Nothing is sent before the user approves it. After a rejection, expiry or cancellation, do not propose another comment in this task.";
 
 const discoveryToolName = "discover_atlassian_tools";
 
@@ -473,7 +479,10 @@ function unwrapResult(output: unknown): unknown {
 }
 
 function remoteRegistration(tool: McpToolList[number]): RemoteRegistration {
-  const inputSchema = convertSchemaToJsonSchema(tool.inputSchema);
+  const approval = tool.name === jiraCommentToolName;
+  const inputSchema = convertSchemaToJsonSchema(
+    approval ? toolArgumentSchemas.jira_add_comment : tool.inputSchema,
+  );
 
   if (!inputSchema) {
     throw new ToolBoundaryError("Tool schema is unavailable");
@@ -482,7 +491,11 @@ function remoteRegistration(tool: McpToolList[number]): RemoteRegistration {
   const wrapped = wrapsResult(tool);
 
   return {
-    definition: { name: tool.name, description: tool.description, inputSchema },
+    definition: {
+      name: tool.name,
+      description: approval ? jiraCommentDescription : tool.description,
+      inputSchema,
+    },
     handler: async (input, context) => {
       const output: unknown = await tool.execute!(input, context);
 
@@ -835,6 +848,10 @@ export async function withAtlassianScope<T>(
         }
       },
       async executeTool(messages, call, context, local) {
+        if (call.name === jiraCommentToolName) {
+          throw new ToolAuthorizationError("Jira comments require durable orchestration approval");
+        }
+
         const config = await getConfiguration();
 
         if (local) {
@@ -865,5 +882,77 @@ export async function withAtlassianScope<T>(
     if (remote) {
       await retire(remote).catch(() => undefined);
     }
+  }
+}
+
+function commentId(output: unknown): string {
+  const id = (output as { id?: unknown } | null)?.id;
+
+  if ((typeof id !== "string" && typeof id !== "number") || String(id).length === 0) {
+    throw new ToolBoundaryError("Jira did not return a comment ID");
+  }
+
+  return String(id);
+}
+
+async function addComment(
+  catalog: RemoteCatalog,
+  args: unknown,
+  signal: AbortSignal,
+  config: HttpConfig,
+): Promise<string> {
+  const entry = catalog.registrations.get(jiraCommentToolName);
+
+  if (!entry) {
+    throw new ToolBoundaryError("Atlassian MCP does not offer jira_add_comment");
+  }
+
+  const output = await withAbort(
+    entry.handler(args, {
+      toolCallId: jiraCommentToolName,
+      abortSignal: signal,
+      emitCustomEvent: () => {},
+    }),
+    signal,
+  );
+  guardCredentials(output, config);
+
+  return commentId(output);
+}
+
+export async function sendApprovedJiraComment(
+  input: unknown,
+  site: string,
+  signal: AbortSignal,
+): Promise<{ externalId: string }> {
+  const args = toolArgumentSchemas.jira_add_comment.parse(input);
+  const config = readAtlassianConfiguration(process.env);
+
+  if (config.mode !== "http" || config.serviceEnvironment.JIRA_URL !== site) {
+    throw new ToolBoundaryError("The configured Jira site differs from the approved one");
+  }
+
+  const controller = new AbortController();
+  const deadlines = new Set<AbortSignal>();
+  const callDeadline = armedDeadline(deadlines, MCP_TIMEOUT_MS);
+  const onAbort = () => controller.abort();
+  signal.addEventListener("abort", onAbort, { once: true });
+  let catalog: RemoteCatalog | undefined;
+
+  try {
+    signal.throwIfAborted();
+    catalog = await openRemote(config, controller, deadlines);
+    const callSignal = AbortSignal.any([controller.signal, callDeadline.signal]);
+
+    return { externalId: await addComment(catalog, args, callSignal, config) };
+  } catch (failure) {
+    guardCredentials(failure, config);
+    throw failure instanceof ToolBoundaryError
+      ? failure
+      : new ToolBoundaryError("Sending the approved Jira comment failed");
+  } finally {
+    callDeadline.release();
+    signal.removeEventListener("abort", onAbort);
+    await catalog?.close();
   }
 }

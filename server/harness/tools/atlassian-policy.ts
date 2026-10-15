@@ -1,16 +1,25 @@
 export type Environment = Readonly<Record<string, string | undefined>>;
 
-export type AtlassianToolPolicy = Readonly<{ required: boolean }>;
+type ToolRoute = "direct" | "codemode";
+
+type AtlassianToolPolicy = Readonly<{ required: boolean; routes: readonly ToolRoute[] }>;
+
+const bothRoutes: readonly ToolRoute[] = ["direct", "codemode"];
 
 export const atlassianTools: ReadonlyMap<string, AtlassianToolPolicy> = new Map([
-  ["jira_get_issue", { required: true }],
-  ["jira_search", { required: false }],
-  ["confluence_get_page", { required: true }],
-  ["confluence_search", { required: false }],
-  ["confluence_get_comments", { required: false }],
+  ["jira_get_issue", { required: true, routes: bothRoutes }],
+  ["jira_search", { required: false, routes: bothRoutes }],
+  ["jira_add_comment", { required: false, routes: ["direct"] }],
+  ["confluence_get_page", { required: true, routes: bothRoutes }],
+  ["confluence_search", { required: false, routes: bothRoutes }],
+  ["confluence_get_comments", { required: false, routes: bothRoutes }],
 ]);
 
 export const atlassianToolNames: readonly string[] = [...atlassianTools.keys()];
+
+export function allowsTool(name: string, route: ToolRoute): boolean {
+  return atlassianTools.get(name)?.routes.includes(route) ?? true;
+}
 
 export const defaultAtlassianEndpoint = "http://127.0.0.1:8000/mcp";
 
@@ -118,10 +127,12 @@ export function readAtlassianConfiguration(env: Environment): AtlassianConfigura
       CONFLUENCE_URL: new URL("/wiki", jira).href,
       CONFLUENCE_USERNAME: email,
       CONFLUENCE_API_TOKEN: token,
-      READ_ONLY_MODE: "true",
+      READ_ONLY_MODE: "false",
+      ATLASSIAN_RETRY_TOTAL: "0",
+      ATLASSIAN_RETRY_INCLUDE_WRITES: "false",
       PYTHON_DOTENV_DISABLED: "1",
       ALLOW_GLOBAL_CRED_FALLBACK: "true",
-      TOOLSETS: "jira_issues,confluence_pages,confluence_comments",
+      TOOLSETS: "jira_issues,jira_comments,confluence_pages,confluence_comments",
       ENABLED_TOOLS: atlassianToolNames.join(","),
     },
     secrets: secretsFor(email, token),

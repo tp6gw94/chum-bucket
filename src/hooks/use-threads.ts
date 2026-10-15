@@ -4,6 +4,12 @@ import { flushSync } from "react-dom";
 import type { StreamChunk, UIMessage } from "@tanstack/ai";
 import { fetchServerSentEvents, useChat } from "@tanstack/ai-react";
 import { parseCompactionEvent, type CompactionState } from "../../shared/compaction-event";
+import {
+  applyToolApprovalEvent,
+  parseToolApprovalEvent,
+  parseToolApprovals,
+  type ToolApproval,
+} from "../../shared/tool-approval";
 import { parseComposerCommand } from "../composer-commands";
 
 const threadSchema = z.object({ id: z.uuid(), title: z.string() });
@@ -84,6 +90,27 @@ async function threadRevision(threadId: string) {
 
   return z.object({ revision: z.number().int().nonnegative() }).parse(await response.json())
     .revision;
+}
+
+export async function decideApproval(approval: ToolApproval, approved: boolean): Promise<void> {
+  const { request } = approval;
+  const response = await fetch(
+    `/api/chat/approvals/${encodeURIComponent(request.approvalId)}/decision`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Tool-Approval": "1" },
+      body: JSON.stringify({
+        threadId: request.threadId,
+        digest: request.digest,
+        tool: request.tool,
+        approved,
+      }),
+    },
+  );
+
+  if (!response.ok) {
+    throw new Error(`送出決策失敗（HTTP ${response.status}）`);
+  }
 }
 
 async function savedMessages(threadId: string): Promise<UIMessage[]> {
@@ -210,6 +237,7 @@ export function useThread(threadId: string) {
   const [phase, setPhase] = useState<ThreadPhase>("loading");
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<ThreadNotice | null>(null);
+  const [approvals, setApprovals] = useState<readonly ToolApproval[]>([]);
   const owner = useRef({
     phase: "loading" as ThreadPhase,
     mounted: true,
@@ -257,6 +285,12 @@ export function useThread(threadId: string) {
     }
   }
 
+  function noteApproval(chunk: unknown) {
+    if (parseToolApprovalEvent(chunk) && owner.mounted) {
+      setApprovals((current) => applyToolApprovalEvent(current, chunk));
+    }
+  }
+
   const connection = useMemo(() => {
     const base = fetchServerSentEvents("/api/chat");
     let hydration: ReturnType<NonNullable<typeof base.hydrate>> | undefined;
@@ -266,6 +300,7 @@ export function useThread(threadId: string) {
         for await (const chunk of stream) {
           const terminal = terminalResult(chunk, owner.runId);
           noteCompaction(chunk);
+          noteApproval(chunk);
 
           if (terminal) {
             owner.terminal = terminal;
@@ -299,6 +334,7 @@ export function useThread(threadId: string) {
           .then((result) => {
             if (owner.mounted) {
               owner.runId = result.activeRun?.runId ?? null;
+              setApprovals(parseToolApprovals((result as { approvals?: unknown }).approvals));
 
               if (owner.runId) {
                 publish("busy");
@@ -437,5 +473,5 @@ export function useThread(threadId: string) {
     return true;
   }
 
-  return { messages: chat.messages, phase, error, notice, send, navigate };
+  return { messages: chat.messages, phase, error, notice, approvals, send, navigate };
 }

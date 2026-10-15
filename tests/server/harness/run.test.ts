@@ -298,7 +298,7 @@ const accepted: AcceptedRun & { message: { id: string; text: string } } = {
   sideChat: false,
   prompt: "offline",
   model: "deepseek-ai/DeepSeek-V4.1-Flash",
-  build: "durable-chat-loop-v7",
+  build: "durable-chat-loop-v8",
 };
 const toolTurn: Turn = {
   messages: baseline,

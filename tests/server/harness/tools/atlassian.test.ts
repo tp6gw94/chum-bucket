@@ -46,6 +46,7 @@ const remoteNames = [
   "confluence_search",
   "confluence_get_comments",
 ];
+const discoverableNames = [...remoteNames.slice(0, 2), "jira_add_comment", ...remoteNames.slice(2)];
 const credentialForms = [
   ...new Set(
     [fakeToken, `${fakeEmail}:${fakeToken}`].flatMap((secret) => [
@@ -278,7 +279,7 @@ test("HTTP initializes once, paginates, retains native schemas and executes disc
           properties: {
             toolNames: {
               type: "array",
-              items: { type: "string", enum: remoteNames },
+              items: { type: "string", enum: discoverableNames },
               minItems: 1,
             },
           },
@@ -390,8 +391,11 @@ test("write tools, official aliases, generic tools and absent optional tools nev
             pages[0] === coreTools ? ["jira_get_issue", "confluence_get_page"] : remoteNames;
           const history = await discover(tools, granted);
           const definitions = await definitionsOf(tools, history);
+          await assert.rejects(
+            tools.executeTool(history, call("jira_add_comment"), context),
+            /Jira comments require durable orchestration approval/,
+          );
           for (const name of [
-            "jira_add_comment",
             "jira_edit_comment",
             "jira_delete_issue",
             "confluence_add_comment",

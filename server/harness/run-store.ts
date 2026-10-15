@@ -20,7 +20,7 @@ import {
 import { openuiInstructions } from "./prompts";
 import { snapshot } from "./model-turn";
 
-export const BUILD = "durable-chat-loop-v7";
+export const BUILD = "durable-chat-loop-v8";
 export const MODEL = "deepseek-ai/DeepSeek-V4.1-Flash";
 export const runIdSchema = z
   .string()
@@ -287,6 +287,21 @@ export async function emit(runId: string, event: StreamChunk, conversation?: Con
         .update(chatRunsTable)
         .set({ projection: toProjection(conversation) })
         .where(eq(chatRunsTable.id, runId));
+    }
+  });
+}
+
+export async function appendRunEventOnce(runId: string, key: string, event: StreamChunk) {
+  const db = await database();
+  await db.transaction(async (tx) => {
+    const { run } = await lockRun(tx, runId);
+    const [saved] = await tx
+      .select({ key: chatEventsTable.event_key })
+      .from(chatEventsTable)
+      .where(and(eq(chatEventsTable.run_id, runId), eq(chatEventsTable.event_key, key)));
+
+    if (!saved) {
+      await appendEvent(tx, run, key, event);
     }
   });
 }

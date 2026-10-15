@@ -18,6 +18,7 @@ import { z } from "zod";
 import type { ModelCall } from "../model-turn";
 import { codeModeDescription, codeModeSystemPrompt } from "../prompts";
 import { CredentialBoundaryError, ToolAuthorizationError, type ModelTool } from "./atlassian";
+import { allowsTool } from "./atlassian-policy";
 
 export const codeModeToolName = "codemode";
 
@@ -281,7 +282,11 @@ function sandboxTools(
   invoke: HostInvoke,
 ): CodeModeTool[] {
   return definitions
-    .filter((definition) => ![codeModeToolName, discoveryToolName].includes(definition.name))
+    .filter(
+      (definition) =>
+        ![codeModeToolName, discoveryToolName].includes(definition.name) &&
+        allowsTool(definition.name, "codemode"),
+    )
     .map(
       (definition) =>
         toolDefinition({

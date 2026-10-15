@@ -80,6 +80,7 @@ export type AgentLoopResult =
 export type AgentOrchestration = (
   call: ModelCall,
   step: string,
+  context: readonly UIMessage[],
 ) => Promise<{ output: unknown; error: boolean } | undefined>;
 
 type AgentLoopInput = {
@@ -218,7 +219,7 @@ async function toolTurn(
     await input.assertExecution?.();
     const current = conversation;
     const name = `tool:${turn}:${index}`;
-    const handled = await input.orchestrate?.(call, name);
+    const handled = await input.orchestrate?.(call, name, current.context);
     conversation = await input.checkpoint({
       name,
       work: () =>

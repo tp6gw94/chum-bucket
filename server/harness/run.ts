@@ -14,6 +14,7 @@ import { prepareCompaction, publishCompaction, readCompactionPolicy } from "./co
 import { modelChatStream } from "./model-turn";
 import type { ConversationState } from "./conversation";
 import { withRunTools, type RunTools } from "./tools";
+import { gateToolApproval, withCommentApproval } from "./tool-approval";
 import { DELEGATE_TASK_TOOL, withDelegation } from "./tools/delegate-task";
 import {
   BUILD,
@@ -116,15 +117,19 @@ function executionGuard(run: AcceptedRun) {
 }
 
 async function finishChatRun(run: AcceptedRun, baseTools: RunTools, signal: AbortSignal) {
-  const tools = run.sideChat ? baseTools : withDelegation(baseTools);
+  const tools = run.sideChat ? baseTools : withCommentApproval(withDelegation(baseTools));
   const compact: AgentCompact = (input) => compactConversation(run, tools, input, signal);
   const assertExecution = executionGuard(run);
   const orchestrate: AgentOrchestration | undefined = run.sideChat
     ? undefined
-    : async (call, step) =>
+    : async (call, step, context) =>
         call.name === DELEGATE_TASK_TOOL
           ? delegateBrowserTask(run.runId, run.model, call, step)
-          : undefined;
+          : gateToolApproval(
+              { runId: run.runId, threadId: run.threadId, workflowId: run.runId },
+              call,
+              context,
+            );
   const result = await runAgentLoop({
     session: runSession(run, tools),
     conversation: run.conversation,

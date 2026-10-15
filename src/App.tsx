@@ -4,11 +4,13 @@ import { useEffect, useRef, useState } from "react";
 
 import { Pane } from "./components/pane";
 import { SideChatPane } from "./components/side-chat-pane";
+import { ToolApprovals } from "./components/tool-approvals";
 import { ThreadSidebar } from "./components/thread-sidebar";
 import { TopBar } from "./components/top-bar";
 import type { Pane as PaneModel, ThreadSummary } from "./components/types";
 import {
   createThread,
+  decideApproval,
   readPageEntry,
   threadStatus,
   threadUrl,
@@ -143,7 +145,9 @@ function ThreadWorkspace({
             isHydrating={thread.phase === "loading"}
             hydrationError={thread.error}
             notice={thread.notice}
-          />
+          >
+            <ToolApprovals approvals={thread.approvals} onDecide={decideApproval} />
+          </Pane>
           {sideChats.chats.map((chat) => (
             <SideChatPane
               key={chat.id}
