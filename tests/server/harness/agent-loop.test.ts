@@ -448,3 +448,36 @@ for (const fail of [
     assert.deepEqual(counts, { model: 1, summary: 0 });
   });
 }
+
+test("orchestration runs outside tool checkpoints and settles without native dispatch", async () => {
+  const { session, counts } = scriptedSession([
+    { tool: "delegate_task", input: {} },
+    { text: "Delegated" },
+  ]);
+  let inCheckpoint = false;
+  let orchestrations = 0;
+  const result = await runAgentLoop({
+    session,
+    conversation,
+    compact: skipCompact,
+    model: "offline",
+    prompt: "prompt",
+    checkpoint: async ({ work }) => {
+      inCheckpoint = true;
+      try {
+        return await work();
+      } finally {
+        inCheckpoint = false;
+      }
+    },
+    orchestration: async () => {
+      assert.equal(inCheckpoint, false);
+      orchestrations++;
+      return { state: "handled", output: { ref: "artifact" } };
+    },
+  });
+  assert.equal(result.state, "done");
+  assert.equal(orchestrations, 1);
+  assert.equal(counts.tool, 0);
+  assert.match(JSON.stringify(result.conversation.context), /artifact/);
+});

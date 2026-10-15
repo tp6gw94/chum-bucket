@@ -8,7 +8,8 @@ import {
   type CompactionPublish,
 } from "./compaction";
 import type { ConversationState } from "./conversation";
-import { withRunTools, type RunTools } from "./tools";
+import { testingOrchestration } from "./testing-run";
+import { withMainTools, type RunTools } from "./tools";
 import {
   BUILD,
   MODEL,
@@ -97,6 +98,7 @@ async function finishChatRun(
     prompt: run.prompt,
     checkpoint: runCheckpoint,
     compact: runCompactor(run, session),
+    orchestration: testingOrchestration(run),
   });
 
   if (result.state === "limit") {
@@ -111,7 +113,7 @@ export async function executeRun(run: AcceptedRun) {
     throw new Error("Incompatible run build");
   }
 
-  return withRunTools(async (tools) => {
+  return withMainTools(async (tools) => {
     const session = runSession(run, tools);
     const conversation = { display: run.messages, context: run.context };
 
@@ -120,7 +122,7 @@ export async function executeRun(run: AcceptedRun) {
     } else {
       await finishChatRun(run, session, conversation);
     }
-  });
+  }, run.delegationAllowed !== false);
 }
 
 const workflow = DBOS.registerWorkflow(executeRun, { name: BUILD });
@@ -169,6 +171,7 @@ export async function launchChatRuntime() {
 
   try {
     await DBOS.launch();
+    await DBOS.registerQueue("testing-delegation");
     await reconcileRuns();
   } catch (error) {
     await DBOS.shutdown();

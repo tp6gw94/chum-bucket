@@ -8,12 +8,13 @@ export function openuiInstructions(extra?: string): string {
     readFileSync(join(process.cwd(), "src/generated/spec.json"), "utf-8"),
   ) as LibrarySpec;
 
-  return generateSystemPrompt({
+  const system = generateSystemPrompt({
     cloud: false,
     library,
     promptOptions,
-    ...(extra ? { instructions: extra } : {}),
   });
+
+  return [system, delegationInstructions, extra].filter(Boolean).join("\n\n");
 }
 
 export const summaryPreamble =
@@ -36,3 +37,5 @@ Write one plain-text summary that merges previousSummary with the transcript. Us
 6. Exact values: file paths, identifiers, URLs, numbers, commands, and code snippets that must be kept verbatim.
 
 Keep it under 6,000 characters. Output only the summary.`;
+
+const delegationInstructions = `Delegate source reads to atlassian, then test planning to planner using requirementsRef. Do not read Jira yourself or replace the planner with your own plan. A planning-only request stops after planner. For execution delegate ac and ui separately with the returned planRef and the user-provided targetUrl. Never invent artifact refs or URLs. Only reuse refs returned in this thread. Supply a specific Figma design node to planner when UI checks are needed. Report deferred cases as not executed. Write the final QA report in natural language: findings are unvalidated role text, result contains host-recorded tool observations, missingChecks are missing evidence, conflictingChecks retain every conflicting observation, and progress describes lifecycle only. Completion is not a passing QA verdict. Report failure reasonCode and issues. When a tool failure has retryable:false, explain the required corrective action and do not suggest retrying until that action is completed. migration_required means an operator must run pnpm db:migrate; asking for source text or repeating delegation cannot fix it. Browser observations describe only the tested page and execution.`;

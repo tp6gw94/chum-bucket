@@ -74,3 +74,69 @@ export const chatEventsTable = pgTable(
     check("chat_events_sequence_nonnegative", sql`${t.sequence} >= 0`),
   ],
 );
+
+export const testingOperationsTable = pgTable(
+  "testing_operations",
+  {
+    id: text().primaryKey(),
+    parent_run_id: text()
+      .notNull()
+      .references(() => chatRunsTable.id, { onDelete: "cascade" }),
+    thread_id: uuid()
+      .notNull()
+      .references(() => threadsTable.id, { onDelete: "cascade" }),
+    request_key: text().notNull(),
+    input: jsonb().notNull().$type<import("../harness/testing-store").TestingInput>(),
+    input_digest: text().notNull(),
+    deadline: timestamp({ withTimezone: true }).notNull(),
+    cancel_accepted_at: timestamp({ withTimezone: true }),
+    finished_at: timestamp({ withTimezone: true }),
+    outcome: text().$type<"succeeded" | "failed" | "cancelled">(),
+    result: jsonb().$type<import("../harness/testing-run").DelegationResult>(),
+  },
+  (t) => [
+    unique("testing_operation_request_unique").on(t.parent_run_id, t.request_key),
+    index("testing_operations_thread_idx").on(t.thread_id),
+  ],
+);
+
+export const testingTasksTable = pgTable(
+  "testing_tasks",
+  {
+    id: text().primaryKey(),
+    operation_id: text()
+      .notNull()
+      .references(() => testingOperationsTable.id, { onDelete: "cascade" }),
+    child_workflow_id: text().notNull().unique(),
+    input_digest: text().notNull(),
+    model_attempts: jsonb().notNull().$type<Record<string, number>>().default({}),
+    native_calls: integer().notNull().default(0),
+    nested_calls: integer().notNull().default(0),
+    settled: jsonb().$type<import("../harness/testing-store").TestingOutput>(),
+  },
+  (t) => [unique("testing_task_operation_unique").on(t.operation_id)],
+);
+
+export const testingArtifactsTable = pgTable("testing_artifacts", {
+  ref: text().primaryKey(),
+  thread_id: uuid()
+    .notNull()
+    .references(() => threadsTable.id, { onDelete: "cascade" }),
+  task_id: text()
+    .notNull()
+    .references(() => testingTasksTable.id, { onDelete: "cascade" })
+    .unique(),
+  payload: jsonb().notNull().$type<import("../../shared/testing").Artifact>(),
+});
+
+export const testingReceiptsTable = pgTable(
+  "testing_receipts",
+  {
+    id: text().primaryKey(),
+    task_id: text()
+      .notNull()
+      .references(() => testingTasksTable.id, { onDelete: "cascade" }),
+    payload: jsonb().notNull().$type<import("../../shared/testing").Receipt>(),
+  },
+  (t) => [index("testing_receipts_task_idx").on(t.task_id)],
+);

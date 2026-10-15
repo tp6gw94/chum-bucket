@@ -78,6 +78,10 @@ export type AgentLoopResult =
   | { state: "done"; conversation: ConversationState }
   | { state: "limit"; conversation: ConversationState };
 
+export type AgentOrchestration = (
+  call: ModelCall,
+) => Promise<{ state: "handled"; output: unknown; error?: boolean } | { state: "unhandled" }>;
+
 type AgentLoopInput = {
   session: AgentSession;
   conversation: ConversationState;
@@ -85,6 +89,11 @@ type AgentLoopInput = {
   prompt: string;
   checkpoint: AgentCheckpoint;
   compact: AgentCompact;
+  orchestration?: AgentOrchestration;
+  maxTurns?: number;
+  finalTurnPrompt?: string;
+  signal?: AbortSignal;
+  toolTimeoutMs?: number;
 };
 
 type ModelStepResult =
@@ -104,12 +113,19 @@ async function openModelStream(
 
 async function modelStep(
   session: AgentSession,
-  input: { conversation: ConversationState; model: string; prompt: string },
+  input: {
+    conversation: ConversationState;
+    model: string;
+    prompt: string;
+    final?: boolean;
+    signal?: AbortSignal;
+  },
 ): Promise<ModelStepResult> {
   const { conversation, model, prompt } = input;
   const { context } = conversation;
   await session.emit(session.runId, snapshot(conversation.display), conversation);
-  const definitions = await session.tools.getModelTools(context);
+  input.signal?.throwIfAborted();
+  const definitions = input.final ? [] : await session.tools.getModelTools(context);
 
   try {
     const result = await streamModelTurn({
@@ -120,7 +136,12 @@ async function modelStep(
         systemPrompts: [prompt],
         tools: definitions,
         logger: resolveDebugOption(false),
-        request: { signal: AbortSignal.timeout(MODEL_REQUEST_TIMEOUT_MS) },
+        request: {
+          signal: AbortSignal.any([
+            AbortSignal.timeout(MODEL_REQUEST_TIMEOUT_MS),
+            ...(input.signal ? [input.signal] : []),
+          ]),
+        },
       }),
       append: (event) => session.emit(session.runId, event),
     });
@@ -190,7 +211,12 @@ async function settleToolStep(
 
 async function executeToolStep(
   session: AgentSession,
-  input: { conversation: ConversationState; call: ModelCall },
+  input: {
+    conversation: ConversationState;
+    call: ModelCall;
+    signal?: AbortSignal;
+    timeoutMs?: number;
+  },
 ): Promise<ConversationState> {
   const { conversation, call } = input;
   const messages = conversation.context;
@@ -202,7 +228,10 @@ async function executeToolStep(
   try {
     const context = {
       toolCallId: call.id,
-      abortSignal: AbortSignal.timeout(TOOL_REQUEST_TIMEOUT_MS),
+      abortSignal: AbortSignal.any([
+        AbortSignal.timeout(input.timeoutMs ?? TOOL_REQUEST_TIMEOUT_MS),
+        ...(input.signal ? [input.signal] : []),
+      ]),
       emitCustomEvent: (name: string, value: Record<string, unknown>) => {
         if (events.length < MAX_TOOL_EVENTS) {
           events.push({
@@ -233,9 +262,24 @@ async function toolTurn(
 
   for (const [index, call] of calls.entries()) {
     const current = conversation;
+    const orchestrated = await input.orchestration?.(call);
     conversation = await input.checkpoint({
       name: `tool:${turn}:${index}`,
-      work: () => executeToolStep(input.session, { conversation: current, call }),
+      work: () =>
+        orchestrated?.state === "handled"
+          ? settleToolStep(input.session, {
+              conversation: current,
+              call,
+              output: orchestrated.output,
+              error: orchestrated.error ?? false,
+              events: [],
+            })
+          : executeToolStep(input.session, {
+              conversation: current,
+              call,
+              signal: input.signal,
+              timeoutMs: input.toolTimeoutMs,
+            }),
     });
   }
 
@@ -282,17 +326,32 @@ export async function runAgentLoop(input: AgentLoopInput): Promise<AgentLoopResu
   const { session, model, prompt } = input;
   let conversation = input.conversation;
 
-  for (let turn = 0; turn < MAX_TURN; turn++) {
+  for (let turn = 0; turn < (input.maxTurns ?? MAX_TURN); turn++) {
+    input.signal?.throwIfAborted();
     ({ conversation } = await input.compact({ conversation, reason: "threshold", turn }));
     const current = conversation;
     const attempt = await input.checkpoint({
       name: `model:${turn}`,
       retry: MODEL_RETRY,
-      work: () => modelStep(session, { conversation: current, model, prompt }),
+      work: () =>
+        modelStep(session, {
+          conversation: current,
+          model,
+          prompt:
+            turn === (input.maxTurns ?? MAX_TURN) - 1 && input.finalTurnPrompt
+              ? `${prompt}\n${input.finalTurnPrompt}`
+              : prompt,
+          final: turn === (input.maxTurns ?? MAX_TURN) - 1 && !!input.finalTurnPrompt,
+          signal: input.signal,
+        }),
     });
     const result =
       attempt.state === "overflow" ? await retryOverflow(input, current, turn) : attempt;
     conversation = result.conversation;
+
+    if (turn === (input.maxTurns ?? MAX_TURN) - 1 && input.finalTurnPrompt && result.calls.length) {
+      return { state: "limit", conversation };
+    }
 
     if (!result.calls.length) {
       return { state: "done", conversation };

@@ -127,3 +127,30 @@ export function readAtlassianConfiguration(env: Environment): AtlassianConfigura
     secrets: secretsFor(email, token),
   };
 }
+
+export function configuredAtlassianSecrets(env: Environment): readonly string[] {
+  return env.JIRA_API_TOKEN ? secretsFor(env.JIRA_EMAIL ?? "", env.JIRA_API_TOKEN) : [];
+}
+
+export function assertCredentialFree(value: unknown, secrets: readonly string[]) {
+  const seen = new WeakSet<object>();
+
+  const inspect = (item: unknown) => {
+    if (typeof item === "string" && secrets.some((secret) => item.includes(secret))) {
+      throw new Error("Tool data contains configured Atlassian credentials");
+    }
+
+    if (!item || typeof item !== "object" || seen.has(item)) {
+      return;
+    }
+
+    seen.add(item);
+
+    for (const key of Object.getOwnPropertyNames(item)) {
+      inspect(key);
+      inspect((item as Record<string, unknown>)[key]);
+    }
+  };
+
+  inspect(value);
+}

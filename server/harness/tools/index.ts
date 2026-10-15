@@ -11,10 +11,16 @@ import {
   type LocalToolHandler,
   type ModelTool,
 } from "./atlassian";
-import { atlassianToolNames } from "./atlassian-policy";
+import {
+  atlassianToolNames,
+  configuredAtlassianSecrets,
+  assertCredentialFree,
+} from "./atlassian-policy";
 import { withCodeMode } from "./code-mode";
 import { getFigma } from "./get-figma";
 import { read, write, edit } from "./fs";
+import { delegateTaskTool } from "./delegate-task";
+import { agentTools } from "../tool-policy";
 
 type Registration = Readonly<{
   definition: ModelTool;
@@ -28,6 +34,7 @@ export type RunTools = Readonly<{
     messages: readonly UIMessage[],
     call: ModelCall,
     context: ToolExecutionContext,
+    route?: "direct" | "codemode",
   ) => Promise<unknown>;
 }>;
 
@@ -88,5 +95,48 @@ export async function withRunTools<T>(use: (tools: RunTools) => Promise<T>): Pro
         { sandboxed },
       ),
     ),
+  );
+}
+
+export async function withMainTools<T>(
+  use: (tools: RunTools) => Promise<T>,
+  delegationAllowed = true,
+): Promise<T> {
+  const catalog = new Map(localCatalog);
+  const delegation = registration(delegateTaskTool, async () => {
+    throw new Error("delegate_task requires workflow orchestration");
+  });
+  catalog.set(delegateTaskTool.name, delegation);
+
+  const secrets = configuredAtlassianSecrets(process.env);
+
+  return use(
+    agentTools("main", {
+      getModelTools: async () =>
+        [...catalog.values()]
+          .map((entry) => entry.definition)
+          .filter((tool) => delegationAllowed || tool.name !== delegateTaskTool.name),
+      executeTool: async (_messages, call, context) => {
+        if (!delegationAllowed && call.name === delegateTaskTool.name) {
+          throw new Error("Side conversations cannot delegate");
+        }
+
+        const entry = catalog.get(call.name);
+
+        if (!entry) {
+          throw new Error("Unknown tool");
+        }
+
+        try {
+          const output = await entry.handler(call.input, context);
+          assertCredentialFree(output, secrets);
+
+          return output;
+        } catch (error) {
+          assertCredentialFree(error, secrets);
+          throw error;
+        }
+      },
+    }),
   );
 }

@@ -38,6 +38,7 @@ export type CodeModeOptions = Readonly<{
   sandboxed: ReadonlySet<string>;
   limits?: CodeModeLimits;
   driver?: IsolateDriver;
+  allowEmpty?: boolean;
 }>;
 
 export type CodeModeResult = {
@@ -239,6 +240,7 @@ function dispatcher(execution: Execution, signal: AbortSignal, limits: CodeModeL
           messages,
           { id, name: tool.name, arguments: JSON.stringify(input), input },
           { toolCallId: id, abortSignal: signal, emitCustomEvent: emit },
+          "codemode",
         ),
         signal,
       );
@@ -333,7 +335,9 @@ export function withCodeMode(base: RunTools, options: CodeModeOptions): RunTools
       const definitions = await base.getModelTools(messages);
       const tools = sandboxTools(definitions, options.sandboxed);
 
-      return tools.length ? [...definitions, definition(tools, limits)] : definitions;
+      return tools.length || options.allowEmpty
+        ? [...definitions, definition(tools, limits)]
+        : definitions;
     },
     executeTool(messages, call, context) {
       return call.name === codeModeToolName

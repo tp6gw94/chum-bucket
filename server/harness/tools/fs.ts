@@ -35,6 +35,7 @@ export const read = toolDefinition({
 
 export const write = toolDefinition({
   name: nativeWrite.name,
+  metadata: { direct: true },
   description: nativeWrite.description,
   inputSchema: nativeWrite.parameters,
 }).server(async (input, context) =>
@@ -43,6 +44,7 @@ export const write = toolDefinition({
 
 export const edit = toolDefinition({
   name: nativeEdit.name,
+  metadata: { direct: true },
   description: nativeEdit.description,
   inputSchema: nativeEdit.parameters,
 }).server(async (input, context) =>

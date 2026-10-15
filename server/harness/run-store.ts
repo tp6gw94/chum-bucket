@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { AGENT_MODEL, agentRegistry } from "./agents";
 import { isDeepStrictEqual } from "node:util";
 import { setTimeout as delay } from "node:timers/promises";
 import { and, eq, gt, sql } from "drizzle-orm";
@@ -6,13 +7,12 @@ import { EventType, type StreamChunk, type UIMessage } from "@tanstack/ai";
 import { z } from "zod";
 import { chatEventsTable, chatRunsTable, threadsTable } from "../db/schema";
 import { parseCompactionEvent, type CompactionState } from "../../shared/compaction-event";
-import { openuiInstructions } from "./prompts";
 import { snapshot } from "./model-turn";
 import { compactionEvent } from "./compaction";
 import { isSummary, readProjection, writeProjection, type ConversationState } from "./conversation";
 
-export const BUILD = "durable-chat-loop-v6";
-export const MODEL = "deepseek-ai/DeepSeek-V4.1-Flash";
+export const BUILD = "durable-chat-loop-v7";
+export const MODEL = AGENT_MODEL;
 const runIdSchema = z
   .string()
   .min(1)
@@ -37,6 +37,7 @@ export type AcceptedRun = RunInput & {
   messages: UIMessage[];
   context: UIMessage[];
   prompt: string;
+  delegationAllowed?: boolean;
   model: typeof MODEL;
   build: typeof BUILD;
 };
@@ -182,7 +183,8 @@ export async function persistRun(value: RunInput) {
       ...input,
       messages: [...thread.messages, ...added],
       context: [...context, ...added],
-      prompt: openuiInstructions(),
+      prompt: agentRegistry.main.systemPrompt(),
+      delegationAllowed: !thread.parent_thread_id,
       model: MODEL,
       build: BUILD,
     };

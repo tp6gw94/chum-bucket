@@ -9,6 +9,7 @@ import { z } from "zod";
 import type { ModelCall } from "../model-turn";
 import {
   atlassianTools,
+  assertCredentialFree,
   readAtlassianConfiguration,
   type AtlassianConfiguration,
 } from "./atlassian-policy";
@@ -366,25 +367,11 @@ function armedDeadline(deadlines: Set<AbortSignal>, ms: number): Deadline {
 }
 
 function guardCredentials(value: unknown, config: AtlassianConfiguration) {
-  const secrets = config.mode === "http" ? config.secrets : [];
-  const seen = new WeakSet<object>();
-
-  function inspect(value: unknown) {
-    if (typeof value === "string" && secrets.some((secret) => value.includes(secret))) {
-      throw new ToolBoundaryError("Tool data contains configured Atlassian credentials");
-    }
-
-    if (value && typeof value === "object" && !seen.has(value)) {
-      seen.add(value);
-
-      for (const key of Object.getOwnPropertyNames(value)) {
-        inspect(key);
-        inspect((value as Record<string, unknown>)[key]);
-      }
-    }
+  try {
+    assertCredentialFree(value, config.mode === "http" ? config.secrets : []);
+  } catch {
+    throw new ToolBoundaryError("Tool data contains configured Atlassian credentials");
   }
-
-  inspect(value);
 }
 
 function withAbort<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
