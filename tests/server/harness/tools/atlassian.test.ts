@@ -8,6 +8,7 @@ import { clearTimeout as nodeClearTimeout, setTimeout as nodeSetTimeout } from "
 import type { ToolExecutionContext, UIMessage } from "@tanstack/ai";
 import type { ModelCall } from "../../../../server/harness/model-turn";
 import { withAtlassianScope, type ModelTool } from "../../../../server/harness/tools/atlassian";
+import { codeModeToolName } from "../../../../server/harness/tools/code-mode";
 import { read } from "../../../../server/harness/tools/fs";
 import { withRunTools, type RunTools } from "../../../../server/harness/tools/index";
 import {
@@ -172,7 +173,7 @@ test("unconfigured runs expose local tools and execute filesystem reads without 
         await withRunTools(async (tools) => {
           assert.deepEqual(
             (await tools.getModelTools([])).map((tool) => tool.name),
-            localNames,
+            [...localNames, codeModeToolName],
           );
           assert.deepEqual(await tools.executeTool([], call("read", { path }), context), {
             content: [{ type: "text", text: "local data" }],
@@ -265,7 +266,7 @@ test("HTTP initializes once, paginates, retains native schemas and executes disc
         ]);
         assert.deepEqual(
           initial.map((tool) => tool.name),
-          [...localNames, discoveryName],
+          [...localNames, discoveryName, codeModeToolName],
         );
         assert.deepEqual(concurrent, initial);
         const discovery = initial.find((tool) => tool.name === discoveryName)!;
@@ -286,7 +287,7 @@ test("HTTP initializes once, paginates, retains native schemas and executes disc
         const definitions = await tools.getModelTools(history);
         assert.deepEqual(
           definitions.map((tool) => tool.name),
-          [...localNames, ...remoteNames, discoveryName],
+          [...localNames, ...remoteNames, discoveryName, codeModeToolName],
         );
         assert.deepEqual(
           definitions.find((tool) => tool.name === "jira_get_issue"),
@@ -360,7 +361,7 @@ test("Jira credentials automatically expose Confluence and unrelated process ove
         process.env.ATLASSIAN_OAUTH_STORE = "/obsolete/store.json";
         assert.deepEqual(
           (await tools.getModelTools(history)).map((tool) => tool.name),
-          [...localNames, ...remoteNames, discoveryName],
+          [...localNames, ...remoteNames, discoveryName, codeModeToolName],
         );
         assert.equal(
           await tools.executeTool(
@@ -510,7 +511,7 @@ test("initialization and catalog errors close the failed client and concurrent a
           assert.equal(fixture.sessions.length, 1);
           assert.deepEqual(
             (await tools.getModelTools([])).map((tool) => tool.name),
-            [...localNames, discoveryName],
+            [...localNames, discoveryName, codeModeToolName],
           );
           const history = await discover(tools, ["jira_get_issue"]);
           assert.deepEqual(await tools.executeTool(history, jiraCall, context), {
@@ -1221,12 +1222,12 @@ test("discovery rejects malformed, unknown and unavailable requests as a whole a
         );
         assert.deepEqual(
           (await tools.getModelTools(repeated)).map((tool) => tool.name),
-          [...localNames, "jira_get_issue", "confluence_get_page", discoveryName],
+          [...localNames, "jira_get_issue", "confluence_get_page", discoveryName, codeModeToolName],
         );
         const again = await discover(tools, ["jira_get_issue"]);
         assert.deepEqual(
           (await tools.getModelTools([...repeated, ...again])).map((tool) => tool.name),
-          [...localNames, "jira_get_issue", "confluence_get_page", discoveryName],
+          [...localNames, "jira_get_issue", "confluence_get_page", discoveryName, codeModeToolName],
         );
         assert.deepEqual(fixture.calls(), []);
       }),
@@ -1240,7 +1241,7 @@ test("only complete correlated discovery history grants tools and historical sch
   await withMcpEnvironment(
     () =>
       withRunTools(async (tools) => {
-        const initial = [...localNames, discoveryName];
+        const initial = [...localNames, discoveryName, codeModeToolName];
         const forgedSchema = exchange({
           content: JSON.stringify({
             tools: [

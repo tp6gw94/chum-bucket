@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import type { AdapterYieldChunk, UIMessage } from "@tanstack/ai";
+import type { AdapterYieldChunk, StreamChunk, UIMessage } from "@tanstack/ai";
 import {
   runAgentLoop,
   type AgentCheckpoint,
   type AgentSession,
 } from "../../../server/harness/agent-loop";
+import type { RunTools } from "../../../server/harness/tools";
+import { codeModeToolName, withCodeMode } from "../../../server/harness/tools/code-mode";
 
 type Step = { tool: string; input: Record<string, unknown> } | { text: string };
 
@@ -148,4 +150,160 @@ test("a rerun reuses completed checkpoints and only executes unfinished steps", 
   assert.equal(result.state, "done");
   assert.deepEqual(second.counts, { model: 1, tool: 0 });
   assert.match(JSON.stringify(result.messages), /"issue":"PROJ-1"/);
+});
+
+const program = `
+  const files = await Promise.all(["a.md", "b.md"].map((path) => external_read({ path })));
+  return files.map((file) => (file as { path: string }).path).join(",");
+`;
+const codeSteps: Step[] = [
+  { tool: codeModeToolName, input: { typescriptCode: program } },
+  { text: "Read a.md and b.md" },
+];
+
+function codeModeSession(steps: Step[], tools: RunTools) {
+  const counts = { model: 0 };
+  const emitted: StreamChunk[] = [];
+  const session: AgentSession = {
+    runId: "run",
+    emit: async (_runId, event) => {
+      emitted.push(structuredClone(event));
+    },
+    chatStream: async () => {
+      const events = modelEvents(steps[counts.model]!, counts.model);
+      counts.model++;
+      return (async function* () {
+        yield* events;
+      })();
+    },
+    tools,
+  };
+  return { session, counts, emitted };
+}
+
+function readOnlyTools(dispatched: string[]): RunTools {
+  return withCodeMode(
+    {
+      getModelTools: async () => [
+        {
+          name: "read",
+          description: "Read a file",
+          inputSchema: { type: "object", properties: { path: { type: "string" } } },
+        },
+        {
+          name: "write",
+          description: "Write a file",
+          inputSchema: { type: "object", properties: { path: { type: "string" } } },
+        },
+      ],
+      executeTool: async (_messages, call) => {
+        dispatched.push(`${call.name}:${(call.input as { path: string }).path}`);
+        return { path: (call.input as { path: string }).path };
+      },
+    },
+    { sandboxed: new Set(["read"]) },
+  );
+}
+
+test("a Code Mode program is one checkpoint and recovery replays it whole", async () => {
+  const cache = new Map<string, unknown>();
+  const dispatched: string[] = [];
+  const crashing: AgentCheckpoint = async ({ name, work }) => {
+    if (cache.has(name)) {
+      return structuredClone(cache.get(name)) as Awaited<ReturnType<typeof work>>;
+    }
+    const result = await work();
+    if (name === "tool:0:0") {
+      throw new Error("process exited before the checkpoint committed");
+    }
+    cache.set(name, structuredClone(result));
+    return result;
+  };
+  const first = codeModeSession(codeSteps, readOnlyTools(dispatched));
+  await assert.rejects(
+    runAgentLoop({
+      session: first.session,
+      messages,
+      model: "offline",
+      prompt: "prompt",
+      checkpoint: crashing,
+    }),
+    /before the checkpoint committed/,
+  );
+  assert.deepEqual(dispatched, ["read:a.md", "read:b.md"]);
+
+  const names: string[] = [];
+  const second = codeModeSession([codeSteps[1]!, codeSteps[1]!], readOnlyTools(dispatched));
+  const result = await runAgentLoop({
+    session: second.session,
+    messages,
+    model: "offline",
+    prompt: "prompt",
+    checkpoint: cachedCheckpoint(cache, names),
+  });
+
+  assert.equal(result.state, "done");
+  assert.deepEqual(names, ["model:0", "tool:0:0", "model:1"]);
+  assert.equal(second.counts.model, 1);
+  assert.deepEqual(dispatched, ["read:a.md", "read:b.md", "read:a.md", "read:b.md"]);
+  const toolResult = result.messages
+    .flatMap((message) => message.parts)
+    .find((part) => part.type === "tool-result");
+  assert.ok(toolResult && toolResult.type === "tool-result");
+  assert.deepEqual(JSON.parse(String(toolResult.content)), {
+    success: true,
+    result: "a.md,b.md",
+    logs: [],
+    toolCalls: 2,
+  });
+
+  const settled = second.emitted.filter(
+    (event) => event.type === "CUSTOM" || event.type === "TOOL_CALL_RESULT",
+  );
+  assert.equal(settled.at(-1)!.type, "TOOL_CALL_RESULT");
+  assert.deepEqual(
+    settled.slice(0, -1).map((event) => event.type === "CUSTOM" && event.name),
+    [
+      "code_mode:external_call",
+      "code_mode:external_call",
+      "code_mode:external_result",
+      "code_mode:external_result",
+      "code_mode:execution_finished",
+    ],
+  );
+  assert.ok(
+    settled.every((event) => event.type !== "CUSTOM" || event.value.toolCallId === "call-0"),
+  );
+});
+
+test("tool custom events are persisted in order and capped per tool call", async () => {
+  const tools: RunTools = {
+    getModelTools: async () => [
+      { name: "noisy", description: "Emit events", inputSchema: { type: "object" } },
+    ],
+    executeTool: async (_messages, _call, context) => {
+      for (let index = 0; index < 100; index++) {
+        context.emitCustomEvent("noisy:tick", { index });
+      }
+      return "done";
+    },
+  };
+  const { session, emitted } = codeModeSession(
+    [{ tool: "noisy", input: {} }, { text: "done" }],
+    tools,
+  );
+  await runAgentLoop({
+    session,
+    messages,
+    model: "offline",
+    prompt: "prompt",
+    checkpoint: cachedCheckpoint(new Map(), []),
+  });
+  const custom = emitted.filter((event) => event.type === "CUSTOM");
+
+  assert.equal(custom.length, 64);
+  assert.deepEqual(
+    custom.map((event) => event.type === "CUSTOM" && event.value.index),
+    [...Array(64).keys()],
+  );
 });

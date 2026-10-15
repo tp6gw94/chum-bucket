@@ -14,6 +14,7 @@ import type { RunTools } from "./tools";
 const MODEL_REQUEST_TIMEOUT_MS = 120_000;
 const TOOL_REQUEST_TIMEOUT_MS = 35_000;
 const MAX_TURN = 20;
+const MAX_TOOL_EVENTS = 64;
 
 const MODEL_RETRY: AgentRetry = {
   retriesAllowed: true,
@@ -95,13 +96,23 @@ async function modelStep(
 
 async function settleToolStep(
   session: AgentSession,
-  input: { messages: UIMessage[]; call: ModelCall; output: unknown; error: boolean },
+  input: {
+    messages: UIMessage[];
+    call: ModelCall;
+    output: unknown;
+    error: boolean;
+    events: readonly StreamChunk[];
+  },
 ): Promise<UIMessage[]> {
-  const { messages, call, output, error } = input;
+  const { messages, call, output, error, events } = input;
   const content = JSON.stringify(output);
 
   if (typeof content !== "string") {
     throw new Error("Tool output is not JSON serializable");
+  }
+
+  for (const event of events) {
+    await session.emit(session.runId, event);
   }
 
   const event: StreamChunk = {
@@ -127,6 +138,7 @@ async function executeToolStep(
 ): Promise<UIMessage[]> {
   const { messages, call } = input;
   await session.emit(session.runId, snapshot(messages), messages);
+  const events: StreamChunk[] = [];
   let output: unknown;
   let error = false;
 
@@ -134,8 +146,15 @@ async function executeToolStep(
     const context = {
       toolCallId: call.id,
       abortSignal: AbortSignal.timeout(TOOL_REQUEST_TIMEOUT_MS),
-      emitCustomEvent: () => {
-        throw new Error("Tool custom events are not supported");
+      emitCustomEvent: (name: string, value: Record<string, unknown>) => {
+        if (events.length < MAX_TOOL_EVENTS) {
+          events.push({
+            type: EventType.CUSTOM,
+            name,
+            value: JSON.parse(JSON.stringify({ ...value, toolCallId: call.id })),
+            timestamp: Date.now(),
+          });
+        }
       },
     };
     output = await session.tools.executeTool(messages, call, context);
@@ -144,7 +163,7 @@ async function executeToolStep(
     error = true;
   }
 
-  return settleToolStep(session, { messages, call, output, error });
+  return settleToolStep(session, { messages, call, output, error, events });
 }
 
 async function toolTurn(

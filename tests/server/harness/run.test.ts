@@ -1617,7 +1617,7 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
       }) {
         assert.deepEqual(
           options.tools?.map((tool) => tool.name),
-          ["get_figma", "read", "write", "edit"],
+          ["get_figma", "read", "write", "edit", "execute_typescript"],
         );
         assert.ok(options.tools?.every((tool) => !("execute" in tool) && tool.inputSchema));
         if (rejectedStream) {
@@ -1891,7 +1891,7 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
         }) {
           assert.deepEqual(
             options.tools?.map((tool) => tool.name),
-            ["get_figma", "read", "write", "edit"],
+            ["get_figma", "read", "write", "edit", "execute_typescript"],
           );
           assert.ok(options.tools?.every((tool) => !("execute" in tool) && tool.inputSchema));
           for (const native of [
@@ -2062,7 +2062,14 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
             if (!toolIds.length) {
               assert.deepEqual(
                 options.tools?.map((tool) => tool.name),
-                ["get_figma", "read", "write", "edit", "discover_atlassian_tools"],
+                [
+                  "get_figma",
+                  "read",
+                  "write",
+                  "edit",
+                  "discover_atlassian_tools",
+                  "execute_typescript",
+                ],
               );
               yield {
                 type: EventType.TEXT_MESSAGE_START,
@@ -2093,6 +2100,7 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
                   "jira_search",
                   "confluence_get_page",
                   "discover_atlassian_tools",
+                  "execute_typescript",
                 ],
               );
               assert.deepEqual(

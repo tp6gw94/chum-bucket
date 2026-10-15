@@ -11,6 +11,8 @@ import {
   type LocalToolHandler,
   type ModelTool,
 } from "./atlassian";
+import { atlassianToolNames } from "./atlassian-policy";
+import { withCodeMode } from "./code-mode";
 import { getFigma } from "./get-figma";
 import { read, write, edit } from "./fs";
 
@@ -58,6 +60,8 @@ const localCatalog: Catalog = new Map(
   ].map((entry) => [entry.definition.name, entry]),
 );
 
+const sandboxed: ReadonlySet<string> = new Set([getFigma.name, read.name, ...atlassianToolNames]);
+
 function mergeLocalDefinitions(remote: AtlassianCatalog): ModelTool[] {
   const definitions = new Map([...localCatalog].map(([name, entry]) => [name, entry.definition]));
 
@@ -74,10 +78,15 @@ function mergeLocalDefinitions(remote: AtlassianCatalog): ModelTool[] {
 
 export async function withRunTools<T>(use: (tools: RunTools) => Promise<T>): Promise<T> {
   return withAtlassianScope((scope) =>
-    use({
-      getModelTools: (messages) => scope.getModelTools(messages, mergeLocalDefinitions),
-      executeTool: (messages, call, context) =>
-        scope.executeTool(messages, call, context, localCatalog.get(call.name)?.handler),
-    }),
+    use(
+      withCodeMode(
+        {
+          getModelTools: (messages) => scope.getModelTools(messages, mergeLocalDefinitions),
+          executeTool: (messages, call, context) =>
+            scope.executeTool(messages, call, context, localCatalog.get(call.name)?.handler),
+        },
+        { sandboxed },
+      ),
+    ),
   );
 }
