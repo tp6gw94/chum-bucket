@@ -17,7 +17,7 @@ export function ProgressPanel({
     return null;
   }
 
-  const running = status === "running";
+  const running = status !== "idle";
 
   return (
     <Card size="sm">

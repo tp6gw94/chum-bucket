@@ -19,6 +19,64 @@ type ModelStream = {
   append: (event: StreamChunk) => Promise<void>;
 };
 
+export class ContextOverflowError extends Error {
+  override name = "ContextOverflowError";
+}
+
+const OVERFLOW_CODES = new Set([
+  "context_length_exceeded",
+  "max_context_length_exceeded",
+  "context_window_exceeded",
+]);
+const OVERFLOW_MESSAGE =
+  /maximum context length (?:is|of) \d+ tokens|context (?:length|window) (?:is )?exceeded/i;
+
+function errorField(error: unknown, field: "code" | "status" | "message"): unknown {
+  return typeof error === "object" && error !== null
+    ? (error as Record<string, unknown>)[field]
+    : undefined;
+}
+
+const TRANSIENT_STATUSES = new Set([401, 403, 408, 429]);
+const LIMIT_STATUSES = new Set([400, 413]);
+
+function hasOverflowCode(error: unknown): boolean {
+  const code = errorField(error, "code");
+
+  return typeof code === "string" && OVERFLOW_CODES.has(code);
+}
+
+function hasOverflowMessage(error: unknown): boolean {
+  const message = errorField(error, "message");
+
+  return typeof message === "string" && OVERFLOW_MESSAGE.test(message);
+}
+
+function isContextOverflow(error: unknown): boolean {
+  if (hasOverflowCode(error)) {
+    return true;
+  }
+
+  const code = errorField(error, "code");
+  const status = Number(errorField(error, "status") ?? code);
+  const transient = TRANSIENT_STATUSES.has(status) || status >= 500;
+  const limitStatus = code === undefined || LIMIT_STATUSES.has(status);
+
+  return !transient && limitStatus && hasOverflowMessage(error);
+}
+
+export function throwProviderError(error: unknown): never {
+  if (isContextOverflow(error)) {
+    throw new ContextOverflowError(String(errorField(error, "message") ?? "Context overflow"));
+  }
+
+  if (error instanceof Error) {
+    throw error;
+  }
+
+  throw new Error(String(errorField(error, "message") ?? "Provider request failed"));
+}
+
 export function snapshot(messages: UIMessage[]): StreamChunk {
   return { type: EventType.MESSAGES_SNAPSHOT, messages: uiMessagesToWire(messages) };
 }
@@ -65,7 +123,7 @@ function validateToolEvent(event: StreamChunk, processor: StreamProcessor): void
 
 function assertLiveEvent(event: StreamChunk, processor: StreamProcessor, finished: boolean): void {
   if (event.type === "RUN_ERROR") {
-    throw new Error(event.message);
+    throwProviderError(event);
   }
 
   if (finished) {

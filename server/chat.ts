@@ -1,4 +1,4 @@
-import { Hono } from "hono";
+import { Hono, type Context, type ErrorHandler } from "hono";
 import { z } from "zod";
 import type { StreamChunk } from "@tanstack/ai";
 import { acceptRun } from "./harness/run";
@@ -7,14 +7,15 @@ import {
   hydrateThread,
   observeRun,
   RunRequestError,
-  runInputSchema,
+  chatInputSchema,
+  compactInputSchema,
 } from "./harness/run-store";
 
 const app = new Hono();
 const bodySchema = z.object({
   threadId: z.uuid(),
-  runId: runInputSchema.shape.runId,
-  forwardedProps: z.object({ baseRevision: runInputSchema.shape.baseRevision }),
+  runId: chatInputSchema.shape.runId,
+  forwardedProps: z.object({ baseRevision: chatInputSchema.shape.baseRevision }),
   messages: z.array(z.unknown()).min(1).max(1000),
   tools: z.array(z.never()).optional(),
   context: z.array(z.never()).optional(),
@@ -47,7 +48,7 @@ export function parseRunBody(body: unknown, header?: string) {
     throw new RunRequestError(400, "A single user text message is required");
   }
 
-  const result = runInputSchema.safeParse({
+  const result = chatInputSchema.safeParse({
     threadId: input.threadId,
     runId: input.runId,
     baseRevision: input.forwardedProps.baseRevision,
@@ -62,6 +63,20 @@ export function parseRunBody(body: unknown, header?: string) {
   }
 
   return result.data;
+}
+
+export function parseCompactBody(body: unknown, header?: string) {
+  const parsed = compactInputSchema.safeParse(body);
+
+  if (!parsed.success) {
+    throw new RunRequestError(400, "Invalid compact input");
+  }
+
+  if (header !== parsed.data.runId) {
+    throw new RunRequestError(409, "Run header mismatch");
+  }
+
+  return parsed.data;
 }
 
 export function parseCursor(header?: string, offset?: string) {
@@ -126,7 +141,7 @@ export function eventResponse(
   });
 }
 
-app.onError((error, c) => {
+const handleError: ErrorHandler = (error, c) => {
   if (error instanceof RunRequestError) {
     return c.json({ error: error.message }, error.status);
   }
@@ -134,16 +149,21 @@ app.onError((error, c) => {
   console.error("Chat request failed", error);
 
   return c.json({ error: "Chat service unavailable" }, 503);
-});
+};
 
-app.post("/", async (c) => {
-  const input = parseRunBody(await c.req.json().catch(() => null), c.req.header("X-Run-Id"));
+async function startRun(c: Context, input: Parameters<typeof acceptRun>[0]) {
   const cursor = parseCursor(c.req.header("Last-Event-ID"));
   await acceptRun(input);
   await checkCursor(input.runId, cursor);
 
   return eventResponse((signal) => observeRun(input.runId, cursor, signal), c.req.raw.signal);
-});
+}
+
+app.onError(handleError);
+
+app.post("/", async (c) =>
+  startRun(c, parseRunBody(await c.req.json().catch(() => null), c.req.header("X-Run-Id"))),
+);
 
 app.get("/", async (c) => {
   const runId = c.req.query("runId");
@@ -162,5 +182,13 @@ app.get("/", async (c) => {
 
   return c.json(await hydrateThread(threadId));
 });
+
+export const compact = new Hono();
+
+compact.onError(handleError);
+
+compact.post("/", async (c) =>
+  startRun(c, parseCompactBody(await c.req.json().catch(() => null), c.req.header("X-Run-Id"))),
+);
 
 export default app;

@@ -5,29 +5,37 @@ import { and, eq, gt, sql } from "drizzle-orm";
 import { EventType, type StreamChunk, type UIMessage } from "@tanstack/ai";
 import { z } from "zod";
 import { chatEventsTable, chatRunsTable, threadsTable } from "../db/schema";
+import { parseCompactionEvent, type CompactionState } from "../../shared/compaction-event";
 import { openuiInstructions } from "./prompts";
 import { snapshot } from "./model-turn";
+import { compactionEvent } from "./compaction";
+import { isSummary, readProjection, writeProjection, type ConversationState } from "./conversation";
 
-export const BUILD = "durable-chat-loop-v5";
+export const BUILD = "durable-chat-loop-v6";
 export const MODEL = "deepseek-ai/DeepSeek-V4.1-Flash";
 const runIdSchema = z
   .string()
   .min(1)
   .max(200)
   .regex(/^[A-Za-z0-9_-]+$/);
-export const runInputSchema = z
-  .object({
-    threadId: z.uuid(),
-    runId: runIdSchema,
-    baseRevision: z.number().int().nonnegative().max(2_000_000_000),
+const runTargetSchema = z.object({
+  threadId: z.uuid(),
+  runId: runIdSchema,
+  baseRevision: z.number().int().nonnegative().max(2_000_000_000),
+});
+export const chatInputSchema = runTargetSchema
+  .extend({
     message: z
       .object({ id: z.string().min(1).max(200), text: z.string().trim().min(1).max(32_000) })
       .strict(),
   })
   .strict();
+export const compactInputSchema = runTargetSchema.extend({ kind: z.literal("compact") }).strict();
+const runInputSchema = z.union([chatInputSchema, compactInputSchema]);
 export type RunInput = z.infer<typeof runInputSchema>;
 export type AcceptedRun = RunInput & {
   messages: UIMessage[];
+  context: UIMessage[];
   prompt: string;
   model: typeof MODEL;
   build: typeof BUILD;
@@ -84,6 +92,40 @@ async function appendEvent(tx: Transaction, run: RunRow, key: string, event: Str
   run.next_sequence++;
 }
 
+async function readContext(tx: Transaction, thread: ThreadRow): Promise<UIMessage[]> {
+  const anchors = await tx
+    .select({ projection: chatRunsTable.projection })
+    .from(chatRunsTable)
+    .where(
+      and(
+        eq(chatRunsTable.thread_id, thread.id),
+        sql`${chatRunsTable.projection}->>'committedRevision' = ${String(thread.revision)}`,
+      ),
+    );
+
+  if (anchors.length > 1) {
+    throw new RunRequestError(409, "Ambiguous context anchor");
+  }
+
+  const [anchor] = anchors;
+
+  if (!anchor) {
+    if (thread.messages.some(isSummary)) {
+      throw new RunRequestError(409, "Missing context anchor");
+    }
+
+    return thread.messages;
+  }
+
+  const projection = readProjection(anchor.projection);
+
+  if (!isDeepStrictEqual(projection.display, thread.messages)) {
+    throw new RunRequestError(409, "Context anchor is stale");
+  }
+
+  return projection.context;
+}
+
 export async function persistRun(value: RunInput) {
   const parsed = runInputSchema.safeParse(value);
 
@@ -121,20 +163,25 @@ export async function persistRun(value: RunInput) {
       throw new RunRequestError(409, "Thread revision or claim conflict");
     }
 
-    if (thread.messages.some((message) => message.id === input.message.id)) {
-      throw new RunRequestError(409, "Message ID already exists");
+    const context = await readContext(tx, thread);
+    const added: UIMessage[] = [];
+
+    if ("message" in input) {
+      if ([...thread.messages, ...context].some((message) => message.id === input.message.id)) {
+        throw new RunRequestError(409, "Message ID already exists");
+      }
+
+      added.push({
+        id: input.message.id,
+        role: "user",
+        parts: [{ type: "text", content: input.message.text }],
+      });
     }
 
     const run: AcceptedRun = {
       ...input,
-      messages: [
-        ...thread.messages,
-        {
-          id: input.message.id,
-          role: "user",
-          parts: [{ type: "text", content: input.message.text }],
-        },
-      ],
+      messages: [...thread.messages, ...added],
+      context: [...context, ...added],
       prompt: openuiInstructions(),
       model: MODEL,
       build: BUILD,
@@ -146,7 +193,7 @@ export async function persistRun(value: RunInput) {
         thread_id: run.threadId,
         request: input,
         accepted: run,
-        projection: run.messages,
+        projection: writeProjection({ display: run.messages, context: run.context }),
       })
       .onConflictDoNothing({ target: chatRunsTable.id })
       .returning();
@@ -171,22 +218,77 @@ export async function persistRun(value: RunInput) {
   return accepted;
 }
 
-export async function emit(runId: string, event: StreamChunk, messages?: UIMessage[]) {
+export async function emit(runId: string, event: StreamChunk, conversation?: ConversationState) {
   const db = await database();
   await db.transaction(async (tx) => {
     const { run } = await lockRun(tx, runId);
     await appendEvent(tx, run, randomUUID(), event);
 
-    if (messages) {
+    if (conversation) {
       await tx
         .update(chatRunsTable)
-        .set({ projection: messages })
+        .set({ projection: writeProjection(conversation) })
         .where(eq(chatRunsTable.id, runId));
     }
   });
 }
 
-export async function finishRun(runId: string, messages?: UIMessage[], code = "execution_failed") {
+export async function checkpointCompaction(
+  runId: string,
+  operationId: string,
+  conversation: ConversationState,
+  state: Exclude<CompactionState, "started">,
+) {
+  const key = `compact:${operationId}`;
+  const db = await database();
+  await db.transaction(async (tx) => {
+    const { run } = await lockRun(tx, runId);
+    const [existing] = await tx
+      .select({ payload: chatEventsTable.payload })
+      .from(chatEventsTable)
+      .where(and(eq(chatEventsTable.run_id, runId), eq(chatEventsTable.event_key, key)));
+
+    if (existing) {
+      const saved =
+        existing.payload.type === EventType.CUSTOM
+          ? parseCompactionEvent(existing.payload.name, existing.payload.value)
+          : null;
+
+      if (saved?.state !== state) {
+        throw new Error("Compaction checkpoint conflict");
+      }
+
+      return;
+    }
+
+    if (state === "done") {
+      await appendEvent(tx, run, `${key}:snapshot`, snapshot(conversation.display));
+      await tx
+        .update(chatRunsTable)
+        .set({ projection: writeProjection(conversation) })
+        .where(eq(chatRunsTable.id, runId));
+    }
+
+    await appendEvent(tx, run, key, compactionEvent(runId, operationId, state));
+  });
+}
+
+function threadTitle(messages: UIMessage[]): string {
+  const title = messages
+    .find((message) => message.role === "user")
+    ?.parts.filter((part) => part.type === "text")
+    .map((part) => part.content)
+    .join("")
+    .slice(0, 10);
+
+  return title || "新對話";
+}
+
+export async function finishRun(
+  runId: string,
+  conversation?: ConversationState,
+  code = "execution_failed",
+) {
   const db = await database();
   await db.transaction(async (tx) => {
     const { run, thread } = await lockRun(tx, runId);
@@ -199,27 +301,30 @@ export async function finishRun(runId: string, messages?: UIMessage[], code = "e
       throw new Error("Thread claim changed");
     }
 
-    if (messages) {
-      const title =
-        messages
-          .find((message) => message.role === "user")
-          ?.parts.filter((part) => part.type === "text")
-          .map((part) => part.content)
-          .join("")
-          .slice(0, 10) || "新對話";
+    if (conversation) {
+      const messages = conversation.display;
       await appendEvent(tx, run, "finished:snapshot", snapshot(messages));
       await tx
         .update(threadsTable)
         .set({
           messages,
-          title,
+          title: threadTitle(messages),
           revision: sql`${threadsTable.revision} + 1`,
           active_run_id: null,
           updated_at: sql`now()`,
         })
         .where(eq(threadsTable.id, thread.id));
+      await tx
+        .update(chatRunsTable)
+        .set({ projection: writeProjection(conversation, thread.revision + 1) })
+        .where(eq(chatRunsTable.id, runId));
     } else {
-      await appendEvent(tx, run, "failed:snapshot", snapshot(run.projection));
+      await appendEvent(
+        tx,
+        run,
+        "failed:snapshot",
+        snapshot(readProjection(run.projection).display),
+      );
       await tx
         .update(threadsTable)
         .set({ active_run_id: null })
@@ -230,7 +335,7 @@ export async function finishRun(runId: string, messages?: UIMessage[], code = "e
       tx,
       run,
       "terminal",
-      messages
+      conversation
         ? { type: EventType.RUN_FINISHED, threadId: thread.id, runId }
         : {
             type: EventType.RUN_ERROR,
@@ -241,7 +346,7 @@ export async function finishRun(runId: string, messages?: UIMessage[], code = "e
     );
     await tx
       .update(chatRunsTable)
-      .set({ state: messages ? "succeeded" : "failed" })
+      .set({ state: conversation ? "succeeded" : "failed" })
       .where(eq(chatRunsTable.id, runId));
   });
 }

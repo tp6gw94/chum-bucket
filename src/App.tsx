@@ -5,13 +5,14 @@ import { useEffect, useRef, useState } from "react";
 import { Pane } from "./components/pane";
 import { ThreadSidebar } from "./components/thread-sidebar";
 import { TopBar } from "./components/top-bar";
-import type { Pane as PaneModel, ThreadSummary } from "./components/types";
+import type { Pane as PaneModel, RunStatus, ThreadSummary } from "./components/types";
 import {
   createThread,
   readPageEntry,
   threadUrl,
   useThread,
   useThreadList,
+  type ThreadPhase,
 } from "./hooks/use-threads";
 import { Button } from "@/components/ui/button";
 import { Provider } from "./Provider";
@@ -61,13 +62,25 @@ function ThreadEntry() {
   );
 }
 
+function paneStatus(phase: ThreadPhase): RunStatus {
+  return phase === "compacting" ? "compacting" : phase === "busy" ? "running" : "idle";
+}
+
+function mainPaneProps(thread: ReturnType<typeof useThread>) {
+  return {
+    onSend: thread.send,
+    onCommand: thread.runCommand,
+    notice: thread.notice,
+    isHydrating: thread.phase === "loading",
+    hydrationError: thread.error,
+  };
+}
+
 function ThreadPage({ threadId }: { threadId: string }) {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [agentPanes, setAgentPanes] = useState<PaneModel[]>([]);
   const { threads, error: listError, remove } = useThreadList(threadId);
   const thread = useThread(threadId);
-  const { messages, send } = thread;
-  const isLoading = thread.phase === "busy";
   const sendDisabled = thread.phase !== "ready";
 
   function openAgentPane() {
@@ -93,9 +106,9 @@ function ThreadPage({ threadId }: { threadId: string }) {
     id: threadId ?? "draft",
     title: threads.find((item) => item.id === threadId)?.title ?? "新對話",
     agent: "main",
-    status: isLoading ? "running" : "idle",
+    status: paneStatus(thread.phase),
     progress: [],
-    messages,
+    messages: thread.messages,
     kind: "main",
   };
   const panes = [mainPane, ...agentPanes];
@@ -134,10 +147,8 @@ function ThreadPage({ threadId }: { threadId: string }) {
                 pane={pane}
                 onOpenAgentPane={openAgentPane}
                 onClose={pane.kind === "agent" ? () => closeAgentPane(pane.id) : undefined}
-                onSend={pane.kind === "main" ? send : undefined}
                 sendDisabled={sendDisabled}
-                isHydrating={pane.kind === "main" && thread.phase === "loading"}
-                hydrationError={pane.kind === "main" ? thread.error : null}
+                {...(pane.kind === "main" ? mainPaneProps(thread) : {})}
               />
             ))}
           </main>

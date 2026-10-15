@@ -33,10 +33,13 @@ import {
 } from "@tanstack/ai";
 import { acceptRun, reconcileRuns, executeRun } from "../../../server/harness/run";
 import { snapshot, streamModelTurn, type Turn } from "../../../server/harness/model-turn";
+import { isSummary, type RunProjection } from "../../../server/harness/conversation";
+import { parseCompactionEvent } from "../../../shared/compaction-event";
 import {
   persistRun,
   emit,
   finishRun,
+  checkpointCompaction,
   hydrateThread,
   checkCursor,
   observeRun,
@@ -289,15 +292,16 @@ test("append failure stops provider consumption and cannot complete a turn", asy
   assert.equal(continued, false);
 });
 
-const accepted: AcceptedRun = {
+const accepted: Extract<AcceptedRun, { message: unknown }> = {
   threadId: "d08035f1-07df-49f3-b2d0-5cf5cb2b1e74",
   runId: "ca2f180a-8461-4cfb-9012-f413df6d72f9",
   baseRevision: 0,
   message: { id: "user-1", text: "Hello" },
   messages: baseline,
+  context: baseline,
   prompt: "offline",
   model: "deepseek-ai/DeepSeek-V4.1-Flash",
-  build: "durable-chat-loop-v5",
+  build: "durable-chat-loop-v6",
 };
 const toolTurn: Turn = {
   messages: baseline,
@@ -322,14 +326,17 @@ test("model checkpoint serialization failure halts all tools", async () => {
   const stepping = mock.method(
     DBOS,
     "runStep",
-    async (_callback: () => Promise<unknown>, config?: { name?: string }) => {
+    async (callback: () => Promise<unknown>, config?: { name?: string }) => {
       names.push(config?.name ?? "");
-      throw new Error("Checkpoint serialization rejected");
+      if (config?.name === "model:0") {
+        throw new Error("Checkpoint serialization rejected");
+      }
+      return callback();
     },
   );
   try {
     await assert.rejects(executeRun(accepted), /Checkpoint serialization rejected/);
-    assert.deepEqual(names, ["model:0"]);
+    assert.deepEqual(names, ["compact:0", "model:0"]);
   } finally {
     stepping.mock.restore();
   }
@@ -1329,6 +1336,16 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
       text.startsWith(`select ${runColumns} from chat_runs where id`)
     ) {
       rows = [runs.get(String(a))].filter((row): row is Row => !!row);
+    } else if (text.startsWith("select projection from chat_runs where")) {
+      assert.equal(
+        text,
+        "select projection from chat_runs where (thread_id = $1 and projection->>'committedRevision' = $2)",
+      );
+      rows = [...runs.values()].filter(
+        (row) =>
+          row.thread_id === a &&
+          String((row.projection as { committedRevision?: number }).committedRevision) === b,
+      );
     } else if (text.startsWith(`select ${runColumns} from chat_runs where state`)) {
       assert.equal(
         text,
@@ -1376,6 +1393,9 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
         .filter((row) => row.run_id === a && Number(row.sequence) > Number(b))
         .sort((a, b) => Number(a.sequence) - Number(b.sequence))
         .slice(0, Number(c));
+    } else if (text.startsWith("select payload from chat_events")) {
+      assert.equal(text, "select payload from chat_events where (run_id = $1 and event_key = $2)");
+      rows = events.filter((row) => row.run_id === a && row.event_key === b);
     } else if (text.startsWith("insert into chat_events")) {
       events.push({ run_id: a, sequence: b, event_key: c, payload: JSON.parse(String(d)) });
     } else if (text.startsWith("update chat_runs set next_sequence")) {
@@ -1529,7 +1549,11 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
         parts: [{ type: "text" as const, content: "complete" }],
       },
     ];
-    const modelTurn: Turn = { calls: [], messages: canonical };
+    const modelTurn = {
+      state: "turn",
+      calls: [],
+      conversation: { display: canonical, context: canonical },
+    };
     const completed = new Map<string, unknown>();
     const failures = new Set(["finish"]);
     const steps = mock.method(
@@ -1685,7 +1709,7 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
         rejectedStream = invalidEvents;
         await assert.rejects(executeRun(nextRun), error);
         assert.deepEqual(external, []);
-        assert.equal(cached.size, 0);
+        assert.deepEqual([...cached.keys()], ["compact:0"]);
         assert.equal(rejectedGenerations, executedModelCallbacks);
       }
       rejectedStream = undefined;
@@ -1705,7 +1729,7 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
       await assert.rejects(executeRun(nextRun), /Uncheckpointed finish/);
       assert.deepEqual(
         runEvents()[beforeToolRetry]!.payload,
-        snapshot(cached.get("tool:0:0") as UIMessage[]),
+        snapshot((cached.get("tool:0:0") as { display: UIMessage[] }).display),
       );
       assert.deepEqual(external, ["TEST-1", "TEST-2", "TEST-2"]);
       assert.equal(modelCalls, 3);
@@ -1736,7 +1760,8 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
       cached.clear();
       gaps.add("model:0");
       await assert.rejects(executeRun(failedRun), /Uncheckpointed model:0/);
-      const speculative = runs.get(failedRun.runId)!.projection as UIMessage[];
+      const speculative = (runs.get(failedRun.runId)!.projection as { display: UIMessage[] })
+        .display;
       assert.equal(speculative.at(-1)!.parts[0]!.type, "text");
       statuses.set(failedRun.runId, "ERROR");
       await reconcileRuns();
@@ -1791,10 +1816,16 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
       await largeReplay.return(undefined);
       const largeThreadRow = threads.get(largeThread)!;
       largeThreadRow.active_run_id = "other-run";
-      await assert.rejects(finishRun(largeRun.runId, largeRun.messages), /Thread claim changed/);
+      await assert.rejects(
+        finishRun(largeRun.runId, { display: largeRun.messages, context: largeRun.context }),
+        /Thread claim changed/,
+      );
       threads.get(largeThread)!.active_run_id = largeRun.runId;
       threads.get(largeThread)!.revision = 1;
-      await assert.rejects(finishRun(largeRun.runId, largeRun.messages), /Thread claim changed/);
+      await assert.rejects(
+        finishRun(largeRun.runId, { display: largeRun.messages, context: largeRun.context }),
+        /Thread claim changed/,
+      );
       threads.get(largeThread)!.revision = 0;
       cached.clear();
       gaps.clear();
@@ -1844,7 +1875,7 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
         Array.from({ length: sequences.length - 1 }, (_, index) => 100_000 + index),
       );
       const beforeTerminal = largeEvents().length;
-      await finishRun(largeRun.runId, largeSaved);
+      await finishRun(largeRun.runId, { display: largeSaved, context: largeSaved });
       await assert.rejects(emit(largeRun.runId, largeEvent), /Run is terminal/);
       assert.equal(largeEvents().length, beforeTerminal);
       assert.equal(threads.get(largeThread)!.revision, 1);
@@ -2437,6 +2468,7 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
     const beforeOldStart = started.length;
     const beforeOldEvents = events.length;
     for (const legacyBuild of [
+      "durable-chat-loop-v5",
       "durable-chat-loop-v4",
       "durable-chat-loop-v3",
       "durable-chat-loop-v2",
@@ -2449,6 +2481,121 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
       assert.equal(oldRow.state, "pending");
       assert.equal(threads.get(oldRun.threadId)!.active_run_id, oldRun.runId);
       assert.equal(events.length, beforeOldEvents);
+    }
+
+    const compactThread = "6a3f1d2e-9c4b-4e8a-8f1d-2b7c9e0a5d31";
+    const longText = "長".repeat(3_000);
+    const compactHistory: UIMessage[] = [
+      { id: "c-user-1", role: "user", parts: [{ type: "text", content: longText }] },
+      { id: "c-assistant-1", role: "assistant", parts: [{ type: "text", content: longText }] },
+      { id: "c-user-2", role: "user", parts: [{ type: "text", content: "second" }] },
+      { id: "c-assistant-2", role: "assistant", parts: [{ type: "text", content: "answer" }] },
+    ];
+    threads.set(compactThread, {
+      id: compactThread,
+      messages: compactHistory,
+      revision: 0,
+      active_run_id: null,
+    });
+    const { deepinfra: compactProvider } = await import("../../../server/harness/provider");
+    const summaryRequests: Array<{ tools?: unknown[] }> = [];
+    const summarizer = mock.method(
+      Object.getPrototypeOf(compactProvider(accepted.model)),
+      "chatStream",
+      async function* (options: { tools?: unknown[] }) {
+        summaryRequests.push(options);
+        yield { type: EventType.RUN_STARTED, threadId: "summary", runId: "summary" };
+        yield { type: EventType.TEXT_MESSAGE_START, messageId: "summary", role: "assistant" };
+        yield { type: EventType.TEXT_MESSAGE_CONTENT, messageId: "summary", delta: "短摘要" };
+        yield { type: EventType.TEXT_MESSAGE_END, messageId: "summary" };
+        yield {
+          type: EventType.RUN_FINISHED,
+          threadId: "summary",
+          runId: "summary",
+          finishReason: "stop",
+        };
+      },
+    );
+    const compactSteps = mock.method(DBOS, "runStep", async (callback: () => Promise<unknown>) =>
+      callback(),
+    );
+    try {
+      const compactRun = await acceptRun({
+        kind: "compact",
+        threadId: compactThread,
+        runId: "manual-compact",
+        baseRevision: 0,
+      });
+      assert.deepEqual(compactRun.messages, compactHistory);
+      assert.deepEqual(compactRun.context, compactHistory);
+      await executeRun(compactRun);
+      const display = threads.get(compactThread)!.messages as UIMessage[];
+      assert.deepEqual(display.slice(0, 4), compactHistory);
+      assert.equal(display.length, 5);
+      assert.ok(isSummary(display[4]!));
+      assert.equal(threads.get(compactThread)!.revision, 1);
+      assert.equal(summaryRequests.length, 1);
+      assert.deepEqual(summaryRequests[0]!.tools ?? [], []);
+      const compactEvents = () => events.filter((row) => row.run_id === compactRun.runId);
+      const compactionStates = () =>
+        compactEvents()
+          .map((row) => row.payload as StreamChunk)
+          .flatMap((event) =>
+            event.type === EventType.CUSTOM
+              ? [parseCompactionEvent(event.name, event.value)?.state]
+              : [],
+          );
+      assert.deepEqual(compactionStates(), ["started", "done"]);
+      const projection = runs.get(compactRun.runId)!.projection as RunProjection;
+      assert.equal(projection.committedRevision, 1);
+      assert.deepEqual(projection.display, display);
+      assert.deepEqual(
+        projection.context.map((message) => message.id),
+        [display[4]!.id, "c-user-2", "c-assistant-2"],
+      );
+
+      const operationId = `${compactRun.runId}/compact/0`;
+      const beforeReplay = compactEvents().length;
+      await checkpointCompaction(compactRun.runId, operationId, projection, "done");
+      assert.equal(compactEvents().length, beforeReplay);
+      await assert.rejects(
+        checkpointCompaction(compactRun.runId, operationId, projection, "failed"),
+        /checkpoint conflict/,
+      );
+
+      const afterCompact = await acceptRun({
+        threadId: compactThread,
+        runId: "after-compact",
+        baseRevision: 1,
+        message: { id: "c-user-3", text: "third" },
+      });
+      assert.deepEqual(
+        afterCompact.context.map((message) => message.id),
+        [display[4]!.id, "c-user-2", "c-assistant-2", "c-user-3"],
+      );
+      assert.deepEqual(
+        afterCompact.messages.map((message) => message.id),
+        [...display.map((message) => message.id), "c-user-3"],
+      );
+      await assert.rejects(
+        acceptRun({ kind: "compact", threadId: compactThread, runId: "busy", baseRevision: 1 }),
+        /claim conflict/,
+      );
+
+      const orphanThread = "0b9e5c7d-3f2a-4d1e-9a8b-7c6d5e4f3a2b";
+      threads.set(orphanThread, {
+        id: orphanThread,
+        messages: display,
+        revision: 0,
+        active_run_id: null,
+      });
+      await assert.rejects(
+        acceptRun({ kind: "compact", threadId: orphanThread, runId: "orphan", baseRevision: 0 }),
+        /Missing context anchor/,
+      );
+    } finally {
+      compactSteps.mock.restore();
+      summarizer.mock.restore();
     }
   } finally {
     start.mock.restore();

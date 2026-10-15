@@ -6,7 +6,15 @@ import { SendIcon } from "lucide-react";
 import { cn } from "cn";
 
 import { Button } from "@/components/ui/button";
+import {
+  causeMessage,
+  parseComposerCommand,
+  resultError,
+  type ComposerCommand,
+} from "../composer-commands";
+import { useCommandMenu } from "../hooks/use-command-menu";
 import type { SendResult } from "../hooks/use-threads";
+import { CommandMenu } from "./command-menu";
 
 const EDITOR_CLASS = cn(
   "min-h-14 w-full rounded-lg border border-input bg-transparent px-2.5 py-2 text-base transition-colors outline-none",
@@ -33,6 +41,7 @@ export function Composer({
   placeholder,
   hint,
   onSend,
+  onCommand,
   disabled = false,
   busy = false,
   className,
@@ -41,6 +50,7 @@ export function Composer({
   placeholder: string;
   hint: string;
   onSend?: (text: string) => Promise<SendResult>;
+  onCommand?: (command: ComposerCommand) => Promise<SendResult>;
   disabled?: boolean;
   busy?: boolean;
   className?: string;
@@ -49,8 +59,16 @@ export function Composer({
   const [error, setError] = useState<string | null>(null);
   const formRef = useRef<HTMLFormElement>(null);
 
-  const canSubmit = text.trim().length > 0 && !disabled && !busy && Boolean(onSend);
+  const ready = !disabled && !busy && Boolean(onSend);
+  const canSubmit = text.trim().length > 0 && ready;
   const errorId = `${label}-error`;
+  const menu = useCommandMenu({
+    text,
+    enabled: ready,
+    available: Boolean(onCommand),
+    onSelect: (command) => void runCommand(command),
+    onSubmit: () => formRef.current?.requestSubmit(),
+  });
 
   const editor = useEditor({
     extensions: [StarterKit],
@@ -68,24 +86,16 @@ export function Composer({
               "aria-describedby": errorId,
             }
           : {}),
+        ...menu.attributes,
       },
-      handleKeyDown: (view, event) => {
-        if (event.key !== "Enter" || event.shiftKey) {
-          return false;
-        }
-
-        if (event.isComposing || view.composing) {
-          return false;
-        }
-
-        event.preventDefault();
-        formRef.current?.requestSubmit();
-
-        return true;
-      },
+      handleKeyDown: (view, event) => menu.handleKey(event, view.composing),
+      handleDOMEvents: menu.domEvents,
     },
+    onFocus: menu.onFocus,
+    onBlur: menu.onBlur,
     onUpdate: ({ editor }) => {
       setText(editor.getText({ blockSeparator: "\n" }));
+      menu.setActive(0);
     },
   });
 
@@ -94,27 +104,51 @@ export function Composer({
     editor.view.dom.toggleAttribute("data-disabled", disabled);
   }, [editor, disabled]);
 
-  async function submit() {
-    if (!canSubmit || !onSend) {
+  async function runCommand(command: ComposerCommand) {
+    if (!onCommand) {
       return;
     }
 
     setError(null);
 
     try {
-      const result = await onSend(text.trim());
+      const result = await onCommand(command);
 
-      if (result === "succeeded") {
-        editor.commands.clearContent();
+      if (result === "uncertain") {
+        setError(resultError(result));
       } else {
-        setError(
-          result === "failed"
-            ? "執行失敗，原文已保留。"
-            : "結果尚未確認，請重新載入對話，原文已保留。",
-        );
+        editor.commands.clearContent();
       }
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "送出失敗，請稍後再試");
+      setError(causeMessage(cause));
+    }
+  }
+
+  async function submit() {
+    if (!canSubmit || !onSend) {
+      return;
+    }
+
+    const command = parseComposerCommand(text);
+
+    if (command && onCommand) {
+      await runCommand(command);
+
+      return;
+    }
+
+    setError(null);
+
+    try {
+      const failure = resultError(await onSend(text.trim()));
+
+      if (failure) {
+        setError(failure);
+      } else {
+        editor.commands.clearContent();
+      }
+    } catch (cause) {
+      setError(causeMessage(cause));
     }
   }
 
@@ -125,6 +159,13 @@ export function Composer({
       className={cn("flex shrink-0 flex-col gap-2 bg-card px-4 py-3", className)}
     >
       <div className="relative">
+        <CommandMenu
+          id={menu.listId}
+          commands={menu.suggestions}
+          highlighted={menu.highlighted}
+          onHighlight={menu.setActive}
+          onSelect={(command) => void runCommand(command)}
+        />
         {text.length === 0 ? (
           <span
             aria-hidden="true"

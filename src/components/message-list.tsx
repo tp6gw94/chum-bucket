@@ -87,12 +87,21 @@ function ChatMessageRow({
     );
   }
 
+  if (message.metadata?.fromSummary) {
+    return (
+      <Message align="start">
+        <MessageContent>
+          <MessageHeader>壓縮摘要</MessageHeader>
+          <Bubble variant="muted" align="start">
+            <BubbleContent className="whitespace-pre-wrap">{text}</BubbleContent>
+          </Bubble>
+        </MessageContent>
+      </Message>
+    );
+  }
+
   const align = message.role === "user" ? "end" : "start";
-  const header = message.metadata?.fromSummary
-    ? "摘要"
-    : message.role === "assistant"
-      ? agent
-      : null;
+  const header = message.role === "assistant" ? agent : null;
 
   return (
     <Message align={align}>

@@ -1,6 +1,13 @@
 import { setTimeout as delay } from "node:timers/promises";
 import { DBOS } from "@dbos-inc/dbos-sdk";
 import { runAgentLoop, type AgentCheckpoint, type AgentSession } from "./agent-loop";
+import {
+  applyCompaction,
+  compactor,
+  COMPACTION_POLICY,
+  type CompactionPublish,
+} from "./compaction";
+import type { ConversationState } from "./conversation";
 import { withRunTools, type RunTools } from "./tools";
 import {
   BUILD,
@@ -10,6 +17,7 @@ import {
   persistRun,
   emit,
   finishRun,
+  checkpointCompaction,
   listPendingRuns,
   type RunInput,
   type AcceptedRun,
@@ -41,25 +49,77 @@ function runSession(run: AcceptedRun, tools: RunTools): AgentSession {
 const runCheckpoint: AgentCheckpoint = ({ name, retry, work }) =>
   retry ? DBOS.runStep(work, { name, ...retry }) : DBOS.runStep(work, { name });
 
+function publishCompaction(runId: string): CompactionPublish {
+  return async ({ operationId, outcome, conversation }) => {
+    const next = applyCompaction(conversation, outcome);
+    await checkpointCompaction(runId, operationId, next, outcome.state);
+
+    return next;
+  };
+}
+
+function runCompactor(run: AcceptedRun, session: AgentSession) {
+  return compactor({
+    session,
+    model: run.model,
+    prompt: run.prompt,
+    policy: COMPACTION_POLICY,
+    checkpoint: runCheckpoint,
+    publish: publishCompaction(run.runId),
+  });
+}
+
+async function finishCompactRun(
+  run: AcceptedRun,
+  session: AgentSession,
+  conversation: ConversationState,
+) {
+  const result = await runCompactor(run, session)({ conversation, reason: "manual", turn: 0 });
+
+  await DBOS.runStep(
+    () =>
+      result.state === "failed"
+        ? finishRun(run.runId, undefined, "compaction_failed")
+        : finishRun(run.runId, result.conversation),
+    { name: "finish" },
+  );
+}
+
+async function finishChatRun(
+  run: AcceptedRun,
+  session: AgentSession,
+  conversation: ConversationState,
+) {
+  const result = await runAgentLoop({
+    session,
+    conversation,
+    model: run.model,
+    prompt: run.prompt,
+    checkpoint: runCheckpoint,
+    compact: runCompactor(run, session),
+  });
+
+  if (result.state === "limit") {
+    throw new Error("Model iteration limit exceeded");
+  }
+
+  await DBOS.runStep(() => finishRun(run.runId, result.conversation), { name: "finish" });
+}
+
 export async function executeRun(run: AcceptedRun) {
   if (run.build !== BUILD || run.model !== MODEL) {
     throw new Error("Incompatible run build");
   }
 
   return withRunTools(async (tools) => {
-    const result = await runAgentLoop({
-      session: runSession(run, tools),
-      messages: run.messages,
-      model: run.model,
-      prompt: run.prompt,
-      checkpoint: runCheckpoint,
-    });
+    const session = runSession(run, tools);
+    const conversation = { display: run.messages, context: run.context };
 
-    if (result.state === "limit") {
-      throw new Error("Model iteration limit exceeded");
+    if ("kind" in run) {
+      await finishCompactRun(run, session, conversation);
+    } else {
+      await finishChatRun(run, session, conversation);
     }
-
-    await DBOS.runStep(() => finishRun(run.runId, result.messages), { name: "finish" });
   });
 }
 

@@ -9,7 +9,12 @@ import {
   type StreamChunk,
   type UIMessage,
 } from "@tanstack/ai";
-import { streamModelTurn, type Turn } from "../../../server/harness/model-turn";
+import {
+  ContextOverflowError,
+  streamModelTurn,
+  throwProviderError,
+  type Turn,
+} from "../../../server/harness/model-turn";
 import type { ModelTool } from "../../../server/harness/tools/atlassian";
 
 type ToolCallEnd = Extract<StreamChunk, { type: "TOOL_CALL_END" }>;
@@ -273,3 +278,52 @@ for (const argumentsJson of ["{", "", "null", "[]", '"text"', "1", "true"]) {
     );
   });
 }
+
+test("provider context limits are recognized by code or by a 400/413 limit message", () => {
+  for (const error of [
+    { code: "context_length_exceeded", message: "too long" },
+    { code: "max_context_length_exceeded", message: "too long" },
+    { code: "context_window_exceeded", message: "too long" },
+    { status: 400, message: "This model's maximum context length is 128000 tokens." },
+    { code: "413", message: "Requested maximum context length of 163840 tokens exceeded" },
+    { message: "maximum context length is 1000 tokens" },
+  ]) {
+    assert.throws(() => throwProviderError(error), ContextOverflowError);
+  }
+});
+
+test("rate limits, server errors, and network failures are not context overflow", () => {
+  const limit = "maximum context length is 1000 tokens";
+  for (const error of [
+    { status: 401, message: limit },
+    { status: 403, message: limit },
+    { status: 408, message: limit },
+    { status: 429, message: limit },
+    { code: "503", message: limit },
+    { code: "rate_limit_exceeded", message: limit },
+    new TypeError("fetch failed"),
+  ]) {
+    assert.throws(
+      () => throwProviderError(error),
+      (thrown: unknown) => thrown instanceof Error && !(thrown instanceof ContextOverflowError),
+    );
+  }
+});
+
+test("a streamed RUN_ERROR reporting a context limit becomes ContextOverflowError", async () => {
+  await assert.rejects(
+    streamModelTurn({
+      messages,
+      stream: (async function* () {
+        yield { type: EventType.RUN_STARTED, threadId: "thread", runId: "run" };
+        yield {
+          type: EventType.RUN_ERROR,
+          message: "maximum context length is 1000 tokens",
+          code: "context_length_exceeded",
+        };
+      })() as AsyncIterable<AdapterYieldChunk>,
+      append: async () => {},
+    }),
+    ContextOverflowError,
+  );
+});

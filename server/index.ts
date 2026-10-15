@@ -1,13 +1,14 @@
 import "dotenv/config";
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
-import chat from "./chat";
+import chat, { compact } from "./chat";
 import thread from "./thread";
 import { launchChatRuntime, shutdownChatRuntime } from "./harness/run";
 
 const app = new Hono();
 app.get("/", (c) => c.text("Hello Node.js!"));
 app.route("/api/chat", chat);
+app.route("/api/compact", compact);
 app.route("/api/thread", thread);
 
 await launchChatRuntime();

@@ -4,7 +4,13 @@ import { setTimeout as delay } from "node:timers/promises";
 import { ChatClient } from "@tanstack/ai-react";
 import { fetchServerSentEvents } from "@tanstack/ai-react";
 import { EventType, uiMessagesToWire, type StreamChunk } from "@tanstack/ai";
-import { createThread, deleteThread, terminalResult } from "../../../src/hooks/use-threads";
+import {
+  compactionNotice,
+  createThread,
+  deleteThread,
+  serverSentData,
+  terminalResult,
+} from "../../../src/hooks/use-threads";
 
 const threadId = "d08035f1-07df-49f3-b2d0-5cf5cb2b1e74";
 const runId = "run-recovery-test";
@@ -203,3 +209,34 @@ test(
     }
   },
 );
+
+test("compaction notices describe each outcome", () => {
+  assert.match(compactionNotice("done").text, /上下文已整理/);
+  assert.match(compactionNotice("skipped").text, /沒有足夠的可整理歷史/);
+  assert.match(compactionNotice("failed").text, /整理上下文失敗/);
+});
+
+test("server-sent data is parsed across chunk boundaries", async () => {
+  const encoder = new TextEncoder();
+  const chunks = [
+    'id: 0\ndata: {"type":"RUN_STARTED"}\n\nid: 1\nda',
+    'ta: {"type":"CUSTOM","name":"context-compaction"}\r\n\r\n',
+  ];
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const chunk of chunks) {
+        controller.enqueue(encoder.encode(chunk));
+      }
+      controller.close();
+    },
+  });
+  const parsed: unknown[] = [];
+  for await (const data of serverSentData(body)) {
+    parsed.push(data);
+  }
+
+  assert.deepEqual(parsed, [
+    { type: "RUN_STARTED" },
+    { type: "CUSTOM", name: "context-compaction" },
+  ]);
+});

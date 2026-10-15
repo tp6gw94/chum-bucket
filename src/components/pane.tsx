@@ -1,8 +1,10 @@
 import { PlusIcon, XIcon } from "lucide-react";
-import type { SendResult } from "../hooks/use-threads";
+import type { ComposerCommand } from "../composer-commands";
+import type { CompactionNotice as Notice, SendResult } from "../hooks/use-threads";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { CompactionNotice } from "./compaction-notice";
 import { Composer } from "./composer";
 import { MessageList } from "./message-list";
 import { PaneShell } from "./pane-shell";
@@ -11,12 +13,24 @@ import { StatusBadge } from "./status-badge";
 import { type Pane as PaneModel } from "./types";
 
 const DEFAULT_WIDTH = { main: 720, agent: 440 } as const;
+const COMPOSER_COPY = {
+  main: {
+    placeholder: "輸入訊息",
+    hint: "送出後會使用目前的 thread，輸入 /compact 整理上下文",
+  },
+  agent: {
+    placeholder: "附屬對話尚未連接執行，僅為預留窗格",
+    hint: "此窗格為 UI 預留狀態，不會呼叫 agent",
+  },
+} as const;
 
 export function Pane({
   pane,
   onOpenAgentPane,
   onClose,
   onSend,
+  onCommand,
+  notice,
   sendDisabled = false,
   isHydrating = false,
   hydrationError,
@@ -25,6 +39,8 @@ export function Pane({
   onOpenAgentPane: () => void;
   onClose?: () => void;
   onSend?: (text: string) => Promise<SendResult>;
+  onCommand?: (command: ComposerCommand) => Promise<SendResult>;
+  notice?: Notice | null;
   sendDisabled?: boolean;
   isHydrating?: boolean;
   hydrationError?: string | null;
@@ -66,7 +82,7 @@ export function Pane({
           <MessageList
             messages={pane.messages}
             agent={pane.agent}
-            isStreaming={pane.status === "running"}
+            isStreaming={pane.status !== "idle"}
           />
         )}
         <ProgressPanel
@@ -80,6 +96,7 @@ export function Pane({
           正在載入對話…
         </p>
       ) : null}
+      <CompactionNotice notice={notice} />
       {hydrationError ? (
         <div role="alert" className="px-4 py-2 text-sm text-destructive">
           <p>{hydrationError}</p>
@@ -90,9 +107,9 @@ export function Pane({
       ) : null}
       <Composer
         label={`${isMain ? "主對話" : pane.title}輸入-${pane.id}`}
-        placeholder={isMain ? "輸入訊息" : "附屬對話尚未連接執行，僅為預留窗格"}
-        hint={isMain ? "送出後會使用目前的 thread" : "此窗格為 UI 預留狀態，不會呼叫 agent"}
+        {...COMPOSER_COPY[pane.kind]}
         onSend={onSend}
+        onCommand={onCommand}
         disabled={sendDisabled || !onSend}
         className="border-t"
       />
