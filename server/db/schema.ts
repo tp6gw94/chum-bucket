@@ -1,6 +1,7 @@
 import { sql } from "drizzle-orm";
 import type { UIMessage, StreamChunk } from "@tanstack/ai";
 import type { RunInput, AcceptedRun } from "../harness/run-store";
+import type { RunProjection } from "../harness/conversation";
 import {
   pgTable,
   uuid,
@@ -25,7 +26,9 @@ export const threadsTable = pgTable(
     revision: integer().notNull().default(0),
     active_run_id: text(),
     messages: jsonb().notNull().$type<UIMessage[]>().default([]),
+    context_anchor: text(),
     parent_thread_id: uuid().references((): AnyPgColumn => threadsTable.id),
+    closed_at: timestamp({ withTimezone: true }),
     created_at: timestamp({ withTimezone: true }).notNull().defaultNow(),
     updated_at: timestamp({ withTimezone: true }).notNull().defaultNow(),
   },
@@ -45,7 +48,7 @@ export const chatRunsTable = pgTable(
       .references(() => threadsTable.id),
     request: jsonb().notNull().$type<RunInput>(),
     accepted: jsonb().notNull().$type<AcceptedRun>(),
-    projection: jsonb().notNull().$type<UIMessage[]>(),
+    projection: jsonb().notNull().$type<RunProjection>(),
     state: text().notNull().$type<"pending" | "succeeded" | "failed">().default("pending"),
     next_sequence: integer().notNull().default(0),
     created_at: timestamp({ withTimezone: true }).notNull().defaultNow(),

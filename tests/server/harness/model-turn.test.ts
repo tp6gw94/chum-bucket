@@ -9,7 +9,12 @@ import {
   type StreamChunk,
   type UIMessage,
 } from "@tanstack/ai";
-import { streamModelTurn, type Turn } from "../../../server/harness/model-turn";
+import {
+  ContextOverflowError,
+  requestModelTurn,
+  streamModelTurn,
+  type Turn,
+} from "../../../server/harness/model-turn";
 import type { ModelTool } from "../../../server/harness/tools/atlassian";
 
 type ToolCallEnd = Extract<StreamChunk, { type: "TOOL_CALL_END" }>;
@@ -273,3 +278,55 @@ for (const argumentsJson of ["{", "", "null", "[]", '"text"', "1", "true"]) {
     );
   });
 }
+
+function failingAdapter(status: number, error: Record<string, unknown>) {
+  const adapter = openaiCompatibleText("offline-model", {
+    apiKey: "offline",
+    baseURL: "http://offline/v1",
+    maxRetries: 0,
+    fetch: async () => Response.json({ error }, { status }),
+  });
+  return (options: Parameters<typeof adapter.chatStream>[0]) =>
+    Promise.resolve(adapter.chatStream(options));
+}
+
+const overflowRequest = {
+  model: "offline-model",
+  messages,
+  systemPrompts: [],
+  tools: [],
+  timeoutMs: 5_000,
+  append: async () => {},
+};
+
+test("provider context limit errors become ContextOverflowError while other errors stay intact", async () => {
+  await assert.rejects(
+    requestModelTurn({
+      ...overflowRequest,
+      chatStream: failingAdapter(400, {
+        message:
+          "This model's maximum context length is 131072 tokens. However, you requested 150000 tokens.",
+        type: "invalid_request_error",
+        code: "context_length_exceeded",
+      }),
+    }),
+    ContextOverflowError,
+  );
+  await assert.rejects(
+    requestModelTurn({
+      ...overflowRequest,
+      chatStream: failingAdapter(401, { message: "Invalid API key", code: "invalid_api_key" }),
+    }),
+    (error: Error) =>
+      !(error instanceof ContextOverflowError) && /Invalid API key/.test(error.message),
+  );
+  await assert.rejects(
+    requestModelTurn({
+      ...overflowRequest,
+      chatStream: async () => {
+        throw Object.assign(new Error("Payload too large"), { status: 413 });
+      },
+    }),
+    ContextOverflowError,
+  );
+});

@@ -3,6 +3,12 @@ import { z } from "zod";
 import { flushSync } from "react-dom";
 import type { StreamChunk } from "@tanstack/ai";
 import { fetchServerSentEvents, useChat } from "@tanstack/ai-react";
+import {
+  readCompactionEvent,
+  type CompactionEvent,
+  type CompactionTrigger,
+} from "../../shared/compaction-event";
+import { commandRunBody, parseComposerCommand } from "../composer-commands";
 
 const threadSchema = z.object({ id: z.uuid(), title: z.string() });
 export type ThreadSummary = z.infer<typeof threadSchema>;
@@ -123,9 +129,44 @@ export function terminalResult(event: unknown, runId: string | null): SendResult
   return null;
 }
 
+const TRIGGER_LABEL: Record<CompactionTrigger, string> = {
+  threshold: "接近上下文上限",
+  overflow: "超出上下文上限",
+  manual: "手動壓縮",
+  "side-chat": "附屬對話",
+};
+
+function formatTokens(tokens: number) {
+  return tokens >= 1000 ? `${(tokens / 1000).toFixed(1)}k` : String(tokens);
+}
+
+export function compactionProgress(event: CompactionEvent): string {
+  const label = TRIGGER_LABEL[event.trigger];
+
+  switch (event.phase) {
+    case "started":
+      return event.trigger === "side-chat"
+        ? `正在摘要主對話（約 ${formatTokens(event.tokensBefore)} tokens）…`
+        : `${label}：正在壓縮對話脈絡（約 ${formatTokens(event.tokensBefore)} tokens）…`;
+    case "done":
+      return event.trigger === "side-chat"
+        ? `已帶入主對話摘要（約 ${formatTokens(event.tokensAfter)} tokens）`
+        : `${label}：已壓縮 ${event.compactedMessages} 則訊息，約 ${formatTokens(event.tokensBefore)} → ${formatTokens(event.tokensAfter)} tokens`;
+    case "skipped":
+      return `${label}：目前沒有可壓縮的訊息`;
+    case "failed":
+      return `${label}：壓縮失敗（${event.error}）`;
+  }
+}
+
+export function compactionLines(event: CompactionEvent | null): string[] {
+  return event && event.phase !== "done" ? [compactionProgress(event)] : [];
+}
+
 export function useThread(threadId: string) {
   const [phase, setPhase] = useState<ThreadPhase>("loading");
   const [error, setError] = useState<string | null>(null);
+  const [compaction, setCompaction] = useState<CompactionEvent | null>(null);
   const owner = useRef({
     phase: "loading" as ThreadPhase,
     mounted: true,
@@ -167,9 +208,14 @@ export function useThread(threadId: string) {
       try {
         for await (const chunk of stream) {
           const terminal = terminalResult(chunk, owner.runId);
+          const compacted = readCompactionEvent(chunk);
 
           if (terminal) {
             owner.terminal = terminal;
+          }
+
+          if (compacted && owner.mounted) {
+            setCompaction(compacted);
           }
 
           yield chunk;
@@ -253,6 +299,8 @@ export function useThread(threadId: string) {
     owner.submitting = true;
     owner.terminal = null;
     setError(null);
+    setCompaction(null);
+    const command = parseComposerCommand(text);
     let submitted = false;
 
     try {
@@ -271,7 +319,7 @@ export function useThread(threadId: string) {
       }
 
       submitted = true;
-      await chat.sendMessage(text, { body: { baseRevision: revision } });
+      await chat.sendMessage(text.trim(), { body: commandRunBody(command, revision) });
     } catch (cause) {
       if (!submitted) {
         publish("ready");
@@ -302,5 +350,12 @@ export function useThread(threadId: string) {
     return true;
   }
 
-  return { messages: chat.messages, phase, error, send, navigate };
+  return {
+    messages: chat.messages,
+    phase,
+    error,
+    progress: compactionLines(compaction),
+    send,
+    navigate,
+  };
 }

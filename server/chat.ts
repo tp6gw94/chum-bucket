@@ -4,8 +4,11 @@ import type { StreamChunk } from "@tanstack/ai";
 import { acceptRun } from "./harness/run";
 import {
   checkCursor,
+  compactInstructionsSchema,
   hydrateThread,
   observeRun,
+  revisionSchema,
+  runIdSchema,
   RunRequestError,
   runInputSchema,
 } from "./harness/run-store";
@@ -13,8 +16,12 @@ import {
 const app = new Hono();
 const bodySchema = z.object({
   threadId: z.uuid(),
-  runId: runInputSchema.shape.runId,
-  forwardedProps: z.object({ baseRevision: runInputSchema.shape.baseRevision }),
+  runId: runIdSchema,
+  forwardedProps: z.object({
+    baseRevision: revisionSchema,
+    kind: z.literal("compact").optional(),
+    instructions: compactInstructionsSchema.optional(),
+  }),
   messages: z.array(z.unknown()).min(1).max(1000),
   tools: z.array(z.never()).optional(),
   context: z.array(z.never()).optional(),
@@ -41,6 +48,18 @@ export function parseRunBody(body: unknown, header?: string) {
     throw new RunRequestError(409, "Run header mismatch");
   }
 
+  const { baseRevision, kind, instructions } = input.forwardedProps;
+
+  if (kind === "compact") {
+    return runInputSchema.parse({
+      kind,
+      threadId: input.threadId,
+      runId: input.runId,
+      baseRevision,
+      ...(instructions ? { instructions } : {}),
+    });
+  }
+
   const user = userSchema.safeParse(input.messages.at(-1));
 
   if (!user.success) {
@@ -50,7 +69,7 @@ export function parseRunBody(body: unknown, header?: string) {
   const result = runInputSchema.safeParse({
     threadId: input.threadId,
     runId: input.runId,
-    baseRevision: input.forwardedProps.baseRevision,
+    baseRevision,
     message: {
       id: user.data.id,
       text: typeof user.data.content === "string" ? user.data.content : user.data.content[0].text,

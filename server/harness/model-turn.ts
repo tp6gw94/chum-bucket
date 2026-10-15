@@ -1,12 +1,15 @@
 import {
   EventType,
   StreamProcessor,
+  convertMessagesToModelMessages,
   normalizeStreamChunk,
   uiMessagesToWire,
+  type JSONSchema,
   type StreamChunk,
   type UIMessage,
   type AdapterYieldChunk,
 } from "@tanstack/ai";
+import { resolveDebugOption } from "@tanstack/ai/adapter-internals";
 
 export type ModelCall = { id: string; name: string; arguments: string; input: unknown };
 export type Turn = {
@@ -18,6 +21,60 @@ type ModelStream = {
   stream: AsyncIterable<AdapterYieldChunk>;
   append: (event: StreamChunk) => Promise<void>;
 };
+type ModelToolDefinition = Readonly<{ name: string; description: string; inputSchema: JSONSchema }>;
+
+export type ChatStream = (options: {
+  model: string;
+  messages: ReturnType<typeof convertMessagesToModelMessages>;
+  systemPrompts: string[];
+  tools: ModelToolDefinition[];
+  logger: ReturnType<typeof resolveDebugOption>;
+  request: { signal: AbortSignal };
+}) => Promise<AsyncIterable<AdapterYieldChunk>>;
+
+export type ModelRequest = Readonly<{
+  chatStream: ChatStream;
+  model: string;
+  messages: UIMessage[];
+  systemPrompts: string[];
+  tools: ModelToolDefinition[];
+  timeoutMs: number;
+  append: (event: StreamChunk) => Promise<void>;
+}>;
+
+export class ContextOverflowError extends Error {
+  override name = "ContextOverflowError";
+}
+
+const CONTEXT_OVERFLOW_CODES = new Set(["context_length_exceeded", "413"]);
+const CONTEXT_OVERFLOW_PATTERN =
+  /context[ _-]?length|context window|maximum context|prompt is too long|input is too long|too many tokens|exceeds? the model's maximum/i;
+
+function isContextOverflow(message: string, code: unknown): boolean {
+  return (
+    (typeof code === "string" && CONTEXT_OVERFLOW_CODES.has(code)) ||
+    CONTEXT_OVERFLOW_PATTERN.test(message)
+  );
+}
+
+function providerFailure(message: string, code: unknown): Error {
+  return isContextOverflow(message, code) ? new ContextOverflowError(message) : new Error(message);
+}
+
+function toContextOverflow(error: unknown): unknown {
+  if (!(error instanceof Error) || error instanceof ContextOverflowError) {
+    return error;
+  }
+
+  const { code, status } = error as Error & { code?: unknown; status?: unknown };
+
+  return isContextOverflow(
+    error.message,
+    code ?? (status === undefined ? undefined : String(status)),
+  )
+    ? new ContextOverflowError(error.message, { cause: error })
+    : error;
+}
 
 export function snapshot(messages: UIMessage[]): StreamChunk {
   return { type: EventType.MESSAGES_SNAPSHOT, messages: uiMessagesToWire(messages) };
@@ -65,7 +122,7 @@ function validateToolEvent(event: StreamChunk, processor: StreamProcessor): void
 
 function assertLiveEvent(event: StreamChunk, processor: StreamProcessor, finished: boolean): void {
   if (event.type === "RUN_ERROR") {
-    throw new Error(event.message);
+    throw providerFailure(event.message, event.code);
   }
 
   if (finished) {
@@ -131,7 +188,9 @@ export async function streamModelTurn(input: ModelStream): Promise<Turn> {
     assertTurnComplete(finished);
   }
 
-  const result = await processor.process(checkedStream());
+  const result = await processor.process(checkedStream()).catch((error: unknown) => {
+    throw toContextOverflow(error);
+  });
   const state = processor.getState();
   const output: Turn = {
     messages: processor.getMessages(),
@@ -144,4 +203,21 @@ export async function streamModelTurn(input: ModelStream): Promise<Turn> {
   };
 
   return JSON.parse(JSON.stringify(output)) as Turn;
+}
+
+export async function requestModelTurn(input: ModelRequest): Promise<Turn> {
+  const stream = await input
+    .chatStream({
+      model: input.model,
+      messages: convertMessagesToModelMessages(input.messages),
+      systemPrompts: input.systemPrompts,
+      tools: input.tools,
+      logger: resolveDebugOption(false),
+      request: { signal: AbortSignal.timeout(input.timeoutMs) },
+    })
+    .catch((error: unknown) => {
+      throw toContextOverflow(error);
+    });
+
+  return streamModelTurn({ messages: input.messages, stream, append: input.append });
 }

@@ -10,71 +10,66 @@ import { ProgressPanel } from "./progress-panel";
 import { StatusBadge } from "./status-badge";
 import { type Pane as PaneModel } from "./types";
 
-const DEFAULT_WIDTH = { main: 720, agent: 440 } as const;
+const PANE_KIND = {
+  main: {
+    width: 720,
+    label: () => "主對話",
+    empty: "還沒有訊息，輸入第一則訊息開始對話。",
+    placeholder: "輸入訊息",
+    hint: "送出後會使用目前的 thread；輸入 / 可選擇指令",
+  },
+  agent: {
+    width: 440,
+    label: (title: string) => `附屬對話：${title}`,
+    empty: "這是附屬對話。第一則訊息會先帶入主對話的摘要，不會影響主對話。",
+    placeholder: "輸入附屬對話訊息",
+    hint: "第一則訊息會帶入主對話摘要；輸入 / 可選擇指令",
+  },
+} as const;
 
-export function Pane({
+function PaneHeader({
   pane,
   onOpenAgentPane,
   onClose,
-  onSend,
-  sendDisabled = false,
-  isHydrating = false,
-  hydrationError,
 }: {
   pane: PaneModel;
   onOpenAgentPane: () => void;
   onClose?: () => void;
-  onSend?: (text: string) => Promise<SendResult>;
-  sendDisabled?: boolean;
-  isHydrating?: boolean;
-  hydrationError?: string | null;
 }) {
-  const isMain = pane.kind === "main";
-
   return (
-    <PaneShell
-      label={isMain ? "主對話" : `附屬對話：${pane.title}`}
-      defaultWidth={isMain ? DEFAULT_WIDTH.main : DEFAULT_WIDTH.agent}
-    >
-      <header className="flex shrink-0 flex-col gap-2.5 border-b bg-card px-4 py-3">
-        <div className="flex flex-wrap items-center gap-2">
-          <h2 className="text-base font-semibold">{pane.title}</h2>
-          <Badge variant="outline">{pane.agent}</Badge>
-          <StatusBadge status={pane.status} runningLabel="執行中" idleLabel="待命" />
-          <div className="ml-auto flex items-center gap-1">
-            <Button variant="outline" size="sm" onClick={onOpenAgentPane}>
-              <PlusIcon data-icon="inline-start" />
-              開啟附屬對話
+    <header className="flex shrink-0 flex-col gap-2.5 border-b bg-card px-4 py-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <h2 className="text-base font-semibold">{pane.title}</h2>
+        <Badge variant="outline">{pane.agent}</Badge>
+        <StatusBadge status={pane.status} runningLabel="執行中" idleLabel="待命" />
+        <div className="ml-auto flex items-center gap-1">
+          <Button variant="outline" size="sm" onClick={onOpenAgentPane}>
+            <PlusIcon data-icon="inline-start" />
+            開啟附屬對話
+          </Button>
+          {onClose ? (
+            <Button variant="ghost" size="sm" onClick={onClose}>
+              <XIcon data-icon="inline-start" />
+              關閉
             </Button>
-            {onClose ? (
-              <Button variant="ghost" size="sm" onClick={onClose}>
-                <XIcon data-icon="inline-start" />
-                關閉
-              </Button>
-            ) : null}
-          </div>
+          ) : null}
         </div>
-      </header>
-      <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-4">
-        {pane.messages.length === 0 ? (
-          <p className="m-auto text-sm text-muted-foreground">
-            {isMain
-              ? "還沒有訊息，輸入第一則訊息開始對話。"
-              : "這是預留的附屬對話窗格，尚未連接 agent 執行。"}
-          </p>
-        ) : (
-          <MessageList
-            messages={pane.messages}
-            agent={pane.agent}
-            isStreaming={pane.status === "running"}
-          />
-        )}
-        <ProgressPanel
-          status={pane.status}
-          label={isMain ? "主對話進度" : "附屬對話進度"}
-          lines={pane.progress}
-        />
       </div>
+    </header>
+  );
+}
+
+function PaneAlerts({
+  isHydrating,
+  hydrationError,
+  notice,
+}: {
+  isHydrating: boolean;
+  hydrationError?: string | null;
+  notice?: string | null;
+}) {
+  return (
+    <>
       {isHydrating ? (
         <p role="status" className="px-4 text-sm">
           正在載入對話…
@@ -88,10 +83,57 @@ export function Pane({
           </Button>
         </div>
       ) : null}
+      {notice ? (
+        <p role="alert" className="px-4 py-2 text-sm text-destructive">
+          {notice}
+        </p>
+      ) : null}
+    </>
+  );
+}
+
+export function Pane({
+  pane,
+  onOpenAgentPane,
+  onClose,
+  onSend,
+  sendDisabled = false,
+  isHydrating = false,
+  hydrationError,
+  notice,
+}: {
+  pane: PaneModel;
+  onOpenAgentPane: () => void;
+  onClose?: () => void;
+  onSend?: (text: string) => Promise<SendResult>;
+  sendDisabled?: boolean;
+  isHydrating?: boolean;
+  hydrationError?: string | null;
+  notice?: string | null;
+}) {
+  const kind = PANE_KIND[pane.kind];
+  const label = kind.label(pane.title);
+
+  return (
+    <PaneShell label={label} defaultWidth={kind.width}>
+      <PaneHeader pane={pane} onOpenAgentPane={onOpenAgentPane} onClose={onClose} />
+      <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-4">
+        {pane.messages.length === 0 ? (
+          <p className="m-auto text-sm text-muted-foreground">{kind.empty}</p>
+        ) : (
+          <MessageList
+            messages={pane.messages}
+            agent={pane.agent}
+            isStreaming={pane.status === "running"}
+          />
+        )}
+        <ProgressPanel status={pane.status} label="對話脈絡壓縮" lines={pane.progress} />
+      </div>
+      <PaneAlerts isHydrating={isHydrating} hydrationError={hydrationError} notice={notice} />
       <Composer
-        label={`${isMain ? "主對話" : pane.title}輸入-${pane.id}`}
-        placeholder={isMain ? "輸入訊息" : "附屬對話尚未連接執行，僅為預留窗格"}
-        hint={isMain ? "送出後會使用目前的 thread" : "此窗格為 UI 預留狀態，不會呼叫 agent"}
+        label={`${label}輸入-${pane.id}`}
+        placeholder={kind.placeholder}
+        hint={kind.hint}
         onSend={onSend}
         disabled={sendDisabled || !onSend}
         className="border-t"

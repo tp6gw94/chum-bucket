@@ -1,37 +1,59 @@
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { setTimeout as delay } from "node:timers/promises";
-import { and, eq, gt, sql } from "drizzle-orm";
+import { and, asc, eq, gt, isNull, sql } from "drizzle-orm";
 import { EventType, type StreamChunk, type UIMessage } from "@tanstack/ai";
 import { z } from "zod";
 import { chatEventsTable, chatRunsTable, threadsTable } from "../db/schema";
+import { compactionEventName, type CompactionEvent } from "../../shared/compaction-event";
+import type { SideChat } from "../../shared/side-chat";
+import {
+  conversationFromProjection,
+  isSummaryMessage,
+  projectConversation,
+  type ConversationState,
+  type RunProjection,
+} from "./conversation";
 import { openuiInstructions } from "./prompts";
 import { snapshot } from "./model-turn";
 
-export const BUILD = "durable-chat-loop-v5";
+export const BUILD = "durable-chat-loop-v6";
 export const MODEL = "deepseek-ai/DeepSeek-V4.1-Flash";
-const runIdSchema = z
+export const runIdSchema = z
   .string()
   .min(1)
   .max(200)
   .regex(/^[A-Za-z0-9_-]+$/);
-export const runInputSchema = z
+export const revisionSchema = z.number().int().nonnegative().max(2_000_000_000);
+export const compactInstructionsSchema = z.string().trim().min(1).max(2_000);
+const messageRunSchema = z
   .object({
     threadId: z.uuid(),
     runId: runIdSchema,
-    baseRevision: z.number().int().nonnegative().max(2_000_000_000),
+    baseRevision: revisionSchema,
     message: z
       .object({ id: z.string().min(1).max(200), text: z.string().trim().min(1).max(32_000) })
       .strict(),
   })
   .strict();
+const compactRunSchema = z
+  .object({
+    kind: z.literal("compact"),
+    threadId: z.uuid(),
+    runId: runIdSchema,
+    baseRevision: revisionSchema,
+    instructions: compactInstructionsSchema.optional(),
+  })
+  .strict();
+export const runInputSchema = z.union([messageRunSchema, compactRunSchema]);
 export type RunInput = z.infer<typeof runInputSchema>;
-export type AcceptedRun = RunInput & {
-  messages: UIMessage[];
-  prompt: string;
-  model: typeof MODEL;
-  build: typeof BUILD;
-};
+export type AcceptedRun = RunInput &
+  RunProjection & {
+    parentContext?: UIMessage[];
+    prompt: string;
+    model: typeof MODEL;
+    build: typeof BUILD;
+  };
 type RunRow = typeof chatRunsTable.$inferSelect;
 type ThreadRow = typeof threadsTable.$inferSelect;
 type Transaction = Parameters<Parameters<typeof import("../db").db.transaction>[0]>[0];
@@ -84,6 +106,74 @@ async function appendEvent(tx: Transaction, run: RunRow, key: string, event: Str
   run.next_sequence++;
 }
 
+function threadProjection(thread: ThreadRow): RunProjection {
+  return thread.context_anchor
+    ? { messages: thread.messages, contextAnchor: thread.context_anchor }
+    : { messages: thread.messages };
+}
+
+function threadTitle(messages: readonly UIMessage[], fallback: string): string {
+  return (
+    messages
+      .find((message) => message.role === "user" && !isSummaryMessage(message))
+      ?.parts.filter((part) => part.type === "text")
+      .map((part) => part.content)
+      .join("")
+      .slice(0, 10) || fallback
+  );
+}
+
+async function sideChatParentContext(
+  tx: Transaction,
+  thread: ThreadRow,
+): Promise<UIMessage[] | undefined> {
+  if (!thread.parent_thread_id || thread.messages.length) {
+    return undefined;
+  }
+
+  const [parent] = await tx
+    .select()
+    .from(threadsTable)
+    .where(eq(threadsTable.id, thread.parent_thread_id))
+    .for("share");
+
+  if (!parent) {
+    throw new Error("Missing parent thread");
+  }
+
+  const { context } = conversationFromProjection(threadProjection(parent));
+
+  return context.length ? context : undefined;
+}
+
+async function acceptedMessages(
+  tx: Transaction,
+  thread: ThreadRow,
+  input: RunInput,
+): Promise<Pick<AcceptedRun, "messages" | "parentContext">> {
+  if ("kind" in input) {
+    return { messages: thread.messages };
+  }
+
+  if (thread.messages.some((message) => message.id === input.message.id)) {
+    throw new RunRequestError(409, "Message ID already exists");
+  }
+
+  const parentContext = await sideChatParentContext(tx, thread);
+
+  return {
+    messages: [
+      ...thread.messages,
+      {
+        id: input.message.id,
+        role: "user",
+        parts: [{ type: "text", content: input.message.text }],
+      },
+    ],
+    ...(parentContext ? { parentContext } : {}),
+  };
+}
+
 export async function persistRun(value: RunInput) {
   const parsed = runInputSchema.safeParse(value);
 
@@ -121,20 +211,15 @@ export async function persistRun(value: RunInput) {
       throw new RunRequestError(409, "Thread revision or claim conflict");
     }
 
-    if (thread.messages.some((message) => message.id === input.message.id)) {
-      throw new RunRequestError(409, "Message ID already exists");
+    if (thread.closed_at) {
+      throw new RunRequestError(409, "Thread is closed");
     }
 
+    const projection = threadProjection(thread);
     const run: AcceptedRun = {
       ...input,
-      messages: [
-        ...thread.messages,
-        {
-          id: input.message.id,
-          role: "user",
-          parts: [{ type: "text", content: input.message.text }],
-        },
-      ],
+      ...projection,
+      ...(await acceptedMessages(tx, thread, input)),
       prompt: openuiInstructions(),
       model: MODEL,
       build: BUILD,
@@ -146,7 +231,7 @@ export async function persistRun(value: RunInput) {
         thread_id: run.threadId,
         request: input,
         accepted: run,
-        projection: run.messages,
+        projection: projectConversation(conversationFromProjection(run)),
       })
       .onConflictDoNothing({ target: chatRunsTable.id })
       .returning();
@@ -171,22 +256,52 @@ export async function persistRun(value: RunInput) {
   return accepted;
 }
 
-export async function emit(runId: string, event: StreamChunk, messages?: UIMessage[]) {
+async function saveProjection(tx: Transaction, runId: string, conversation: ConversationState) {
+  await tx
+    .update(chatRunsTable)
+    .set({ projection: projectConversation(conversation) })
+    .where(eq(chatRunsTable.id, runId));
+}
+
+export async function emit(runId: string, event: StreamChunk, conversation?: ConversationState) {
   const db = await database();
   await db.transaction(async (tx) => {
     const { run } = await lockRun(tx, runId);
     await appendEvent(tx, run, randomUUID(), event);
 
-    if (messages) {
-      await tx
-        .update(chatRunsTable)
-        .set({ projection: messages })
-        .where(eq(chatRunsTable.id, runId));
+    if (conversation) {
+      await saveProjection(tx, runId, conversation);
     }
   });
 }
 
-export async function finishRun(runId: string, messages?: UIMessage[], code = "execution_failed") {
+export async function recordCompaction(
+  runId: string,
+  event: CompactionEvent,
+  conversation?: ConversationState,
+) {
+  const db = await database();
+  await db.transaction(async (tx) => {
+    const { run } = await lockRun(tx, runId);
+    await appendEvent(tx, run, randomUUID(), {
+      type: EventType.CUSTOM,
+      name: compactionEventName,
+      value: event,
+      timestamp: Date.now(),
+    });
+
+    if (conversation) {
+      await appendEvent(tx, run, randomUUID(), snapshot(conversation.display));
+      await saveProjection(tx, runId, conversation);
+    }
+  });
+}
+
+export async function finishRun(
+  runId: string,
+  conversation?: ConversationState,
+  code = "execution_failed",
+) {
   const db = await database();
   await db.transaction(async (tx) => {
     const { run, thread } = await lockRun(tx, runId);
@@ -199,27 +314,22 @@ export async function finishRun(runId: string, messages?: UIMessage[], code = "e
       throw new Error("Thread claim changed");
     }
 
-    if (messages) {
-      const title =
-        messages
-          .find((message) => message.role === "user")
-          ?.parts.filter((part) => part.type === "text")
-          .map((part) => part.content)
-          .join("")
-          .slice(0, 10) || "新對話";
+    if (conversation) {
+      const { messages, contextAnchor } = projectConversation(conversation);
       await appendEvent(tx, run, "finished:snapshot", snapshot(messages));
       await tx
         .update(threadsTable)
         .set({
           messages,
-          title,
+          context_anchor: contextAnchor ?? null,
+          title: threadTitle(messages, thread.title),
           revision: sql`${threadsTable.revision} + 1`,
           active_run_id: null,
           updated_at: sql`now()`,
         })
         .where(eq(threadsTable.id, thread.id));
     } else {
-      await appendEvent(tx, run, "failed:snapshot", snapshot(run.projection));
+      await appendEvent(tx, run, "failed:snapshot", snapshot(run.projection.messages));
       await tx
         .update(threadsTable)
         .set({ active_run_id: null })
@@ -230,7 +340,7 @@ export async function finishRun(runId: string, messages?: UIMessage[], code = "e
       tx,
       run,
       "terminal",
-      messages
+      conversation
         ? { type: EventType.RUN_FINISHED, threadId: thread.id, runId }
         : {
             type: EventType.RUN_ERROR,
@@ -241,7 +351,7 @@ export async function finishRun(runId: string, messages?: UIMessage[], code = "e
     );
     await tx
       .update(chatRunsTable)
-      .set({ state: messages ? "succeeded" : "failed" })
+      .set({ state: conversation ? "succeeded" : "failed" })
       .where(eq(chatRunsTable.id, runId));
   });
 }
@@ -294,6 +404,79 @@ export async function hydrateThread(threadId: string) {
       revision: thread.revision,
       activeRun: thread.active_run_id ? { runId: thread.active_run_id } : null,
     };
+  });
+}
+
+function sideChatOf(thread: ThreadRow): SideChat {
+  return {
+    id: thread.id,
+    parentThreadId: thread.parent_thread_id!,
+    title: thread.title,
+    revision: thread.revision,
+  };
+}
+
+export async function createSideChat(parentThreadId: string): Promise<SideChat> {
+  const db = await database();
+
+  return db.transaction(async (tx) => {
+    const [parent] = await tx
+      .select()
+      .from(threadsTable)
+      .where(eq(threadsTable.id, parentThreadId))
+      .for("share");
+
+    if (!parent || parent.closed_at) {
+      throw new RunRequestError(404, "Unknown thread");
+    }
+
+    if (parent.parent_thread_id) {
+      throw new RunRequestError(409, "Side chats cannot be nested");
+    }
+
+    const [created] = await tx
+      .insert(threadsTable)
+      .values({ title: "附屬對話", agent: "side-chat", parent_thread_id: parentThreadId })
+      .returning();
+
+    return sideChatOf(created!);
+  });
+}
+
+export async function listSideChats(parentThreadId: string): Promise<SideChat[]> {
+  const db = await database();
+  const rows = await db
+    .select()
+    .from(threadsTable)
+    .where(and(eq(threadsTable.parent_thread_id, parentThreadId), isNull(threadsTable.closed_at)))
+    .orderBy(asc(threadsTable.created_at), asc(threadsTable.id));
+
+  return rows.map(sideChatOf);
+}
+
+export async function closeSideChat(id: string): Promise<void> {
+  const db = await database();
+  await db.transaction(async (tx) => {
+    const [thread] = await tx
+      .select()
+      .from(threadsTable)
+      .where(eq(threadsTable.id, id))
+      .for("update");
+
+    if (!thread?.parent_thread_id) {
+      throw new RunRequestError(404, "Unknown side chat");
+    }
+
+    if (thread.active_run_id) {
+      throw new RunRequestError(409, "Side chat is still running");
+    }
+
+    if (!thread.closed_at) {
+      await tx
+        .update(threadsTable)
+        .set({ closed_at: sql`now()` })
+        .where(eq(threadsTable.id, id));
+    }
   });
 }
 

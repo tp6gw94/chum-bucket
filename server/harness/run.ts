@@ -1,6 +1,21 @@
 import { setTimeout as delay } from "node:timers/promises";
 import { DBOS } from "@dbos-inc/dbos-sdk";
-import { runAgentLoop, type AgentCheckpoint, type AgentSession } from "./agent-loop";
+import type { UIMessage } from "@tanstack/ai";
+import type { CompactionTrigger } from "../../shared/compaction-event";
+import {
+  runAgentLoop,
+  type AgentCheckpoint,
+  type AgentCompact,
+  type AgentSession,
+} from "./agent-loop";
+import {
+  compactConversation,
+  estimateContextTokens,
+  seedSideChat,
+  type CompactionResult,
+} from "./compaction";
+import { conversationFromProjection, type ConversationState } from "./conversation";
+import type { ChatStream } from "./model-turn";
 import { withRunTools, type RunTools } from "./tools";
 import {
   BUILD,
@@ -11,6 +26,7 @@ import {
   emit,
   finishRun,
   listPendingRuns,
+  recordCompaction,
   type RunInput,
   type AcceptedRun,
 } from "./run-store";
@@ -25,41 +41,144 @@ export async function acceptRun(value: RunInput): Promise<AcceptedRun> {
   return accepted.run;
 }
 
-function runSession(run: AcceptedRun, tools: RunTools): AgentSession {
-  return {
-    runId: run.runId,
-    emit,
-    chatStream: async (options) => {
-      const { deepinfra } = await import("./provider");
+function providerChatStream(run: AcceptedRun): ChatStream {
+  return async (options) => {
+    const { deepinfra } = await import("./provider");
 
-      return deepinfra(run.model).chatStream(options);
-    },
-    tools,
+    return deepinfra(run.model).chatStream(options);
   };
+}
+
+function runSession(run: AcceptedRun, tools: RunTools): AgentSession {
+  return { runId: run.runId, emit, chatStream: providerChatStream(run), tools };
 }
 
 const runCheckpoint: AgentCheckpoint = ({ name, retry, work }) =>
   retry ? DBOS.runStep(work, { name, ...retry }) : DBOS.runStep(work, { name });
+
+async function compactionStep(
+  run: AcceptedRun,
+  input: {
+    name: string;
+    trigger: CompactionTrigger;
+    source: readonly UIMessage[];
+    work: (summaryId: string) => Promise<CompactionResult>;
+  },
+): Promise<CompactionResult> {
+  const result = await DBOS.runStep(
+    async () => {
+      await recordCompaction(run.runId, {
+        phase: "started",
+        trigger: input.trigger,
+        tokensBefore: estimateContextTokens(input.source),
+      });
+
+      return input.work(`summary:${run.runId}:${input.name}`);
+    },
+    { name: input.name },
+  );
+  await DBOS.runStep(
+    () =>
+      recordCompaction(
+        run.runId,
+        result.event,
+        result.status === "done" ? result.conversation : undefined,
+      ),
+    { name: `${input.name}:record` },
+  );
+
+  return result;
+}
+
+function runCompaction(run: AcceptedRun): AgentCompact {
+  const chatStream = providerChatStream(run);
+
+  return ({ conversation, trigger, name }) =>
+    compactionStep(run, {
+      name,
+      trigger,
+      source: conversation.context,
+      work: (summaryId) =>
+        compactConversation({ conversation, trigger, summaryId, model: run.model, chatStream }),
+    });
+}
+
+async function executeCompactRun(run: Extract<AcceptedRun, { kind: "compact" }>) {
+  const conversation = conversationFromProjection(run);
+  const chatStream = providerChatStream(run);
+  const result = await compactionStep(run, {
+    name: "compact:manual",
+    trigger: "manual",
+    source: conversation.context,
+    work: (summaryId) =>
+      compactConversation({
+        conversation,
+        trigger: "manual",
+        summaryId,
+        model: run.model,
+        chatStream,
+        instructions: run.instructions,
+      }),
+  });
+
+  if (result.status === "failed") {
+    throw new Error(`Compaction failed: ${result.event.error}`);
+  }
+
+  const next = result.status === "done" ? result.conversation : conversation;
+  await DBOS.runStep(() => finishRun(run.runId, next), { name: "finish" });
+}
+
+async function seededConversation(run: AcceptedRun): Promise<ConversationState> {
+  const conversation = conversationFromProjection(run);
+  const parentContext = run.parentContext;
+
+  if (!parentContext) {
+    return conversation;
+  }
+
+  const chatStream = providerChatStream(run);
+  const result = await compactionStep(run, {
+    name: "side-chat:seed",
+    trigger: "side-chat",
+    source: parentContext,
+    work: (summaryId) =>
+      seedSideChat({ conversation, parentContext, summaryId, model: run.model, chatStream }),
+  });
+
+  if (result.status === "failed") {
+    throw new Error(`Side chat summary failed: ${result.event.error}`);
+  }
+
+  return result.status === "done" ? result.conversation : conversation;
+}
 
 export async function executeRun(run: AcceptedRun) {
   if (run.build !== BUILD || run.model !== MODEL) {
     throw new Error("Incompatible run build");
   }
 
+  if ("kind" in run) {
+    return executeCompactRun(run);
+  }
+
+  const conversation = await seededConversation(run);
+
   return withRunTools(async (tools) => {
     const result = await runAgentLoop({
       session: runSession(run, tools),
-      messages: run.messages,
+      conversation,
       model: run.model,
       prompt: run.prompt,
       checkpoint: runCheckpoint,
+      compact: runCompaction(run),
     });
 
-    if (result.state === "limit") {
+    if (result.outcome === "limit") {
       throw new Error("Model iteration limit exceeded");
     }
 
-    await DBOS.runStep(() => finishRun(run.runId, result.messages), { name: "finish" });
+    await DBOS.runStep(() => finishRun(run.runId, result.conversation), { name: "finish" });
   });
 }
 

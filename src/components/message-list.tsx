@@ -48,6 +48,24 @@ function AssistantMessage({ text, isStreaming }: { text: string; isStreaming: bo
   );
 }
 
+function SummaryMessage({ text }: { text: string }) {
+  const [preamble = "", ...body] = text.split("\n\n");
+
+  return (
+    <div className="flex flex-col gap-2">
+      <Marker variant="separator">
+        <MarkerContent>對話摘要</MarkerContent>
+      </Marker>
+      <details className="rounded-lg bg-muted/50 px-3 py-2 text-sm">
+        <summary className="cursor-pointer text-muted-foreground select-none">{preamble}</summary>
+        <div className="mt-2 min-w-0">
+          <MarkDownRenderer textMarkdown={body.join("\n\n")} options={markdownOptions} />
+        </div>
+      </details>
+    </div>
+  );
+}
+
 function ChatMessageRow({
   message,
   agent,
@@ -70,12 +88,12 @@ function ChatMessageRow({
     );
   }
 
+  if (message.metadata?.fromSummary === true) {
+    return <SummaryMessage text={text} />;
+  }
+
   const align = message.role === "user" ? "end" : "start";
-  const header = message.metadata?.fromSummary
-    ? "摘要"
-    : message.role === "assistant"
-      ? agent
-      : null;
+  const header = message.role === "assistant" ? agent : null;
 
   return (
     <Message align={align}>

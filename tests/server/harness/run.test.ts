@@ -289,7 +289,7 @@ test("append failure stops provider consumption and cannot complete a turn", asy
   assert.equal(continued, false);
 });
 
-const accepted: AcceptedRun = {
+const accepted: Extract<AcceptedRun, { message: unknown }> = {
   threadId: "d08035f1-07df-49f3-b2d0-5cf5cb2b1e74",
   runId: "ca2f180a-8461-4cfb-9012-f413df6d72f9",
   baseRevision: 0,
@@ -297,8 +297,9 @@ const accepted: AcceptedRun = {
   messages: baseline,
   prompt: "offline",
   model: "deepseek-ai/DeepSeek-V4.1-Flash",
-  build: "durable-chat-loop-v5",
+  build: "durable-chat-loop-v6",
 };
+const conversation = (messages: UIMessage[]) => ({ display: messages, context: messages });
 const toolTurn: Turn = {
   messages: baseline,
   calls: [
@@ -1164,6 +1165,23 @@ test("AG-UI boundary ignores forged history, requires revision, and keeps run id
     baseRevision: 0,
     message: accepted.message,
   });
+  assert.deepEqual(
+    parseRunBody({
+      ...body,
+      forwardedProps: { baseRevision: 3, kind: "compact", instructions: " 保留決策 " },
+    }),
+    {
+      kind: "compact",
+      threadId: accepted.threadId,
+      runId: accepted.runId,
+      baseRevision: 3,
+      instructions: "保留決策",
+    },
+  );
+  assert.throws(
+    () => parseRunBody({ ...body, forwardedProps: { baseRevision: 0, kind: "fork" } }),
+    /Invalid AG-UI/,
+  );
   assert.throws(() => parseRunBody({ ...body, forwardedProps: {} }), /Invalid AG-UI/);
   assert.throws(() => parseRunBody(body, "other"), /header mismatch/);
   for (const runId of ["", "bad/id", "空白", "x".repeat(201)]) {
@@ -1314,7 +1332,7 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
     }
     statements.push(text);
     const threadColumns =
-      "id, title, agent, revision, active_run_id, messages, parent_thread_id, created_at, updated_at";
+      "id, title, agent, revision, active_run_id, messages, context_anchor, parent_thread_id, closed_at, created_at, updated_at";
     const runColumns =
       "id, thread_id, request, accepted, projection, state, next_sequence, created_at";
     const [a, b, c, d, e] = values;
@@ -1356,12 +1374,13 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
     } else if (text.startsWith("update threads set title")) {
       assert.equal(
         text,
-        "update threads set title = $1, revision = revision + 1, active_run_id = $2, messages = $3, updated_at = now() where id = $4",
+        "update threads set title = $1, revision = revision + 1, active_run_id = $2, messages = $3, context_anchor = $4, updated_at = now() where id = $5",
       );
       assert.equal(b, null);
-      const thread = threads.get(String(d))!;
+      const thread = threads.get(String(e))!;
       thread.title = a;
       thread.messages = JSON.parse(String(c));
+      thread.context_anchor = d;
       thread.revision = Number(thread.revision) + 1;
       thread.active_run_id = null;
     } else if (text.startsWith("update threads set active_run_id")) {
@@ -1529,7 +1548,7 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
         parts: [{ type: "text" as const, content: "complete" }],
       },
     ];
-    const modelTurn: Turn = { calls: [], messages: canonical };
+    const modelTurn = { kind: "turn", calls: [], conversation: conversation(canonical) };
     const completed = new Map<string, unknown>();
     const failures = new Set(["finish"]);
     const steps = mock.method(
@@ -1705,7 +1724,7 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
       await assert.rejects(executeRun(nextRun), /Uncheckpointed finish/);
       assert.deepEqual(
         runEvents()[beforeToolRetry]!.payload,
-        snapshot(cached.get("tool:0:0") as UIMessage[]),
+        snapshot((cached.get("tool:0:0") as ReturnType<typeof conversation>).display),
       );
       assert.deepEqual(external, ["TEST-1", "TEST-2", "TEST-2"]);
       assert.equal(modelCalls, 3);
@@ -1736,7 +1755,8 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
       cached.clear();
       gaps.add("model:0");
       await assert.rejects(executeRun(failedRun), /Uncheckpointed model:0/);
-      const speculative = runs.get(failedRun.runId)!.projection as UIMessage[];
+      const speculative = (runs.get(failedRun.runId)!.projection as { messages: UIMessage[] })
+        .messages;
       assert.equal(speculative.at(-1)!.parts[0]!.type, "text");
       statuses.set(failedRun.runId, "ERROR");
       await reconcileRuns();
@@ -1791,10 +1811,16 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
       await largeReplay.return(undefined);
       const largeThreadRow = threads.get(largeThread)!;
       largeThreadRow.active_run_id = "other-run";
-      await assert.rejects(finishRun(largeRun.runId, largeRun.messages), /Thread claim changed/);
+      await assert.rejects(
+        finishRun(largeRun.runId, conversation(largeRun.messages)),
+        /Thread claim changed/,
+      );
       threads.get(largeThread)!.active_run_id = largeRun.runId;
       threads.get(largeThread)!.revision = 1;
-      await assert.rejects(finishRun(largeRun.runId, largeRun.messages), /Thread claim changed/);
+      await assert.rejects(
+        finishRun(largeRun.runId, conversation(largeRun.messages)),
+        /Thread claim changed/,
+      );
       threads.get(largeThread)!.revision = 0;
       cached.clear();
       gaps.clear();
@@ -1844,7 +1870,7 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
         Array.from({ length: sequences.length - 1 }, (_, index) => 100_000 + index),
       );
       const beforeTerminal = largeEvents().length;
-      await finishRun(largeRun.runId, largeSaved);
+      await finishRun(largeRun.runId, conversation(largeSaved));
       await assert.rejects(emit(largeRun.runId, largeEvent), /Run is terminal/);
       assert.equal(largeEvents().length, beforeTerminal);
       assert.equal(threads.get(largeThread)!.revision, 1);
@@ -2430,6 +2456,7 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
     const beforeOldStart = started.length;
     const beforeOldEvents = events.length;
     for (const legacyBuild of [
+      "durable-chat-loop-v5",
       "durable-chat-loop-v4",
       "durable-chat-loop-v3",
       "durable-chat-loop-v2",
@@ -2442,6 +2469,147 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
       assert.equal(oldRow.state, "pending");
       assert.equal(threads.get(oldRun.threadId)!.active_run_id, oldRun.runId);
       assert.equal(events.length, beforeOldEvents);
+    }
+
+    const compactThread = "0b3c6f2e-6a0e-4d8f-9b7e-3f1f7f3f9a11";
+    const sideThread = "5e0f3b8a-2c4d-4e6f-8a9b-1c2d3e4f5a6b";
+    const longHistory: UIMessage[] = [
+      { id: "long-user", role: "user", parts: [{ type: "text", content: "Plan the release" }] },
+      {
+        id: "long-answer",
+        role: "assistant",
+        parts: [{ type: "text", content: "Release on Friday" }],
+      },
+    ];
+    threads.set(compactThread, {
+      id: compactThread,
+      title: "Plan the r",
+      messages: longHistory,
+      revision: 0,
+      active_run_id: null,
+    });
+    threads.set(sideThread, {
+      id: sideThread,
+      title: "附屬對話",
+      messages: [],
+      revision: 0,
+      active_run_id: null,
+      parent_thread_id: compactThread,
+    });
+    process.env.MODEL_API_KEY = "offline";
+    const { deepinfra: summaryProvider } = await import("../../../server/harness/provider");
+    const modelRequests: { systemPrompts: string[]; messages: string }[] = [];
+    const summaryModel = mock.method(
+      Object.getPrototypeOf(summaryProvider(accepted.model)),
+      "chatStream",
+      async function* (options: { systemPrompts: string[]; messages: unknown }) {
+        modelRequests.push({
+          systemPrompts: options.systemPrompts,
+          messages: JSON.stringify(options.messages),
+        });
+        const [system] = options.systemPrompts;
+        const reply = system?.includes("side chat")
+          ? "Side summary"
+          : system?.includes("checkpoint summary")
+            ? "Checkpoint summary"
+            : "Answer";
+        yield {
+          type: EventType.TEXT_MESSAGE_START,
+          messageId: `reply-${modelRequests.length}`,
+          role: "assistant",
+        };
+        yield {
+          type: EventType.TEXT_MESSAGE_CONTENT,
+          messageId: `reply-${modelRequests.length}`,
+          delta: reply,
+        };
+        yield { type: EventType.TEXT_MESSAGE_END, messageId: `reply-${modelRequests.length}` };
+        yield providerFinish;
+      },
+    );
+    const directSteps = mock.method(DBOS, "runStep", async (callback: () => Promise<unknown>) =>
+      callback(),
+    );
+    try {
+      const compactRun = await acceptRun({
+        kind: "compact",
+        threadId: compactThread,
+        runId: "manual-compact",
+        baseRevision: 0,
+        instructions: "保留發布日期",
+      });
+      assert.deepEqual(compactRun.messages, longHistory);
+      await executeRun(compactRun);
+      const summaryId = "summary:manual-compact:compact:manual";
+      const compacted = threads.get(compactThread)!;
+      assert.equal(compacted.context_anchor, summaryId);
+      assert.equal(compacted.revision, 1);
+      assert.equal(compacted.title, "Plan the r");
+      assert.deepEqual(
+        (compacted.messages as UIMessage[]).map((message) => message.id),
+        ["long-user", "long-answer", summaryId],
+      );
+      assert.match(modelRequests[0]!.messages, /保留發布日期/);
+      const compactEvents = events
+        .filter((row) => row.run_id === compactRun.runId)
+        .map((row) => row.payload as StreamChunk);
+      assert.deepEqual(
+        compactEvents
+          .filter((event) => event.type === EventType.CUSTOM)
+          .map((event) => (event.value as { phase: string }).phase),
+        ["started", "done"],
+      );
+      assert.equal(compactEvents.at(-1)!.type, EventType.RUN_FINISHED);
+      assert.deepEqual((await hydrateThread(compactThread)).messages, compacted.messages);
+
+      const followUp = await acceptRun({
+        threadId: compactThread,
+        runId: "after-compact",
+        baseRevision: 1,
+        message: { id: "follow-up", text: "When do we ship?" },
+      });
+      assert.equal(followUp.contextAnchor, summaryId);
+      await executeRun(followUp);
+      const followUpRequest = modelRequests.at(-1)!.messages;
+      assert.match(followUpRequest, /Checkpoint summary/);
+      assert.equal(followUpRequest.includes("Plan the release"), false);
+      assert.deepEqual(
+        (threads.get(compactThread)!.messages as UIMessage[]).map((message) => message.id),
+        ["long-user", "long-answer", summaryId, "follow-up", `reply-${modelRequests.length}`],
+      );
+      assert.equal(threads.get(compactThread)!.context_anchor, summaryId);
+
+      const sideRun = await acceptRun({
+        threadId: sideThread,
+        runId: "side-first",
+        baseRevision: 0,
+        message: { id: "side-user", text: "剛剛決定了什麼時候發布？" },
+      });
+      assert.ok(!("kind" in sideRun));
+      assert.deepEqual(
+        sideRun.parentContext?.map((message) => message.id),
+        [summaryId, "follow-up", `reply-${modelRequests.length}`],
+      );
+      await executeRun(sideRun);
+      const side = threads.get(sideThread)!;
+      const sideSummaryId = "summary:side-first:side-chat:seed";
+      assert.equal(side.context_anchor, sideSummaryId);
+      assert.equal(side.title, "剛剛決定了什麼時候發");
+      assert.deepEqual(
+        (side.messages as UIMessage[]).map((message) => message.id),
+        [sideSummaryId, "side-user", `reply-${modelRequests.length}`],
+      );
+      assert.match(modelRequests.at(-1)!.messages, /Side summary/);
+      const secondSide = await acceptRun({
+        threadId: sideThread,
+        runId: "side-second",
+        baseRevision: 1,
+        message: { id: "side-user-2", text: "還有呢？" },
+      });
+      assert.equal("parentContext" in secondSide, false);
+    } finally {
+      directSteps.mock.restore();
+      summaryModel.mock.restore();
     }
   } finally {
     start.mock.restore();

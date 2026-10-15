@@ -3,12 +3,15 @@ import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import chat from "./chat";
 import thread from "./thread";
+import sideChat from "./side-chat";
+import { sideChatPath } from "../shared/side-chat";
 import { launchChatRuntime, shutdownChatRuntime } from "./harness/run";
 
 const app = new Hono();
 app.get("/", (c) => c.text("Hello Node.js!"));
 app.route("/api/chat", chat);
 app.route("/api/thread", thread);
+app.route(sideChatPath, sideChat);
 
 await launchChatRuntime();
 const server = serve(app);

@@ -51,6 +51,63 @@ ${declarations}
 - Tools that require discovery appear here only after their discovery tool has been called directly; never call discovery tools from code.`;
 }
 
+export const summaryPreambles = {
+  compaction: "以下是先前對話的摘要。較早的訊息已移出模型上下文，請以這份摘要接續對話。",
+  sideChat:
+    "以下是主對話目前的摘要。這是附屬對話，使用者想在不打斷主對話的情況下討論相關問題；需要時請引用摘要中的內容。",
+} as const;
+
+const summaryFormat = `Use this exact structure and keep every section, writing "None" when a section is empty:
+
+## Goal
+## Constraints & Preferences
+## Progress
+### Done
+### In Progress
+### Blocked
+## Key Decisions
+## Next Steps
+## Critical Context`;
+
+export const compactionSystemPrompt = `You compress a long conversation between a user and an AI assistant into a checkpoint summary. Another model will continue the conversation from this summary alone, without the original messages.
+
+Preserve everything needed to continue the work: the user's goals and requests, constraints and preferences, decisions with their reasons, file paths, identifiers, issue keys, URLs, commands, tool results that still matter, errors, and open questions. Drop pleasantries, repetition, and tool output that no longer matters.
+
+If a previous summary is provided, merge it with the new messages into one updated summary instead of summarizing the summary.
+
+Write in the same language the user writes in. Output only the summary.
+
+${summaryFormat}`;
+
+export const sideChatSummarySystemPrompt = `You summarize the main conversation between a user and an AI assistant so that a separate side chat can start with the right background. The side chat will answer the user's follow-up questions without access to the original messages.
+
+Focus on what a newcomer needs to discuss the main conversation: its goal, the current state of the work, decisions and their reasons, important names, file paths, identifiers, URLs, and unresolved questions. If the main conversation already starts with a summary, fold it into yours.
+
+Write in the same language the user writes in. Output only the summary.
+
+${summaryFormat}`;
+
+export type SummaryRequestInput = Readonly<{
+  transcript: string;
+  previousSummary?: string;
+  instructions?: string;
+}>;
+
+export function summaryRequestPrompt({
+  transcript,
+  previousSummary,
+  instructions,
+}: SummaryRequestInput): string {
+  return [
+    previousSummary ? `<previous-summary>\n${previousSummary}\n</previous-summary>` : "",
+    `<conversation>\n${transcript}\n</conversation>`,
+    instructions ? `<user-instructions>\n${instructions}\n</user-instructions>` : "",
+    "Write the summary now.",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
 export function openuiInstructions(extra?: string): string {
   const library = JSON.parse(
     readFileSync(join(process.cwd(), "src/generated/spec.json"), "utf-8"),

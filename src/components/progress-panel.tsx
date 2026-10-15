@@ -20,11 +20,15 @@ export function ProgressPanel({
   const running = status === "running";
 
   return (
-    <Card size="sm">
+    <Card size="sm" className="shrink-0">
       <CardHeader>
         <CardTitle className="flex items-center gap-2 text-xs font-medium tracking-wide text-muted-foreground uppercase">
-          {running ? <LoaderCircleIcon className="motion-safe:animate-spin" /> : <CircleIcon />}
-          {`${label}（${running ? "持續執行中" : "已結束"}）`}
+          {running ? (
+            <LoaderCircleIcon className="size-3.5 motion-safe:animate-spin" />
+          ) : (
+            <CircleIcon className="size-3.5" />
+          )}
+          {`${label}（${running ? "進行中" : "已結束"}）`}
         </CardTitle>
       </CardHeader>
       <CardContent className="flex flex-col gap-1 font-mono text-xs text-muted-foreground">

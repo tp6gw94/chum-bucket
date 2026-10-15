@@ -7,6 +7,7 @@ import { cn } from "cn";
 
 import { Button } from "@/components/ui/button";
 import type { SendResult } from "../hooks/use-threads";
+import { CommandMenu, useCommandMenu } from "./command-menu";
 
 const EDITOR_CLASS = cn(
   "min-h-14 w-full rounded-lg border border-input bg-transparent px-2.5 py-2 text-base transition-colors outline-none",
@@ -48,6 +49,7 @@ export function Composer({
   const [text, setText] = useState("");
   const [error, setError] = useState<string | null>(null);
   const formRef = useRef<HTMLFormElement>(null);
+  const menuKeyRef = useRef<(event: KeyboardEvent) => boolean>(() => false);
 
   const canSubmit = text.trim().length > 0 && !disabled && !busy && Boolean(onSend);
   const errorId = `${label}-error`;
@@ -70,11 +72,17 @@ export function Composer({
           : {}),
       },
       handleKeyDown: (view, event) => {
-        if (event.key !== "Enter" || event.shiftKey) {
+        if (event.isComposing || view.composing) {
           return false;
         }
 
-        if (event.isComposing || view.composing) {
+        if (menuKeyRef.current(event)) {
+          event.preventDefault();
+
+          return true;
+        }
+
+        if (event.key !== "Enter" || event.shiftKey) {
           return false;
         }
 
@@ -87,6 +95,11 @@ export function Composer({
     onUpdate: ({ editor }) => {
       setText(editor.getText({ blockSeparator: "\n" }));
     },
+  });
+  const menu = useCommandMenu(editor, text);
+
+  useEffect(() => {
+    menuKeyRef.current = menu.handleKey;
   });
 
   useEffect(() => {
@@ -134,6 +147,7 @@ export function Composer({
           </span>
         ) : null}
         <EditorContent editor={editor} />
+        <CommandMenu menu={menu} />
       </div>
       <div className="flex items-center gap-2">
         <span className="text-xs text-muted-foreground">{hint}</span>
