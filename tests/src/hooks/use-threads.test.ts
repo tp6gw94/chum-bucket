@@ -4,7 +4,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { ChatClient } from "@tanstack/ai-react";
 import { fetchServerSentEvents } from "@tanstack/ai-react";
 import { EventType, uiMessagesToWire, type StreamChunk } from "@tanstack/ai";
-import { createThread, terminalResult } from "../../../src/hooks/use-threads";
+import { createThread, deleteThread, terminalResult } from "../../../src/hooks/use-threads";
 
 const threadId = "d08035f1-07df-49f3-b2d0-5cf5cb2b1e74";
 const runId = "run-recovery-test";
@@ -53,6 +53,28 @@ test("creation is empty and never sends chat", async () => {
   try {
     assert.deepEqual(await createThread(), { id: threadId, title: "新對話" });
     assert.deepEqual(requests, [{}]);
+  } finally {
+    mocked.mock.restore();
+  }
+});
+
+test("deletion treats missing threads as deleted and surfaces running conflicts", async () => {
+  const requests: Array<[string, string | undefined]> = [];
+  const statuses = [204, 404, 409, 500];
+  const mocked = mock.method(
+    globalThis,
+    "fetch",
+    async (url: string | URL | Request, init?: RequestInit) => {
+      requests.push([String(url), init?.method]);
+      return new Response(null, { status: statuses[requests.length - 1] });
+    },
+  );
+  try {
+    await deleteThread(threadId);
+    await deleteThread(threadId);
+    await assert.rejects(deleteThread(threadId), /執行中/);
+    await assert.rejects(deleteThread(threadId), /HTTP 500/);
+    assert.deepEqual(requests[0], [`/api/thread/${threadId}`, "DELETE"]);
   } finally {
     mocked.mock.restore();
   }

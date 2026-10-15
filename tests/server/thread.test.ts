@@ -59,3 +59,74 @@ test("thread creation accepts only an empty object and stores an empty revision"
     insert.mock.restore();
   }
 });
+
+function deletionTransaction(row: { activeRunId: string | null } | undefined) {
+  const writes: string[] = [];
+  const where = () => ({ for: async () => (row ? [row] : []) });
+  const tx = {
+    select: () => ({ from: () => ({ where }) }),
+    delete: (table: unknown) => ({
+      where: async () => {
+        writes.push(
+          `delete:${String((table as Record<symbol, string>)[Symbol.for("drizzle:Name")])}`,
+        );
+      },
+    }),
+    update: () => ({
+      set: () => ({
+        where: async () => {
+          writes.push("detach-children");
+        },
+      }),
+    }),
+  };
+  const transaction = mock.method(db, "transaction", (async (
+    run: (value: typeof tx) => Promise<unknown>,
+  ) => run(tx)) as unknown as typeof db.transaction);
+
+  return { writes, restore: () => transaction.mock.restore() };
+}
+
+test("thread deletion validates the id and refuses missing or running threads", async () => {
+  assert.equal((await app.request("/not-a-uuid", { method: "DELETE" })).status, 400);
+
+  const missing = deletionTransaction(undefined);
+  try {
+    const response = await app.request("/d08035f1-07df-49f3-b2d0-5cf5cb2b1e74", {
+      method: "DELETE",
+    });
+    assert.equal(response.status, 404);
+    assert.deepEqual(missing.writes, []);
+  } finally {
+    missing.restore();
+  }
+
+  const busy = deletionTransaction({ activeRunId: "run-1" });
+  try {
+    const response = await app.request("/d08035f1-07df-49f3-b2d0-5cf5cb2b1e74", {
+      method: "DELETE",
+    });
+    assert.equal(response.status, 409);
+    assert.deepEqual(busy.writes, []);
+  } finally {
+    busy.restore();
+  }
+});
+
+test("thread deletion removes events, runs, and the thread", async () => {
+  const idle = deletionTransaction({ activeRunId: null });
+  try {
+    const response = await app.request("/d08035f1-07df-49f3-b2d0-5cf5cb2b1e74", {
+      method: "DELETE",
+    });
+    assert.equal(response.status, 204);
+    assert.deepEqual(idle.writes, [
+      "delete:chat_events",
+      "delete:chat_runs",
+      "detach-children",
+      "delete:threads",
+    ]);
+  } finally {
+    idle.restore();
+  }
+});

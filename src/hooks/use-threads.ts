@@ -49,7 +49,21 @@ export async function createThread(): Promise<ThreadSummary> {
   return threadSchema.parse(await response.json());
 }
 
-export function useThreadList() {
+export async function deleteThread(id: string) {
+  const response = await fetch(`/api/thread/${encodeURIComponent(z.uuid().parse(id))}`, {
+    method: "DELETE",
+  });
+
+  if (response.status === 409) {
+    throw new Error("對話仍在執行中，無法刪除");
+  }
+
+  if (!response.ok && response.status !== 404) {
+    throw new Error(`刪除對話失敗（HTTP ${response.status}）`);
+  }
+}
+
+export function useThreadList(currentId: string | null = null) {
   const [threads, setThreads] = useState<ThreadSummary[]>([]);
   const [error, setError] = useState<string | null>(null);
   useEffect(() => {
@@ -75,7 +89,25 @@ export function useThreadList() {
     return () => controller.abort();
   }, []);
 
-  return { threads, error };
+  async function remove({ id }: ThreadSummary) {
+    setError(null);
+
+    try {
+      await deleteThread(id);
+    } catch (cause) {
+      setError(errorMessage(cause));
+
+      return;
+    }
+
+    if (id === currentId) {
+      window.location.assign(threadUrl(null));
+    } else {
+      setThreads((list) => list.filter((thread) => thread.id !== id));
+    }
+  }
+
+  return { threads, error, remove };
 }
 
 function errorMessage(cause: unknown) {

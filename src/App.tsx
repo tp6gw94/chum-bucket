@@ -64,7 +64,7 @@ function ThreadEntry() {
 function ThreadPage({ threadId }: { threadId: string }) {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [agentPanes, setAgentPanes] = useState<PaneModel[]>([]);
-  const { threads, error: listError } = useThreadList();
+  const { threads, error: listError, remove } = useThreadList(threadId);
   const thread = useThread(threadId);
   const { messages, send } = thread;
   const isLoading = thread.phase === "busy";
@@ -120,6 +120,7 @@ function ThreadPage({ threadId }: { threadId: string }) {
             disabled={sendDisabled}
             onNewThread={() => thread.navigate(null)}
             onSelectThread={thread.navigate}
+            onDeleteThread={remove}
           />
           <main
             role="region"

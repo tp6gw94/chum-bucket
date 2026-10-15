@@ -1,8 +1,8 @@
 import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { db } from "./db";
-import { threadsTable } from "./db/schema";
-import { desc, eq } from "drizzle-orm";
+import { chatEventsTable, chatRunsTable, threadsTable } from "./db/schema";
+import { desc, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
 
 const app = new Hono();
@@ -61,6 +61,54 @@ app.get("/:threadId", async (c) => {
     .where(eq(threadsTable.id, threadId));
 
   return thread ? c.json(thread) : c.notFound();
+});
+
+app.delete("/:threadId", async (c) => {
+  const threadId = c.req.param("threadId");
+
+  if (!z.uuid().safeParse(threadId).success) {
+    return c.json({ error: "Invalid thread id" }, 400);
+  }
+
+  const outcome = await db.transaction(async (tx) => {
+    const [thread] = await tx
+      .select({ activeRunId: threadsTable.active_run_id })
+      .from(threadsTable)
+      .where(eq(threadsTable.id, threadId))
+      .for("update");
+
+    if (!thread) {
+      return "missing";
+    }
+
+    if (thread.activeRunId) {
+      return "busy";
+    }
+
+    const runs = tx
+      .select({ id: chatRunsTable.id })
+      .from(chatRunsTable)
+      .where(eq(chatRunsTable.thread_id, threadId));
+    await tx.delete(chatEventsTable).where(inArray(chatEventsTable.run_id, runs));
+    await tx.delete(chatRunsTable).where(eq(chatRunsTable.thread_id, threadId));
+    await tx
+      .update(threadsTable)
+      .set({ parent_thread_id: null })
+      .where(eq(threadsTable.parent_thread_id, threadId));
+    await tx.delete(threadsTable).where(eq(threadsTable.id, threadId));
+
+    return "deleted";
+  });
+
+  if (outcome === "missing") {
+    return c.notFound();
+  }
+
+  if (outcome === "busy") {
+    return c.json({ error: "Thread has an active run" }, 409);
+  }
+
+  return c.body(null, 204);
 });
 
 export default app;
