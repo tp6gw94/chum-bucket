@@ -77,6 +77,11 @@ export type AgentLoopResult =
   | { state: "done"; conversation: ConversationState }
   | { state: "limit"; conversation: ConversationState };
 
+export type AgentOrchestration = (
+  call: ModelCall,
+  step: string,
+) => Promise<{ output: unknown; error: boolean } | undefined>;
+
 type AgentLoopInput = {
   session: AgentSession;
   conversation: ConversationState;
@@ -84,6 +89,7 @@ type AgentLoopInput = {
   prompt: string;
   checkpoint: AgentCheckpoint;
   compact?: AgentCompact;
+  orchestrate?: AgentOrchestration;
   signal?: AbortSignal;
   assertExecution?: () => Promise<void>;
 };
@@ -211,10 +217,14 @@ async function toolTurn(
   for (const [index, call] of calls.entries()) {
     await input.assertExecution?.();
     const current = conversation;
+    const name = `tool:${turn}:${index}`;
+    const handled = await input.orchestrate?.(call, name);
     conversation = await input.checkpoint({
-      name: `tool:${turn}:${index}`,
+      name,
       work: () =>
-        executeToolStep(input.session, { conversation: current, call, signal: input.signal }),
+        handled
+          ? settleToolStep(input.session, { conversation: current, call, ...handled })
+          : executeToolStep(input.session, { conversation: current, call, signal: input.signal }),
     });
   }
 

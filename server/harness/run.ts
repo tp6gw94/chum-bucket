@@ -6,12 +6,15 @@ import {
   runAgentLoop,
   type AgentCheckpoint,
   type AgentCompact,
+  type AgentOrchestration,
   type AgentSession,
 } from "./agent-loop";
+import { delegateBrowserTask } from "./browser-agent";
 import { prepareCompaction, publishCompaction, readCompactionPolicy } from "./compaction";
 import { modelChatStream } from "./model-turn";
 import type { ConversationState } from "./conversation";
 import { withRunTools, type RunTools } from "./tools";
+import { DELEGATE_TASK_TOOL, withDelegation } from "./tools/delegate-task";
 import {
   BUILD,
   MODEL,
@@ -112,9 +115,16 @@ function executionGuard(run: AcceptedRun) {
   return run.sideChat ? () => assertSideChatOpen(run.threadId) : undefined;
 }
 
-async function finishChatRun(run: AcceptedRun, tools: RunTools, signal: AbortSignal) {
+async function finishChatRun(run: AcceptedRun, baseTools: RunTools, signal: AbortSignal) {
+  const tools = run.sideChat ? baseTools : withDelegation(baseTools);
   const compact: AgentCompact = (input) => compactConversation(run, tools, input, signal);
   const assertExecution = executionGuard(run);
+  const orchestrate: AgentOrchestration | undefined = run.sideChat
+    ? undefined
+    : async (call, step) =>
+        call.name === DELEGATE_TASK_TOOL
+          ? delegateBrowserTask(run.runId, run.model, call, step)
+          : undefined;
   const result = await runAgentLoop({
     session: runSession(run, tools),
     conversation: run.conversation,
@@ -122,6 +132,7 @@ async function finishChatRun(run: AcceptedRun, tools: RunTools, signal: AbortSig
     prompt: run.prompt,
     checkpoint: runCheckpoint,
     compact,
+    orchestrate,
     signal,
     assertExecution,
   });

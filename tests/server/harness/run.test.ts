@@ -298,7 +298,7 @@ const accepted: AcceptedRun & { message: { id: string; text: string } } = {
   sideChat: false,
   prompt: "offline",
   model: "deepseek-ai/DeepSeek-V4.1-Flash",
-  build: "durable-chat-loop-v6",
+  build: "durable-chat-loop-v7",
 };
 const toolTurn: Turn = {
   messages: baseline,
@@ -1632,7 +1632,7 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
       }) {
         assert.deepEqual(
           options.tools?.map((tool) => tool.name),
-          ["get_figma", "read", "write", "edit", "codemode"],
+          ["get_figma", "read", "write", "edit", "codemode", "delegate_task"],
         );
         assert.ok(options.tools?.every((tool) => !("execute" in tool) && tool.inputSchema));
         if (rejectedStream) {
@@ -1917,7 +1917,7 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
         }) {
           assert.deepEqual(
             options.tools?.map((tool) => tool.name),
-            ["get_figma", "read", "write", "edit", "codemode"],
+            ["get_figma", "read", "write", "edit", "codemode", "delegate_task"],
           );
           assert.ok(options.tools?.every((tool) => !("execute" in tool) && tool.inputSchema));
           for (const native of [
@@ -2088,7 +2088,15 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
             if (!toolIds.length) {
               assert.deepEqual(
                 options.tools?.map((tool) => tool.name),
-                ["get_figma", "read", "write", "edit", "discover_atlassian_tools", "codemode"],
+                [
+                  "get_figma",
+                  "read",
+                  "write",
+                  "edit",
+                  "discover_atlassian_tools",
+                  "codemode",
+                  "delegate_task",
+                ],
               );
               yield {
                 type: EventType.TEXT_MESSAGE_START,
@@ -2120,6 +2128,7 @@ test("SQL-boundary contracts: immutable claim, checkpoint recovery, terminal rel
                   "confluence_get_page",
                   "discover_atlassian_tools",
                   "codemode",
+                  "delegate_task",
                 ],
               );
               assert.deepEqual(
