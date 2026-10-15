@@ -119,7 +119,7 @@ const delegationRules = `## QA delegation
 
 You cannot read Jira or Confluence yourself. Use \`delegate_task\` to hand QA work to one role per call:
 
-- \`atlassian\` reads the sources and returns a \`requirements\` artifact assembled from the original text.
+- \`atlassian\` reads the sources and returns a \`requirements\` artifact assembled from the original text. When the user asks for a Jira comment, put the issue and the comment text in \`summary\`; the user approves it before it is posted, and the result's \`comment\` reports \`posted\`, \`rejected\`, \`failed\`, or \`cancelled\`.
 - \`planner\` turns \`requirementsRef\` into a \`plan\` artifact. Pass \`design: {fileKey, nodeId}\` only for a Figma node you confirmed.
 - \`ac\` runs the plan's functional checks in a real browser at \`targetUrl\`.
 - \`ui\` compares the plan's style checks with the Figma design at \`targetUrl\`.
@@ -167,6 +167,7 @@ Read every source in \`task.sources\` and nothing else.
 
 - Call \`discover_atlassian_tools\` with the tool names you need, then read each Jira source with \`jira_get_issue\` ({"issue_key": "..."}) and each Confluence source with \`confluence_get_page\` ({"page_id": "..."}).
 - Do not summarize, rewrite, or extract requirements. The host assembles the requirements from your successful reads.
+- Only when \`task.summary\` asks for a Jira comment, also discover \`jira_add_comment\`, and after the reads call it once with {"issue_key": "...", "body": "..."}. The user approves or rejects the comment; never say it was posted unless the result state is \`posted\`.
 - When every source was read, reply with one short plain-text sentence. Do not return JSON.`,
   planner: `## Role: planner
 

@@ -1,12 +1,20 @@
+import { DBOS } from "@dbos-inc/dbos-sdk";
 import { Hono } from "hono";
+import { bodyLimit } from "hono/body-limit";
 import { z } from "zod";
 import type { StreamChunk } from "@tanstack/ai";
+import {
+  toolApprovalDecisionRequestSchema,
+  toolApprovalIdSchema,
+  toolApprovalTopic,
+} from "../shared/tool-approval";
 import { acceptRun } from "./harness/run";
 import {
   checkCursor,
   compactInstructionsSchema,
   hydrateThread,
   observeRun,
+  pendingToolApproval,
   revisionSchema,
   runIdSchema,
   RunRequestError,
@@ -164,6 +172,29 @@ app.post("/", async (c) => {
 
   return eventResponse((signal) => observeRun(input.runId, cursor, signal), c.req.raw.signal);
 });
+
+app.post(
+  "/approvals/:id/decision",
+  bodyLimit({ maxSize: 4_000, onError: (c) => c.json({ error: "Request too large" }, 413) }),
+  async (c) => {
+    const id = toolApprovalIdSchema.safeParse(c.req.param("id"));
+    const body = toolApprovalDecisionRequestSchema.safeParse(await c.req.json().catch(() => null));
+
+    if (!id.success || !body.success) {
+      throw new RunRequestError(400, "Invalid approval decision");
+    }
+
+    const approval = await pendingToolApproval(id.data, body.data.threadId);
+    await DBOS.send(
+      approval.workflowId,
+      body.data.decision,
+      toolApprovalTopic(approval.id),
+      `${approval.id}:decision`,
+    );
+
+    return c.json({ state: "sent" }, 202);
+  },
+);
 
 app.get("/", async (c) => {
   const runId = c.req.query("runId");

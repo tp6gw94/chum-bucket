@@ -135,6 +135,7 @@ export const atlassianOutputs = {
   ]),
   confluence_search: z.array(confluencePage),
   confluence_get_comments: z.array(confluenceComment),
+  jira_add_comment: jiraComment,
 } satisfies Record<string, z.ZodType>;
 
 const outputSchemas: ReadonlyMap<string, JSONSchema> = new Map(

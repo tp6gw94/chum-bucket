@@ -7,8 +7,8 @@ import type { ToolAccess } from "../../server/harness/agents";
 import { atlassianToolNames } from "../../server/harness/tools/atlassian-policy";
 
 export const scopeAccess: ToolAccess = {
-  permits: (name) => name !== "delegate_task",
-  atlassianNames: atlassianToolNames,
+  permits: (name) => name !== "delegate_task" && name !== "jira_add_comment",
+  atlassianNames: atlassianToolNames.filter((name) => name !== "jira_add_comment"),
 };
 
 export const fakeEmail = "mcp-test@example.invalid";

@@ -81,6 +81,8 @@ function ThreadPage({ threadId }: { threadId: string }) {
     kind: "main",
     testing: thread.testing,
     onTestingUpdate: thread.updateTesting,
+    approvals: thread.approvals,
+    onApprovalDecision: thread.decideApproval,
   };
 
   const threadSummaries: ThreadSummary[] = threads.map((thread) => ({

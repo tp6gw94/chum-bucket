@@ -1,7 +1,9 @@
 import type { Tool } from "@tanstack/ai";
 import { artifactKinds, type ArtifactKind, type Role } from "../../shared/testing";
 import { mainSystemPrompt, openuiInstructions, qaSystemPrompt } from "./prompts";
+import { jiraCommentToolName } from "../../shared/tool-approval";
 import { discoveryToolName } from "./tools/atlassian";
+import { atlassianTools } from "./tools/atlassian-policy";
 import { codeModeToolName } from "./tools/code-mode";
 import { delegateTaskTool } from "./tools/delegate-task";
 import { edit, read, write } from "./tools/fs";
@@ -48,7 +50,7 @@ const browserLimits: RoleLimits = { maxTurns: 20, maxToolCalls: 60, maxNestedCal
 
 const atlassianRead: AtlassianFactory = {
   kind: "atlassian",
-  names: ["jira_get_issue", "confluence_get_page"],
+  names: ["jira_get_issue", "confluence_get_page", jiraCommentToolName],
 };
 
 export const agentRegistry = {
@@ -153,7 +155,7 @@ export function allowsTool(agentId: AgentId, name: string, route: Route): boolea
   }
 
   if (isFactory(entry)) {
-    return (entry.routes?.[name] ?? ALL_ROUTES).includes(route);
+    return (entry.routes?.[name] ?? atlassianTools.get(name)?.routes ?? ALL_ROUTES).includes(route);
   }
 
   return entry.metadata?.direct === true ? route === "direct" : true;

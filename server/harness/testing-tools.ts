@@ -1,9 +1,11 @@
+import { convertSchemaToJsonSchema } from "@tanstack/ai";
 import {
   browserAdapterVersion,
   browserFixture,
   verifyInputSchema,
   type Design,
 } from "../../shared/testing";
+import { jiraCommentParamsSchema, jiraCommentToolName } from "../../shared/tool-approval";
 import { agentAccess } from "./agents";
 import {
   guardActualIO,
@@ -38,6 +40,9 @@ import {
 
 const DESIGN_CAPTURE = "design_capture";
 const ATLASSIAN_READS = new Set(["jira_get_issue", "confluence_get_page"]);
+const JIRA_COMMENT_DESCRIPTION =
+  "Propose a Jira comment for the user to approve. Nothing is posted until the user approves it; the result reports whether it was posted, rejected, failed, or cancelled.";
+const jiraCommentInputSchema = convertSchemaToJsonSchema(jiraCommentParamsSchema);
 
 export type RoleStore = Readonly<{
   guard: typeof guardActualIO;
@@ -79,6 +84,32 @@ async function initialCapture(runtime: RoleRuntime): Promise<DesignCapture | und
   return receipts.findLast((receipt) => receipt.nativeName === DESIGN_CAPTURE)?.output as
     | DesignCapture
     | undefined;
+}
+
+const proposalOverrides = {
+  description: JIRA_COMMENT_DESCRIPTION,
+  ...(jiraCommentInputSchema ? { inputSchema: jiraCommentInputSchema } : {}),
+};
+
+function proposalDefinition<T extends { name: string }>(definition: T): T {
+  return definition.name === jiraCommentToolName
+    ? { ...definition, ...proposalOverrides }
+    : definition;
+}
+
+function proposalDiscovery(output: unknown): unknown {
+  const discovered = record(output);
+
+  if (!Array.isArray(discovered?.tools)) {
+    return output;
+  }
+
+  return {
+    ...discovered,
+    tools: discovered.tools.map((tool: unknown) =>
+      record(tool)?.name === jiraCommentToolName ? { ...record(tool), ...proposalOverrides } : tool,
+    ),
+  };
 }
 
 function figmaRegistration(context: RoleContext): Registration {
@@ -229,7 +260,7 @@ async function recordOutput(
   const name = external.call.name;
 
   if (name === discoveryToolName) {
-    return output;
+    return proposalDiscovery(output);
   }
 
   const slot = slotFor(runtime, state, external);
@@ -268,6 +299,12 @@ function roleHooks(runtime: RoleRuntime, state: RoleState): ToolHooks {
   return {
     visible: (name) => role !== "ui" || name !== verifyUiTool.name || state.capture !== undefined,
     prepare: (external) => {
+      if (external.call.name === jiraCommentToolName) {
+        throw new Error(
+          `${jiraCommentToolName} is posted only after user approval and cannot run directly`,
+        );
+      }
+
       if (role === "atlassian" && ATLASSIAN_READS.has(external.call.name)) {
         bindingsFor(runtime, external);
       }
@@ -291,7 +328,11 @@ function roleHooks(runtime: RoleRuntime, state: RoleState): ToolHooks {
 
 function guarded(runtime: RoleRuntime, tools: RunTools): RunTools {
   return {
-    getModelTools: tools.getModelTools,
+    async getModelTools(messages) {
+      const turn = await tools.getModelTools(messages);
+
+      return { ...turn, definitions: turn.definitions.map(proposalDefinition) };
+    },
     async executeTool(messages, call, context) {
       await guard(runtime, "tool", `tool:${call.id}`, call.name);
 

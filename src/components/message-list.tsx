@@ -8,14 +8,18 @@ import { Bubble, BubbleContent } from "@/components/ui/bubble";
 import { Marker, MarkerContent } from "@/components/ui/marker";
 import { Message, MessageContent, MessageGroup, MessageHeader } from "@/components/ui/message";
 import type { TestView } from "../../shared/testing";
+import type { ToolApprovals } from "../../shared/tool-approval";
 import type { TestingViews } from "../lib/testing-views";
 import { TestingPanel } from "./testing-panel";
+import { ToolApprovalList, type DecideToolApproval } from "./tool-approvals";
 import { type ChatMessage } from "./types";
 import { ToolCall } from "./tool-call";
 
 type TestingProps = {
   testing?: TestingViews;
   onTestingUpdate?: (view: TestView) => void;
+  approvals?: ToolApprovals;
+  onApprovalDecision?: DecideToolApproval;
 };
 
 const assistantReplyParser = createParser(openuiLibrary.toJSONSchema(), openuiLibrary.root);
@@ -78,13 +82,23 @@ function ToolCallWithTesting({
   part,
   testing,
   onTestingUpdate,
+  approvals,
+  onApprovalDecision,
 }: TestingProps & { part: Extract<ChatMessage["parts"][number], { type: "tool-call" }> }) {
-  const view = part.name === "delegate_task" ? testing?.[part.id] : undefined;
+  const delegated = part.name === "delegate_task";
+  const view = delegated ? testing?.[part.id] : undefined;
 
   return (
     <>
       <ToolCall part={part} />
       {view ? <TestingPanel view={view} onUpdate={onTestingUpdate ?? (() => undefined)} /> : null}
+      {delegated && approvals ? (
+        <ToolApprovalList
+          approvals={approvals}
+          requestKey={part.id}
+          onDecide={onApprovalDecision}
+        />
+      ) : null}
     </>
   );
 }
@@ -93,8 +107,7 @@ function ChatMessageRow({
   message,
   agent,
   isStreaming,
-  testing,
-  onTestingUpdate,
+  ...testingProps
 }: TestingProps & {
   message: ChatMessage;
   agent: string;
@@ -128,12 +141,7 @@ function ChatMessageRow({
           <div className="flex min-w-0 flex-col gap-2">
             {message.parts.map((part) =>
               part.type === "tool-call" ? (
-                <ToolCallWithTesting
-                  key={part.id}
-                  part={part}
-                  testing={testing}
-                  onTestingUpdate={onTestingUpdate}
-                />
+                <ToolCallWithTesting key={part.id} part={part} {...testingProps} />
               ) : null,
             )}
             {text.trim() !== "" ? <AssistantMessage text={text} isStreaming={isStreaming} /> : null}
@@ -152,8 +160,7 @@ export function MessageList({
   messages,
   agent,
   isStreaming = false,
-  testing,
-  onTestingUpdate,
+  ...testingProps
 }: TestingProps & {
   messages: ChatMessage[];
   agent: string;
@@ -169,8 +176,7 @@ export function MessageList({
           message={message}
           agent={agent}
           isStreaming={message.id === streamingId && message.role === "assistant"}
-          testing={testing}
-          onTestingUpdate={onTestingUpdate}
+          {...testingProps}
         />
       ))}
     </MessageGroup>

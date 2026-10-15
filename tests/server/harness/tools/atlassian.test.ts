@@ -7,7 +7,12 @@ import { setTimeout as delay } from "node:timers/promises";
 import { clearTimeout as nodeClearTimeout, setTimeout as nodeSetTimeout } from "node:timers";
 import type { ToolExecutionContext, UIMessage } from "@tanstack/ai";
 import type { ModelCall } from "../../../../server/harness/model-turn";
-import { withAtlassianScope, type ModelTool } from "../../../../server/harness/tools/atlassian";
+import {
+  jiraCommentApproval,
+  sendApprovedJiraComment,
+  withAtlassianScope,
+  type ModelTool,
+} from "../../../../server/harness/tools/atlassian";
 import { read } from "../../../../server/harness/tools/fs";
 import { withRunTools, type RunTools } from "../../../../server/harness/tools/index";
 import {
@@ -1392,4 +1397,83 @@ test("undiscovered native calls are rejected before any MCP dispatch and succeed
     true,
     fixture,
   );
+});
+
+const approvedComment = { issue_key: "TEST-1", body: "Looks good" };
+
+function commentResult(value: unknown) {
+  return { content: [{ type: "text", text: JSON.stringify(value) }] };
+}
+
+test("approved comments post the stored params once and return the Jira comment ID", async () => {
+  const fixture = mcpFixture({
+    rules: [
+      {
+        method: "tools/call",
+        name: "jira_add_comment",
+        result: commentResult({ id: "10001", body: "Looks good" }),
+      },
+    ],
+  });
+  await withMcpEnvironment(
+    async () => {
+      assert.deepEqual(await sendApprovedJiraComment(approvedComment), { commentId: "10001" });
+      assert.deepEqual(
+        fixture.calls().map((request) => request.message.params),
+        [{ name: "jira_add_comment", arguments: approvedComment }],
+      );
+    },
+    true,
+    fixture,
+  );
+});
+
+test("approved comments fail when Jira returns no comment ID", async () => {
+  const fixture = mcpFixture({
+    rules: [
+      { method: "tools/call", name: "jira_add_comment", result: commentResult({ body: "x" }) },
+    ],
+  });
+  await withMcpEnvironment(
+    async () => {
+      await assert.rejects(
+        sendApprovedJiraComment(approvedComment),
+        safeError(/did not return a comment ID/),
+      );
+      assert.equal(fixture.calls().length, 1);
+    },
+    true,
+    fixture,
+  );
+});
+
+test("approved comments never reach MCP without a configured service or with credentials in the body", async () => {
+  const fixture = mcpFixture();
+  await withMcpEnvironment(
+    () => assert.rejects(sendApprovedJiraComment(approvedComment), /not configured/),
+    false,
+    fixture,
+  );
+  await withMcpEnvironment(
+    () =>
+      assert.rejects(
+        sendApprovedJiraComment({ ...approvedComment, body: `token ${fakeToken}` }),
+        safeError(/credentials/),
+      ),
+    true,
+    fixture,
+  );
+  assert.deepEqual(fixture.calls(), []);
+});
+
+test("comment proposals accept only an issue key and a body", () => {
+  assert.deepEqual(jiraCommentApproval({ issue_key: "TEST-1", body: " hi " }), {
+    issue_key: "TEST-1",
+    body: "hi",
+  });
+  assert.throws(
+    () => jiraCommentApproval({ issue_key: "TEST-1", body: "hi", visibility: "{}" }),
+    /Invalid jira_add_comment input/,
+  );
+  assert.throws(() => jiraCommentApproval({ issue_key: "test", body: "hi" }), /issue_key/);
 });

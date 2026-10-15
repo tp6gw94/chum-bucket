@@ -6,6 +6,11 @@ import {
 } from "@tanstack/ai";
 import { createMCPClient, type MCPClient } from "@tanstack/ai-mcp";
 import { z } from "zod";
+import {
+  jiraCommentParamsSchema,
+  jiraCommentToolName,
+  type JiraCommentParams,
+} from "../../../shared/tool-approval";
 import type { ModelCall } from "../model-turn";
 import {
   atlassianTools,
@@ -739,6 +744,106 @@ async function runRemoteTool(
   } finally {
     callDeadline.release();
     signal.removeEventListener("abort", onAbort);
+  }
+}
+
+export function jiraCommentApproval(input: unknown): JiraCommentParams {
+  const parsed = jiraCommentParamsSchema.safeParse(input);
+
+  if (!parsed.success) {
+    const issues = parsed.error.issues.map(
+      (issue) => `${issue.path.join(".") || "input"}: ${issue.message}`,
+    );
+
+    throw new ToolBoundaryError(`Invalid ${jiraCommentToolName} input: ${issues.join("; ")}`);
+  }
+
+  return parsed.data;
+}
+
+function commentIdOf(output: unknown): string | undefined {
+  let value = output;
+
+  if (typeof value === "string") {
+    try {
+      value = JSON.parse(value);
+    } catch {
+      return undefined;
+    }
+  }
+
+  const id = (value as { id?: unknown } | null)?.id;
+
+  if (typeof id === "number" && Number.isSafeInteger(id)) {
+    return String(id);
+  }
+
+  return typeof id === "string" && id.trim() ? id.trim() : undefined;
+}
+
+async function postComment(
+  config: HttpConfig,
+  params: JiraCommentParams,
+  controller: AbortController,
+  deadlines: Set<AbortSignal>,
+): Promise<string> {
+  const catalog = await openRemote(config, controller, deadlines);
+  const callDeadline = armedDeadline(deadlines, MCP_TIMEOUT_MS);
+  const signal = AbortSignal.any([controller.signal, callDeadline.signal]);
+
+  try {
+    const entry = catalog.registrations.get(jiraCommentToolName);
+
+    if (!entry) {
+      throw new ToolBoundaryError(`Atlassian MCP is missing ${jiraCommentToolName}`);
+    }
+
+    const output = unwrapResultText(
+      await withAbort(
+        entry.handler(params, { abortSignal: signal, emitCustomEvent: () => undefined }),
+        signal,
+      ),
+    );
+    guardCredentials(output, config);
+    const commentId = commentIdOf(output);
+
+    if (!commentId) {
+      throw new ToolBoundaryError(`${jiraCommentToolName} did not return a comment ID`);
+    }
+
+    return commentId;
+  } finally {
+    callDeadline.release();
+    await catalog.close();
+  }
+}
+
+export async function sendApprovedJiraComment(
+  params: JiraCommentParams,
+): Promise<{ commentId: string }> {
+  const config = readAtlassianConfiguration(process.env);
+
+  if (config.mode !== "http") {
+    throw new ToolBoundaryError("Atlassian MCP is not configured");
+  }
+
+  guardCredentials(params, config);
+  const controller = new AbortController();
+
+  try {
+    return { commentId: await postComment(config, params, controller, new Set()) };
+  } catch (failure) {
+    guardCredentials(failure, config);
+
+    if (failure instanceof ToolBoundaryError) {
+      throw failure;
+    }
+
+    throw new ToolBoundaryError(
+      `${jiraCommentToolName} failed; check Jira credentials, site access, and the issue key`,
+    );
+  } finally {
+    controller.abort();
   }
 }
 

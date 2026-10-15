@@ -1,12 +1,21 @@
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { setTimeout as delay } from "node:timers/promises";
-import { and, asc, eq, gt, isNull, sql } from "drizzle-orm";
+import { and, asc, eq, gt, inArray, isNull, sql, type SQL } from "drizzle-orm";
+import { DBOS } from "@dbos-inc/dbos-sdk";
 import { EventType, type StreamChunk, type UIMessage } from "@tanstack/ai";
 import { z } from "zod";
-import { chatEventsTable, chatRunsTable, threadsTable } from "../db/schema";
+import { chatEventsTable, chatRunsTable, testingOperationsTable, threadsTable } from "../db/schema";
 import { compactionEventName, type CompactionEvent } from "../../shared/compaction-event";
 import type { SideChat } from "../../shared/side-chat";
+import {
+  projectToolApprovals,
+  toolApprovalRequestedEventName,
+  toolApprovalResolvedEventName,
+  toolApprovalTopic,
+  type ToolApproval,
+  type ToolApprovals,
+} from "../../shared/tool-approval";
 import {
   conversationFromProjection,
   isSummaryMessage,
@@ -292,6 +301,115 @@ export async function appendRunEvent(
   await appendEvent(tx, run, key, event);
 
   return true;
+}
+
+export async function recordToolApprovalEvent(
+  runId: string,
+  key: string,
+  event: StreamChunk,
+): Promise<boolean> {
+  const db = await database();
+
+  return db.transaction(async (tx) => {
+    const { run } = await lockRun(tx, runId);
+    const [existing] = await tx
+      .select({ key: chatEventsTable.event_key })
+      .from(chatEventsTable)
+      .where(and(eq(chatEventsTable.run_id, runId), eq(chatEventsTable.event_key, key)));
+
+    if (existing) {
+      return true;
+    }
+
+    if (run.state !== "pending") {
+      return false;
+    }
+
+    await appendEvent(tx, run, key, event);
+
+    return true;
+  });
+}
+
+async function toolApprovals(where: SQL | undefined): Promise<ToolApprovals> {
+  const db = await database();
+  const rows = await db
+    .select({ payload: chatEventsTable.payload })
+    .from(chatEventsTable)
+    .innerJoin(chatRunsTable, eq(chatRunsTable.id, chatEventsTable.run_id))
+    .where(
+      and(
+        where,
+        inArray(sql`${chatEventsTable.payload}->>'name'`, [
+          toolApprovalRequestedEventName,
+          toolApprovalResolvedEventName,
+        ]),
+      ),
+    )
+    .orderBy(asc(chatRunsTable.created_at), asc(chatEventsTable.sequence));
+
+  return projectToolApprovals(rows.map((row) => row.payload));
+}
+
+export async function pendingToolApproval(id: string, threadId: string): Promise<ToolApproval> {
+  const approval = (
+    await toolApprovals(
+      and(
+        eq(chatRunsTable.thread_id, threadId),
+        sql`${chatEventsTable.payload}->'value'->>'id' = ${id}`,
+      ),
+    )
+  )[id];
+
+  if (!approval) {
+    throw new RunRequestError(404, "Unknown approval");
+  }
+
+  if (approval.state !== "pending") {
+    throw new RunRequestError(409, "Approval is already resolved");
+  }
+
+  return approval;
+}
+
+export async function toolApprovalOutcome(runId: string, operationId: string) {
+  const approval = Object.values(await toolApprovals(eq(chatEventsTable.run_id, runId)))
+    .filter((candidate) => candidate.operationId === operationId)
+    .at(-1);
+
+  return approval
+    ? {
+        state: approval.state,
+        issueKey: approval.params.issue_key,
+        commentId: approval.commentId,
+        reason: approval.reason,
+      }
+    : null;
+}
+
+export async function wakeToolApprovals(operationId: string): Promise<void> {
+  const db = await database();
+  const [operation] = await db
+    .select({ runId: testingOperationsTable.parent_run_id })
+    .from(testingOperationsTable)
+    .where(eq(testingOperationsTable.id, operationId));
+
+  if (!operation) {
+    return;
+  }
+
+  const approvals = await toolApprovals(eq(chatEventsTable.run_id, operation.runId));
+
+  for (const approval of Object.values(approvals)) {
+    if (approval.operationId === operationId && approval.state === "pending") {
+      await DBOS.send(
+        approval.workflowId,
+        { wake: "cancelled" },
+        toolApprovalTopic(approval.id),
+        `${approval.id}:wake`,
+      );
+    }
+  }
 }
 
 export async function recordCompaction(

@@ -1,6 +1,8 @@
 import type { UIMessage } from "@tanstack/ai-react";
 import type { TestView } from "../../shared/testing";
+import type { ToolApprovals } from "../../shared/tool-approval";
 import type { TestingViews } from "../lib/testing-views";
+import type { DecideToolApproval } from "./tool-approvals";
 
 export type RunStatus = "running" | "idle";
 
@@ -18,6 +20,8 @@ export interface Pane {
   kind: "main" | "agent";
   testing?: TestingViews;
   onTestingUpdate?: (view: TestView) => void;
+  approvals?: ToolApprovals;
+  onApprovalDecision?: DecideToolApproval;
 }
 
 export interface ThreadSummary {

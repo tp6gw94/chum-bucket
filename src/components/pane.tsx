@@ -127,6 +127,8 @@ export function Pane({
             isStreaming={pane.status === "running"}
             testing={pane.testing}
             onTestingUpdate={pane.onTestingUpdate}
+            approvals={pane.approvals}
+            onApprovalDecision={pane.onApprovalDecision}
           />
         )}
         <ProgressPanel status={pane.status} label="對話脈絡壓縮" lines={pane.progress} />

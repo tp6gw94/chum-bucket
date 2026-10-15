@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import type { ToolExecutionContext } from "@tanstack/ai";
+import type { ToolExecutionContext, UIMessage } from "@tanstack/ai";
 import type { PlanArtifact, Role } from "../../../shared/testing";
 import { digestOf, type Receipt, type RoleContext } from "../../../server/harness/testing-domain";
 import { withRoleTools, type RoleStore } from "../../../server/harness/testing-tools";
 import type { ModelCall } from "../../../server/harness/model-turn";
-import { withMcpEnvironment } from "../../fixtures/mcp-fixture";
+import { mcpFixture, withMcpEnvironment } from "../../fixtures/mcp-fixture";
 
 const design = { fileKey: "abc123", nodeId: "1:2" };
 
@@ -241,5 +241,89 @@ test("planner role only gets code mode with no external tools", async () => {
       assert.ok(turn.definitions.every((definition) => definition.name === "codemode"));
       await assert.rejects(tools.executeTool([], call("read", { path: "/etc/hosts" }), context));
     }),
+  );
+});
+
+const atlassianContext: RoleContext = {
+  role: "atlassian",
+  intent: {
+    role: "atlassian",
+    summary: "Read TEST-1 and leave a comment",
+    goal: "Checkout works",
+    sources: [{ kind: "jira", issueKey: "TEST-1" }],
+  },
+};
+
+test("atlassian role sees jira_add_comment as an approval proposal that never runs directly", async () => {
+  const { store } = fakeStore();
+  const fixture = mcpFixture();
+
+  await withMcpEnvironment(
+    () =>
+      withRoleTools(runtime("atlassian", atlassianContext, store), async (tools) => {
+        const toolNames = ["jira_get_issue", "jira_add_comment"];
+        const discovery = (await tools.executeTool(
+          [],
+          call("discover_atlassian_tools", { toolNames }),
+          context,
+        )) as { tools: { name: string; description: string; inputSchema: unknown }[] };
+        const proposed = discovery.tools.find((tool) => tool.name === "jira_add_comment")!;
+
+        assert.match(proposed.description, /approve/);
+        assert.deepEqual(Object.keys((proposed.inputSchema as { properties: object }).properties), [
+          "issue_key",
+          "body",
+        ]);
+        assert.equal(
+          discovery.tools.find((tool) => tool.name === "jira_get_issue")!.description,
+          "Read an issue",
+        );
+
+        const history: UIMessage[] = [
+          {
+            id: "discovery-message",
+            role: "assistant",
+            parts: [
+              {
+                type: "tool-call",
+                id: "call-1",
+                name: "discover_atlassian_tools",
+                arguments: JSON.stringify({ toolNames }),
+                state: "complete",
+              },
+              {
+                type: "tool-result",
+                toolCallId: "call-1",
+                content: JSON.stringify(discovery),
+                state: "complete",
+              },
+            ],
+          },
+        ];
+        const turn = await tools.getModelTools(history);
+
+        assert.deepEqual(
+          turn.definitions.find((tool) => tool.name === "jira_add_comment"),
+          {
+            name: "jira_add_comment",
+            description: proposed.description,
+            inputSchema: proposed.inputSchema,
+          },
+        );
+        await assert.rejects(
+          tools.executeTool(
+            history,
+            call("jira_add_comment", { issue_key: "TEST-1", body: "Looks good" }),
+            context,
+          ),
+          /cannot run directly/,
+        );
+        assert.equal(
+          fixture.calls().some((request) => request.message.params?.name === "jira_add_comment"),
+          false,
+        );
+      }),
+    true,
+    fixture,
   );
 });

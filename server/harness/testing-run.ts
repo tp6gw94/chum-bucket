@@ -1,7 +1,7 @@
 import { setTimeout as delay } from "node:timers/promises";
 import { DBOS } from "@dbos-inc/dbos-sdk";
 import type { ModelCall } from "./model-turn";
-import type { AcceptedRun } from "./run-store";
+import { toolApprovalOutcome, type AcceptedRun } from "./run-store";
 import { TESTING_QUEUE, testingChildWorkflow, type ChildResult } from "./testing-child";
 import {
   acceptRoleCompletion,
@@ -114,7 +114,10 @@ export async function delegateTask(run: AcceptedRun, call: ModelCall) {
     async () => {
       await publishOperation(operationId);
 
-      return operationResult(operationId);
+      return {
+        ...(await operationResult(operationId)),
+        comment: await toolApprovalOutcome(run.runId, operationId),
+      };
     },
     { name: `${operationId}:result` },
   );

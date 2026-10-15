@@ -25,10 +25,17 @@ test("side chats cannot delegate", () => {
   assert.equal(allowsTool("side", "get_figma", "direct"), true);
 });
 
-test("atlassian role reads only issues and pages", () => {
-  assert.deepEqual(atlassianNamesFor("atlassian"), ["jira_get_issue", "confluence_get_page"]);
+test("atlassian role reads issues and pages and proposes comments only directly", () => {
+  assert.deepEqual(atlassianNamesFor("atlassian"), [
+    "jira_get_issue",
+    "confluence_get_page",
+    "jira_add_comment",
+  ]);
   assert.equal(allowsTool("atlassian", "jira_get_issue", "direct"), true);
   assert.equal(allowsTool("atlassian", "confluence_get_page", "codemode"), true);
+  assert.equal(allowsTool("atlassian", "jira_add_comment", "direct"), true);
+  assert.equal(allowsTool("atlassian", "jira_add_comment", "codemode"), false);
+  assert.equal(allowsTool("main", "jira_add_comment", "direct"), false);
   assert.equal(allowsTool("atlassian", "jira_create_issue", "direct"), false);
   assert.equal(allowsTool("atlassian", discoveryToolName, "direct"), true);
   assert.equal(allowsTool("atlassian", discoveryToolName, "codemode"), false);

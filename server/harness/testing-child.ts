@@ -2,11 +2,19 @@ import { setTimeout as delay } from "node:timers/promises";
 import { DBOS } from "@dbos-inc/dbos-sdk";
 import type { UIMessage } from "@tanstack/ai";
 import type { RoleFailureCode } from "../../shared/testing";
+import { jiraCommentToolName } from "../../shared/tool-approval";
 import { agentRegistry, roleSystemPrompt, type MODEL } from "./agents";
-import { runAgentLoop, type AgentCheckpoint, type AgentSession } from "./agent-loop";
+import {
+  runAgentLoop,
+  type AgentCheckpoint,
+  type AgentOrchestration,
+  type AgentSession,
+} from "./agent-loop";
 import type { ConversationState } from "./conversation";
 import type { ChatStream } from "./model-turn";
 import { roleFeedbackPrompt, roleFinalTurnPrompt, roleTaskPrompt } from "./prompts";
+import { wakeToolApprovals } from "./run-store";
+import { gateToolApproval } from "./tool-approval";
 import {
   clipIssues,
   evaluateRole,
@@ -148,6 +156,19 @@ function finalText(conversation: ConversationState): string | null {
   return text || null;
 }
 
+function approvalOrchestration(input: TestingChildInput): AgentOrchestration | undefined {
+  if (input.role !== "atlassian") {
+    return undefined;
+  }
+
+  let proposals = 0;
+
+  return async (call) =>
+    call.name === jiraCommentToolName
+      ? gateToolApproval(input, call, proposals++)
+      : { state: "unhandled" };
+}
+
 async function evaluateCompletion(
   input: TestingChildInput,
   task: ClaimedTask,
@@ -170,6 +191,8 @@ async function runRole(
   const prompt = roleSystemPrompt(input.role, task.runtime.profile);
   const browser = input.role === "ac" || input.role === "ui";
   const finalPrompt = roleFinalTurnPrompt(input.role);
+  const orchestration = approvalOrchestration(input);
+  const orchestrated = orchestration ? { orchestration } : {};
 
   return withRoleTools({ child: input, context: task.context }, async (tools) => {
     const session: AgentSession = {
@@ -188,6 +211,7 @@ async function runRole(
       prompt,
       checkpoint: roleCheckpoint(input, "a:", signal),
       bounded: { maxTurn: task.runtime.limits.maxTurns - FEEDBACK_TURNS, finalPrompt },
+      ...orchestrated,
     });
     const proposal = await DBOS.runStep(() => evaluateCompletion(input, task, first.conversation), {
       name: "proposal",
@@ -213,6 +237,7 @@ async function runRole(
       prompt,
       checkpoint: roleCheckpoint(input, "b:", signal),
       bounded: { maxTurn: FEEDBACK_TURNS, finalPrompt },
+      ...orchestrated,
     });
     const retried = await DBOS.runStep(() => evaluateCompletion(input, task, second.conversation), {
       name: "proposal-2",
@@ -312,6 +337,7 @@ export async function reconcileTestingOperations() {
   for (const operation of await openOperations()) {
     if (operation.cancelled) {
       await ensureCancelDeliveries(operation.id);
+      await wakeToolApprovals(operation.id);
     }
 
     await publishOperation(operation.id);

@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { z } from "zod";
 import { cancelTestingSchema } from "../shared/testing";
-import { RunRequestError } from "./harness/run-store";
+import { RunRequestError, wakeToolApprovals } from "./harness/run-store";
 import { operationView, publishOperation, requestCancel } from "./harness/testing-store";
 
 const app = new Hono();
@@ -58,6 +58,7 @@ app.post("/:runId/cancel", async (c) => {
   }
 
   const result = await requestCancel(operationId, body.data.threadId);
+  await wakeToolApprovals(operationId);
   const view = await publishOperation(operationId);
 
   return c.json({ ...result, view });

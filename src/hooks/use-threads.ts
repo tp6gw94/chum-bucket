@@ -9,6 +9,12 @@ import {
   type CompactionTrigger,
 } from "../../shared/compaction-event";
 import { parseTestingProjectionEvent } from "../../shared/testing";
+import {
+  projectToolApprovals,
+  toolApprovalPath,
+  type ToolApprovalDecision,
+  type ToolApprovals,
+} from "../../shared/tool-approval";
 import { commandRunBody, parseComposerCommand } from "../composer-commands";
 import { withPublishedTasks } from "../lib/testing-api";
 import { mergeTestingView, mergeTestingViews, type TestingViews } from "../lib/testing-views";
@@ -166,11 +172,32 @@ export function compactionLines(event: CompactionEvent | null): string[] {
   return event && event.phase !== "done" ? [compactionProgress(event)] : [];
 }
 
+async function sendToolApprovalDecision(
+  threadId: string,
+  approvalId: string,
+  decision: ToolApprovalDecision,
+): Promise<void> {
+  const response = await fetch(`${toolApprovalPath}/${encodeURIComponent(approvalId)}/decision`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ threadId, decision }),
+  });
+
+  if (response.status === 409) {
+    throw new Error("這則留言已經處理過了");
+  }
+
+  if (!response.ok) {
+    throw new Error(`送出決定失敗（HTTP ${response.status}）`);
+  }
+}
+
 export function useThread(threadId: string) {
   const [phase, setPhase] = useState<ThreadPhase>("loading");
   const [error, setError] = useState<string | null>(null);
   const [compaction, setCompaction] = useState<CompactionEvent | null>(null);
   const [testing, setTesting] = useState<TestingViews>({});
+  const [approvals, setApprovals] = useState<ToolApprovals>({});
   const owner = useRef({
     phase: "loading" as ThreadPhase,
     mounted: true,
@@ -214,23 +241,34 @@ export function useThread(threadId: string) {
     });
     let hydration: ReturnType<NonNullable<typeof base.hydrate>> | undefined;
 
+    const project = (chunk: StreamChunk) => {
+      const compacted = readCompactionEvent(chunk);
+      const view = parseTestingProjectionEvent(chunk);
+
+      if (compacted) {
+        setCompaction(compacted);
+      }
+
+      if (view) {
+        setTesting((current) => mergeTestingView(current, view));
+      }
+
+      if (chunk.type === "CUSTOM") {
+        setApprovals((current) => projectToolApprovals([chunk], current));
+      }
+    };
+
     const observe = async function* (stream: AsyncIterable<StreamChunk>) {
       try {
         for await (const chunk of stream) {
           const terminal = terminalResult(chunk, owner.runId);
-          const compacted = readCompactionEvent(chunk);
-          const view = parseTestingProjectionEvent(chunk);
 
           if (terminal) {
             owner.terminal = terminal;
           }
 
-          if (compacted && owner.mounted) {
-            setCompaction(compacted);
-          }
-
-          if (view && owner.mounted) {
-            setTesting((current) => mergeTestingView(current, view));
+          if (owner.mounted) {
+            project(chunk);
           }
 
           yield chunk;
@@ -373,6 +411,9 @@ export function useThread(threadId: string) {
     testing,
     updateTesting: (view: Parameters<typeof mergeTestingView>[1]) =>
       setTesting((current) => mergeTestingView(current, view)),
+    approvals,
+    decideApproval: (approvalId: string, decision: ToolApprovalDecision) =>
+      sendToolApprovalDecision(threadId, approvalId, decision),
     send,
     navigate,
   };

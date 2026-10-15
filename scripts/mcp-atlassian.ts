@@ -91,7 +91,6 @@ function launch(env: Environment) {
       "8000",
       "--path",
       "/mcp",
-      "--read-only",
       "--enabled-tools",
       atlassianToolNames.join(","),
     ],
